@@ -691,6 +691,10 @@ pub struct RdpServer {
     /// completed. `None` = no tunnel (all DVC traffic stays on TCP).
     udp_tunnel_tx: Option<mpsc::Sender<Vec<u8>>>,
     heartbeat: Option<HeartbeatConfig>,
+    /// Whether the client set RNS_UD_CS_SUPPORT_ERRINFO_PDU in its Client
+    /// Core Data `earlyCapabilityFlags`. MS-RDPBCGR 3.3.5.7.1: the Set Error
+    /// Info PDU MUST NOT be sent to a client that did not set it.
+    client_supports_errinfo: bool,
     connection_handler: Option<Box<dyn ConnectionHandler>>,
     /// Anti-storm net for [`RdpServerOptions::preempt_existing_session`]: the
     /// peer most recently EVICTED by a takeover, and when it last tried to
@@ -1448,6 +1452,7 @@ impl RdpServer {
             autodetect: None,
             udp_tunnel_tx: None,
             heartbeat: None,
+            client_supports_errinfo: false,
             connection_handler,
             recently_evicted: None,
             display_suppressed: display_suppressed.unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
@@ -2767,14 +2772,15 @@ impl RdpServer {
                 // against the preempting client — see the variant's docs).
                 ServerEvent::EvictedByOtherConnection => {
                     debug!("evicting this connection -- another client took the session over");
-                    // KNOWN GAP: MS-RDPBCGR 3.3.5.7.1 says the Set Error Info
-                    // PDU MUST NOT be sent to a client that did not set
+                    // MS-RDPBCGR 3.3.5.7.1: the Set Error Info PDU MUST NOT
+                    // be sent to a client that did not set
                     // RNS_UD_CS_SUPPORT_ERRINFO_PDU in its Client Core Data
-                    // `earlyCapabilityFlags`, and this sends it unconditionally.
-                    // `AcceptorResult` exposes no early-capability field today,
-                    // so the check is not currently expressible here; the
-                    // pre-existing `send_access_denied` has the identical gap.
-                    // Closing it needs an ironrdp-acceptor API addition.
+                    // `earlyCapabilityFlags` (tracked in
+                    // `self.client_supports_errinfo`).
+                    if !self.client_supports_errinfo {
+                        debug!("client did not announce SUPPORT_ERRINFO_PDU; skipping the eviction reason");
+                        return Ok(RunState::Disconnect);
+                    }
                     let pdu = rdp::headers::ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(
                         ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::DisconnectedByOtherconnection),
                     ));
@@ -2797,6 +2803,13 @@ impl RdpServer {
                 }
                 ServerEvent::Disconnect(error) => {
                     debug!(?error, "Got disconnect event");
+                    // MS-RDPBCGR 3.3.5.7.1: MUST NOT send the Set Error Info
+                    // PDU to a client that did not set
+                    // RNS_UD_CS_SUPPORT_ERRINFO_PDU.
+                    if !self.client_supports_errinfo {
+                        debug!("client did not announce SUPPORT_ERRINFO_PDU; disconnecting without a reason PDU");
+                        return Ok(RunState::Disconnect);
+                    }
                     let pdu = rdp::headers::ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(error));
                     // pduSource=0, not user_channel_id -- same MS-RDPBCGR
                     // 2.2.5.1.1 requirement as the EvictedByOtherConnection
@@ -3506,7 +3519,7 @@ impl RdpServer {
         let is_auto_reconnect = if let Some(reconnect) = result.auto_reconnect.as_ref() {
             if !self.verify_auto_reconnect_cookie(reconnect) {
                 warn!("Auto-reconnect cookie validation rejected");
-                send_access_denied(result.io_channel_id, result.user_channel_id, writer).await?;
+                send_access_denied(result.io_channel_id, result.user_channel_id, self.client_supports_errinfo, writer).await?;
                 return Err(ServerError::reason("auto-reconnect validation", "cookie rejected"));
             }
 
@@ -3528,12 +3541,12 @@ impl RdpServer {
                     }
                     Ok(CredentialDecision::Reject) => {
                         warn!("Credential validation rejected");
-                        send_access_denied(result.io_channel_id, result.user_channel_id, writer).await?;
+                        send_access_denied(result.io_channel_id, result.user_channel_id, self.client_supports_errinfo, writer).await?;
                         return Err(ServerError::reason("credential validation", "rejected by validator"));
                     }
                     Err(e) => {
                         error!(error = %e, "Credential validator backend error");
-                        send_access_denied(result.io_channel_id, result.user_channel_id, writer).await?;
+                        send_access_denied(result.io_channel_id, result.user_channel_id, self.client_supports_errinfo, writer).await?;
                         return Err(ServerError::custom("credential validation", e));
                     }
                 }
@@ -3734,6 +3747,12 @@ impl RdpServer {
                 debug!("Client did not announce UDP multitransport support; staying TCP-only");
             }
         }
+
+        // MS-RDPBCGR 3.3.5.7.1: the Set Error Info PDU must only be sent to
+        // clients that announced RNS_UD_CS_SUPPORT_ERRINFO_PDU.
+        self.client_supports_errinfo = result
+            .client_early_capability_flags
+            .contains(ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU);
 
         let state = self
             .client_loop(
@@ -4352,11 +4371,18 @@ async fn deactivate_all(io_channel_id: u16, user_channel_id: u16, writer: &mut i
 ///
 /// Used to deny a connection after credential validation rejects it, mirroring the
 /// acceptor's exact-match denial so both paths refuse the same spec-defined way.
+/// `client_supports_errinfo` gates the PDU on RNS_UD_CS_SUPPORT_ERRINFO_PDU
+/// (MS-RDPBCGR 3.3.5.7.1: MUST NOT send it to clients that did not announce it).
 async fn send_access_denied(
     io_channel_id: u16,
     user_channel_id: u16,
+    client_supports_errinfo: bool,
     writer: &mut impl FramedWrite,
 ) -> ServerResult<()> {
+    if !client_supports_errinfo {
+        debug!("client did not announce SUPPORT_ERRINFO_PDU; denying the connection without a reason PDU");
+        return Ok(());
+    }
     let info = ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
         ProtocolIndependentCode::ServerDeniedConnection,
     ));

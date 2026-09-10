@@ -864,13 +864,20 @@ impl Sequence for Acceptor {
                         if expected != &creds {
                             // FIXME: How authorization should be denied with standard RDP security?
                             // Since standard RDP security is not a priority, we just send a ServerDeniedConnection ServerSetErrorInfo PDU.
-                            let info = ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
-                                ProtocolIndependentCode::ServerDeniedConnection,
-                            ));
+                            // MS-RDPBCGR 3.3.5.7.1: only to clients that set
+                            // RNS_UD_CS_SUPPORT_ERRINFO_PDU.
+                            if self
+                                .early_capability_flags
+                                .contains(gcc::ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU)
+                            {
+                                let info = ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
+                                    ProtocolIndependentCode::ServerDeniedConnection,
+                                ));
 
-                            debug!(message = ?info, "Send");
+                                debug!(message = ?info, "Send");
 
-                            util::encode_send_data_indication(self.user_channel_id, self.io_channel_id, &info, output)?;
+                                util::encode_send_data_indication(self.user_channel_id, self.io_channel_id, &info, output)?;
+                            }
 
                             return Err(ConnectorError::general("invalid credentials"));
                         }
