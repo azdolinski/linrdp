@@ -706,6 +706,11 @@ pub struct RdpServer {
     /// When it did not, display updates fall back to slow-path Share Data
     /// Update PDUs (MS-RDPBCGR 2.2.9.1.1) instead of failing the session.
     client_fastpath_output: bool,
+    /// Whether the CURRENT disconnect was initiated by the client (Shutdown
+    /// Request PDU or MCS Disconnect Provider Ultimatum). Server-initiated
+    /// teardowns send their own Ultimatum (MS-RDPBCGR 3.3.5.6); echoing one
+    /// back at a client that is already leaving would be noise.
+    client_initiated_disconnect: bool,
     connection_handler: Option<Box<dyn ConnectionHandler>>,
     /// Anti-storm net for [`RdpServerOptions::preempt_existing_session`]: the
     /// peer most recently EVICTED by a takeover, and when it last tried to
@@ -1465,6 +1470,7 @@ impl RdpServer {
             heartbeat: None,
             client_supports_errinfo: false,
             client_fastpath_output: true,
+            client_initiated_disconnect: false,
             connection_handler,
             recently_evicted: None,
             display_suppressed: display_suppressed.unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
@@ -2039,6 +2045,7 @@ impl RdpServer {
     /// connection.
     async fn serve_negotiated(&mut self, candidate: Box<NegotiatedCandidate>) -> ServerResult<()> {
         self.display_suppressed.store(false, Ordering::Relaxed);
+        self.client_initiated_disconnect = false;
 
         let mut candidate = candidate;
         // Only NOW build the channel backends: this connection has
@@ -2173,6 +2180,7 @@ impl RdpServer {
         // here also covers backends that share an externally-created Arc via
         // `set_display_suppressed_handle()`.
         self.display_suppressed.store(false, Ordering::Relaxed);
+        self.client_initiated_disconnect = false;
 
         let size = self.display.lock().await.size().await;
         let capabilities = capabilities::capabilities(&self.opts, size);
@@ -3949,6 +3957,12 @@ impl RdpServer {
                 }
 
                 rdp::headers::ShareDataPdu::ShutdownRequest => {
+                    // MS-RDPBCGR 2.2.2.1/3.3.5.4.1: the client asked the
+                    // server to shut down; comply (end the session) and
+                    // remember it was client-initiated so the teardown does
+                    // not send a redundant Ultimatum back.
+                    debug!("client Shutdown Request — ending the session");
+                    self.client_initiated_disconnect = true;
                     return Ok(true);
                 }
 
@@ -4123,8 +4137,10 @@ impl RdpServer {
 
             mcs::McsMessage::DisconnectProviderUltimatum(disconnect) => {
                 if disconnect.reason == mcs::DisconnectReason::UserRequested {
+                    self.client_initiated_disconnect = true;
                     return Ok(true);
                 }
+                warn!(reason = ?disconnect.reason, "client Disconnect Provider Ultimatum with a non-user-requested reason");
             }
 
             _ => {
@@ -4220,6 +4236,25 @@ impl RdpServer {
                     continue;
                 }
                 RunState::Disconnect => {
+                    // MS-RDPBCGR 1.3.1.4/3.3.5.6: a server-initiated
+                    // teardown ends with an MCS Disconnect Provider
+                    // Ultimatum, so the client does not read the drop as a
+                    // network failure and auto-reconnect. Best-effort: a
+                    // dead socket just fails the write.
+                    if !self.client_initiated_disconnect {
+                        let ultimatum =
+                            mcs::DisconnectProviderUltimatum::from_reason(mcs::DisconnectReason::ProviderInitiated);
+                        match ironrdp_core::encode_vec(&X224(mcs::McsMessage::DisconnectProviderUltimatum(ultimatum))) {
+                            Ok(bytes) => {
+                                if let Err(error) = writer.write_all(&bytes).await {
+                                    debug!(%error, "could not send Disconnect Provider Ultimatum; closing anyway");
+                                }
+                            }
+                            Err(error) => {
+                                warn!(%error, "could not encode Disconnect Provider Ultimatum; closing anyway");
+                            }
+                        }
+                    }
                     let final_framed = unsplit_tokio_framed(reader, writer);
                     return Ok(final_framed);
                 }
