@@ -991,9 +991,14 @@ impl PendingConnection {
         honor_client_desktop_size: Option<DesktopSize>,
         credential_resolver: Option<std::sync::Arc<dyn Fn(&str) -> std::io::Result<Credentials> + Send + Sync>>,
     enable_ainput: bool,
+    multitransport: bool,
     ) -> Self {
         let mut acceptor = Acceptor::new_with_resolver(security.flag(), desktop_size, capabilities, creds, credential_resolver);
         acceptor.set_honor_client_desktop_size(honor_client_desktop_size);
+        // TS_UD_SC_MULTITRANSPORT (2.2.1.4.6): announce the UDP/FECR transport
+        // whenever the embedder configured multitransport — 3.3.5.8 requires
+        // the announcement before bootstrapping it.
+        acceptor.set_multitransport_announce(multitransport);
         Self { security, acceptor }
     }
 
@@ -1310,6 +1315,7 @@ async fn negotiate_candidate(
         ctx.opts.honor_client_desktop_size,
         ctx.credential_resolver.clone(),
         ctx.enable_ainput,
+        ctx.opts.multitransport.is_some(),
     );
 
     // NOTE: deliberately NO channel attachment here. Building the cliprdr /
@@ -2161,6 +2167,7 @@ impl RdpServer {
             self.opts.honor_client_desktop_size,
             self.credential_resolver.clone(),
             self.enable_ainput,
+            self.opts.multitransport.is_some(),
         );
 
         self.attach_channels(pending.acceptor_mut());

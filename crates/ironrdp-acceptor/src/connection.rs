@@ -48,6 +48,10 @@ pub struct Acceptor {
     received_auto_reconnect: Option<ClientAutoReconnect>,
     reactivation: bool,
     honor_client_desktop_size: Option<DesktopSize>,
+    /// Whether to announce UDP/FECR multitransport support in the server GCC
+    /// blocks (TS_UD_SC_MULTITRANSPORT, section 2.2.1.4.6). Per 3.3.5.8 the
+    /// server only bootstraps a multitransport it announced here.
+    multitransport_announce: bool,
 }
 
 /// Minimum and maximum desktop dimension honored from a client.
@@ -190,6 +194,7 @@ impl Acceptor {
             received_auto_reconnect: None,
             reactivation: false,
             honor_client_desktop_size: None,
+            multitransport_announce: false,
         }
     }
 
@@ -237,6 +242,17 @@ impl Acceptor {
         self.honor_client_desktop_size = max;
     }
 
+    /// Announce UDP/FECR multitransport support in the server GCC blocks
+    /// (TS_UD_SC_MULTITRANSPORT, section 2.2.1.4.6).
+    ///
+    /// [MS-RDPBCGR] 3.3.5.8 ties the later Server Initiate Multitransport
+    /// Request to this announcement: a compliant client may reject a
+    /// transport the server never advertised, so the embedder must enable
+    /// this whenever it intends to bootstrap RDP-UDP. Disabled by default.
+    pub fn set_multitransport_announce(&mut self, announce: bool) {
+        self.multitransport_announce = announce;
+    }
+
     pub fn new_deactivation_reactivation(
         mut consumed: Acceptor,
         static_channels: StaticChannelSet,
@@ -280,6 +296,7 @@ impl Acceptor {
             received_auto_reconnect: consumed.received_auto_reconnect,
             reactivation: true,
             honor_client_desktop_size: consumed.honor_client_desktop_size,
+            multitransport_announce: consumed.multitransport_announce,
         })
     }
 
@@ -747,6 +764,7 @@ impl Sequence for Acceptor {
                     requested_protocol,
                     skip_channel_join,
                     self.message_channel_id,
+                    self.multitransport_announce,
                 );
 
                 let settings_response = mcs::ConnectResponse {
@@ -1057,6 +1075,7 @@ fn create_gcc_blocks(
     requested: SecurityProtocol,
     skip_channel_join: bool,
     message_channel_id: Option<u16>,
+    multitransport_announce: bool,
 ) -> gcc::ServerGccBlocks {
     gcc::ServerGccBlocks {
         core: gcc::ServerCoreData {
@@ -1075,6 +1094,10 @@ fn create_gcc_blocks(
         message_channel: message_channel_id.map(|id| gcc::ServerMessageChannelData {
             mcs_message_channel_id: id,
         }),
-        multi_transport_channel: None,
+        // TS_UD_SC_MULTITRANSPORT (2.2.1.4.6): announce the UDP/FECR
+        // transport the server is prepared to bootstrap (3.3.5.8).
+        multi_transport_channel: multitransport_announce.then(|| gcc::MultiTransportChannelData {
+            flags: gcc::MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR,
+        }),
     }
 }
