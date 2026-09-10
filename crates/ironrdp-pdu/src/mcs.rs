@@ -1044,6 +1044,66 @@ impl DomainParameters {
             protocol_version: 2,
         }
     }
+
+    /// Merge the client's target/minimum/maximum domain parameters from an
+    /// MCS Connect Initial into the parameters the server returns in its
+    /// Connect Response, exactly as [MS-RDPBCGR] 3.3.5.3.3's
+    /// `MergeDomainParameters` pseudocode prescribes. `None` means the merge
+    /// failed and the connection SHOULD be dropped.
+    pub fn merge(target: &Self, minimum: &Self, maximum: &Self) -> Option<Self> {
+        let max_channel_ids = if target.max_channel_ids >= 4 {
+            target.max_channel_ids
+        } else if maximum.max_channel_ids >= 4 {
+            4
+        } else {
+            return None;
+        };
+
+        let max_user_ids = if target.max_user_ids >= 3 {
+            target.max_user_ids
+        } else if maximum.max_user_ids >= 3 {
+            3
+        } else {
+            return None;
+        };
+
+        if minimum.num_priorities > 1 {
+            return None;
+        }
+
+        if target.max_height != 1 && minimum.max_height > 1 {
+            return None;
+        }
+
+        let max_mcs_pdu_size = if target.max_mcs_pdu_size >= 124 {
+            if target.max_mcs_pdu_size <= 65528 {
+                target.max_mcs_pdu_size
+            } else if (124..=65528).contains(&minimum.max_mcs_pdu_size) {
+                65528
+            } else {
+                return None;
+            }
+        } else if maximum.max_mcs_pdu_size >= 124 {
+            maximum.max_mcs_pdu_size
+        } else {
+            return None;
+        };
+
+        if !(target.protocol_version == 2 || (minimum.protocol_version <= 2 && maximum.protocol_version >= 2)) {
+            return None;
+        }
+
+        Some(Self {
+            max_channel_ids,
+            max_user_ids,
+            max_token_ids: target.max_token_ids,
+            num_priorities: 1,
+            min_throughput: target.min_throughput,
+            max_height: 1,
+            max_mcs_pdu_size,
+            protocol_version: 2,
+        })
+    }
 }
 
 mod legacy {

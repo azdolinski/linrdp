@@ -52,6 +52,9 @@ pub struct Acceptor {
     /// blocks (TS_UD_SC_MULTITRANSPORT, section 2.2.1.4.6). Per 3.3.5.8 the
     /// server only bootstraps a multitransport it announced here.
     multitransport_announce: bool,
+    /// Domain parameters merged from the client's MCS Connect Initial per
+    /// 3.3.5.3.3, echoed back in the Connect Response.
+    merged_domain_parameters: mcs::DomainParameters,
 }
 
 /// Minimum and maximum desktop dimension honored from a client.
@@ -195,6 +198,7 @@ impl Acceptor {
             reactivation: false,
             honor_client_desktop_size: None,
             multitransport_announce: false,
+            merged_domain_parameters: mcs::DomainParameters::target(),
         }
     }
 
@@ -297,6 +301,7 @@ impl Acceptor {
             reactivation: true,
             honor_client_desktop_size: consumed.honor_client_desktop_size,
             multitransport_announce: consumed.multitransport_announce,
+            merged_domain_parameters: mcs::DomainParameters::target(),
         })
     }
 
@@ -676,6 +681,23 @@ impl Sequence for Acceptor {
 
                 debug!(message = ?settings_initial, "Received");
 
+                // MS-RDPBCGR 3.3.5.3.3: merge the client's domain parameters
+                // now (the Connect Response is built in a later state) and
+                // drop the connection if the merge fails.
+                let merged_domain_parameters = mcs::DomainParameters::merge(
+                    &settings_initial.target_parameters,
+                    &settings_initial.min_parameters,
+                    &settings_initial.max_parameters,
+                )
+                .ok_or_else(|| {
+                    reason_err!(
+                        "BasicSettings",
+                        "failed to merge the client's MCS domain parameters: {:?}",
+                        settings_initial.target_parameters,
+                    )
+                })?;
+                self.merged_domain_parameters = merged_domain_parameters;
+
                 let gcc_blocks = settings_initial.conference_create_request.into_gcc_blocks();
                 let early_capability = gcc_blocks.core.optional_data.early_capability_flags;
                 self.early_capability_flags = early_capability.unwrap_or(gcc::ClientEarlyCapabilityFlags::empty());
@@ -798,7 +820,9 @@ impl Sequence for Acceptor {
                     conference_create_response: gcc::ConferenceCreateResponse::new(self.user_channel_id, server_blocks)
                         .map_err(ConnectorError::decode)?,
                     called_connect_id: 1,
-                    domain_parameters: mcs::DomainParameters::target(),
+                    // Merged from the client's Connect Initial per 3.3.5.3.3
+                    // (captured in `BasicSettingsWaitInitial`).
+                    domain_parameters: self.merged_domain_parameters.clone(),
                 };
 
                 debug!(message = ?settings_response, "Send");
