@@ -1068,6 +1068,17 @@ impl Sequence for Acceptor {
 
                         debug!(message = ?capabilities_confirm, "Received");
 
+                        // MS-RDPBCGR 2.2.1.13.2: the Confirm Active PDU's
+                        // originatorId MUST be 0x03EA. Log rather than drop:
+                        // strict rejection would break otherwise-working
+                        // clients over a field they echo from our PDUs.
+                        if capabilities_confirm.pdu_source != rdp::capability_sets::SERVER_CHANNEL_ID {
+                            tracing::warn!(
+                                originator_id = capabilities_confirm.pdu_source,
+                                "client Confirm Active has a non-conforming originatorId (MUST be 0x03EA)"
+                            );
+                        }
+
                         let ShareControlPdu::ClientConfirmActive(confirm) = capabilities_confirm.share_control_pdu
                         else {
                             return Err(ConnectorError::general("expected client confirm active"));

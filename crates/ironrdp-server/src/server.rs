@@ -3610,6 +3610,19 @@ impl RdpServer {
                         return Err(ServerError::unsupported("Fastpath output"));
                     }
                 }
+                CapabilitySet::VirtualChannel(c) => {
+                    // MS-RDPBCGR 2.2.7.1.10: VCChunkSize must be in
+                    // [16256]. The client→server value is advisory (the pdu
+                    // crate deliberately leaves verification to the caller),
+                    // and our SVC sender always chunks at the 1600 minimum,
+                    // which is legal under any negotiated size — so validate
+                    // and warn, never fail the session over it.
+                    if let Some(chunk) = c.chunk_size
+                        && !(1600..=16256).contains(&chunk)
+                    {
+                        warn!(chunk_size = chunk, "client VCChunkSize outside 1600..=16256 (2.2.7.1.10); ignoring");
+                    }
+                }
                 CapabilitySet::Bitmap(b) => {
                     if !b.desktop_resize_flag {
                         debug!("Desktop resize is not supported by the client");

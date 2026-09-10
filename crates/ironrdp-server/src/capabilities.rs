@@ -82,7 +82,9 @@ fn input_capabilities() -> capability_sets::Input {
         keyboard_layout: 0,
         keyboard_type: None,
         keyboard_subtype: 0,
-        keyboard_function_key: 128,
+        // MS-RDPBCGR 2.2.7.1.6: in the server-to-client direction the
+        // keyboard fields SHOULD all be zero.
+        keyboard_function_key: 0,
         keyboard_ime_filename: "".into(),
     }
 }
