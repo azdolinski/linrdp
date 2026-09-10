@@ -1,0 +1,18 @@
+[Unit]
+Description=LinRDP — RDP server for the Linux desktop
+After=network.target display-manager.service
+Wants=network.target
+
+[Service]
+Type=simple
+# Set to your desktop session's DISPLAY / XAUTHORITY (or run under the user session)
+Environment=DISPLAY=:99
+Environment=XAUTHORITY=/home/user/.Xauthority
+Environment=LINRDP_LOG=info
+# Root is required for /etc/shadow authentication and (later) uinput injection.
+ExecStart=/usr/local/bin/linrdp
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

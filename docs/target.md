@@ -1,0 +1,8 @@
+- full RDP windows implementation without external library dependencies working on linux 
+- writen fully in rust
+- possible to login as on Windows RDP using login and password
+- possible to see screen, resizing, match size of screen - expirance same like in windows RDP
+- possible to get voice both direction, map mikrofon from local machine and hear stream voice from server
+- possible to map local USB devices to remote server (same like on widnwos) - ie stick usb will appeare on linux
+- all nessesery libs should be embaded to our tool - so on linux we recived single app witouth need to install extra parameters
+- lindrdp should - if would need - keep parameter on /etc/linrdp/ - in easy to manage parameter file linrdp.cfg where parameters are keept

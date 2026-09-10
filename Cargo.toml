@@ -1,0 +1,154 @@
+[workspace]
+members = [
+  "crates/*",
+  "linrdp",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["LinRDP contributors", "Devolutions Inc. <infos@devolutions.net>", "Teleport <goteleport.com>"]
+homepage = "https://github.com/linrdp/linrdp"
+repository = "https://github.com/linrdp/linrdp"
+keywords = ["rdp", "remote-desktop", "linux", "server", "network"]
+categories = ["network-programming"]
+
+[workspace.dependencies]
+# Vendored IronRDP crates (internal, path-only). Upstream: Devolutions/IronRDP (Apache-2.0/MIT).
+ironrdp-core = { path = "crates/ironrdp-core" }
+ironrdp-error = { path = "crates/ironrdp-error" }
+ironrdp-str = { path = "crates/ironrdp-str" }
+ironrdp-cfg = { path = "crates/ironrdp-cfg" }
+ironrdp-propertyset = { path = "crates/ironrdp-propertyset" }
+ironrdp-bulk = { path = "crates/ironrdp-bulk" }
+ironrdp-pdu = { path = "crates/ironrdp-pdu" }
+ironrdp-input = { path = "crates/ironrdp-input" }
+ironrdp-svc = { path = "crates/ironrdp-svc" }
+ironrdp-async = { path = "crates/ironrdp-async" }
+ironrdp-tokio = { path = "crates/ironrdp-tokio" }
+ironrdp-tls = { path = "crates/ironrdp-tls" }
+ironrdp-connector = { path = "crates/ironrdp-connector" }
+ironrdp-acceptor = { path = "crates/ironrdp-acceptor" }
+ironrdp-session = { path = "crates/ironrdp-session" }
+ironrdp-graphics = { path = "crates/ironrdp-graphics" }
+ironrdp-cliprdr = { path = "crates/ironrdp-cliprdr" }
+ironrdp-cliprdr-format = { path = "crates/ironrdp-cliprdr-format" }
+ironrdp-cliprdr-native = { path = "crates/ironrdp-cliprdr-native" }
+ironrdp-rdpsnd = { path = "crates/ironrdp-rdpsnd" }
+ironrdp-rdpsnd-native = { path = "crates/ironrdp-rdpsnd-native" }
+ironrdp-displaycontrol = { path = "crates/ironrdp-displaycontrol" }
+ironrdp-dvc = { path = "crates/ironrdp-dvc" }
+ironrdp-echo = { path = "crates/ironrdp-echo" }
+ironrdp-rdpei = { path = "crates/ironrdp-rdpei" }
+ironrdp-rdpdr = { path = "crates/ironrdp-rdpdr" }
+ironrdp-ainput = { path = "crates/ironrdp-ainput" }
+ironrdp-nscodec = { path = "crates/ironrdp-nscodec" }
+ironrdp-egfx = { path = "crates/ironrdp-egfx" }
+ironrdp-server = { path = "crates/ironrdp-server" }
+
+num-derive = "0.5"
+num-traits = "0.2"
+expect-test = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1
+strip = "none"
+
+[workspace.lints.rust]
+
+# == Safer unsafe == #
+unsafe_op_in_unsafe_fn = "warn"
+invalid_reference_casting = "warn"
+unused_unsafe = "warn"
+missing_unsafe_on_extern = "warn"
+unsafe_attr_outside_unsafe = "warn"
+
+# == Correctness == #
+ambiguous_negative_literals  = "warn"
+
+# == Style, readability == #
+elided_lifetimes_in_paths = "warn"
+absolute_paths_not_starting_with_crate = "warn"
+single_use_lifetimes = "warn"
+unreachable_pub = "warn"
+unused_lifetimes = "warn"
+unused_qualifications = "warn"
+keyword_idents = "warn"
+noop_method_call = "warn"
+macro_use_extern_crate = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+
+# == Compile-time / optimization == #
+unused_crate_dependencies = "warn"
+unused_macro_rules = "warn"
+
+# == Extra-pedantic rustc == #
+unit_bindings = "warn"
+
+[workspace.lints.clippy]
+
+# == Safer unsafe == #
+undocumented_unsafe_blocks = "warn"
+unnecessary_safety_comment = "warn"
+multiple_unsafe_ops_per_block = "warn"
+missing_safety_doc = "warn"
+transmute_ptr_to_ptr = "warn"
+as_ptr_cast_mut = "warn"
+as_pointer_underscore = "warn"
+cast_ptr_alignment = "warn"
+fn_to_numeric_cast_any = "warn"
+ptr_cast_constness = "warn"
+
+# == Correctness == #
+as_conversions = "warn"
+cast_lossless = "warn"
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+cast_sign_loss = "warn"
+filetype_is_file = "warn"
+float_cmp = "warn"
+lossy_float_literal = "warn"
+float_cmp_const = "warn"
+as_underscore = "warn"
+unwrap_used = "warn"
+large_stack_frames = "warn"
+mem_forget = "warn"
+mixed_read_write_in_expression = "warn"
+needless_raw_strings = "warn"
+non_ascii_literal = "warn"
+panic = "warn"
+precedence_bits = "warn"
+rc_mutex = "warn"
+same_name_method = "warn"
+string_slice = "warn"
+suspicious_xor_used_as_pow = "warn"
+unused_result_ok = "warn"
+missing_panics_doc = "warn"
+
+# == Style, readability == #
+semicolon_outside_block = "warn"
+clone_on_ref_ptr = "warn"
+cloned_instead_of_copied = "warn"
+pub_without_shorthand = "warn"
+infinite_loop = "warn"
+empty_enum_variants_with_brackets = "warn"
+deref_by_slicing = "warn"
+multiple_inherent_impl = "warn"
+map_with_unused_argument_over_ranges = "warn"
+partial_pub_fields = "warn"
+trait_duplication_in_bounds = "warn"
+type_repetition_in_bounds = "warn"
+checked_conversions = "warn"
+get_unwrap = "warn"
+similar_names = "warn"
+str_to_string = "warn"
+std_instead_of_core = "warn"
+separated_literal_suffix = "warn"
+unused_self = "warn"
+useless_let_if_seq = "warn"
+string_add = "warn"

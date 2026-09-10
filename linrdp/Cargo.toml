@@ -1,0 +1,39 @@
+[package]
+name = "linrdp"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "RDP server for Linux — connect to a Linux desktop from any Windows/macOS RDP client"
+
+[dependencies]
+ironrdp-server = { path = "../crates/ironrdp-server", features = ["helper", "usb", "nscodec"] }
+ironrdp-connector = { path = "../crates/ironrdp-connector" }
+ironrdp-cliprdr = { path = "../crates/ironrdp-cliprdr" }
+ironrdp-cliprdr-native = { path = "../crates/ironrdp-cliprdr-native" }
+async-trait = "0.1"
+sha-crypt = "0.5"
+yescrypt = { version = "0.1", features = ["password-hash"] }
+md5 = "0.7"
+x11rb = { version = "0.13", features = ["xtest", "randr"] }
+ironrdp-rdpsnd = { path = "../crates/ironrdp-rdpsnd" }
+ironrdp-displaycontrol = { path = "../crates/ironrdp-displaycontrol" }
+ironrdp-rdpeai = { path = "../crates/ironrdp-rdpeai" }
+ironrdp-core = { path = "../crates/ironrdp-core" }
+ironrdp-pdu = { path = "../crates/ironrdp-pdu" }
+libpulse-binding = "2.30"
+opus2 = { version = "0.4", features = ["bundled"] }
+ironrdp-rdpeudp-tokio = { path = "../crates/ironrdp-rdpeudp-tokio", features = ["rustls-aws-lc-rs"] }
+ironrdp-rdpemt = { path = "../crates/ironrdp-rdpemt", features = ["std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
+byteorder = "1"
+arboard = "3.6"
+ironrdp-dvc = { path = "../crates/ironrdp-dvc" }
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+pico-args = "0.5"
+rcgen = "0.13"
+
+[lints]
+workspace = true
