@@ -50,6 +50,21 @@ impl TryFrom<u16> for Version {
     }
 }
 
+impl Version {
+    /// Resolve a wire `wVersion` to the highest known version not greater than
+    /// it. The spec does not enumerate every future value, and an unknown
+    /// version must not fail the channel — the server negotiates down and keeps
+    /// serving with the features of the resolved version.
+    pub fn negotiate(value: u16) -> Self {
+        match value {
+            0..=0x02 => Self::V2,
+            0x03..=0x05 => Self::V5,
+            0x06..=0x07 => Self::V6,
+            _ => Self::V8,
+        }
+    }
+}
+
 impl From<Version> for u16 {
     #[expect(
         clippy::as_conversions,
@@ -480,7 +495,9 @@ impl<'de> Decode<'de> for ClientAudioFormatPdu {
         let dgram_port = src.read_u16_be();
         let n_formats = usize::from(src.read_u16());
         let _block_no = src.read_u8();
-        let version = Version::try_from(src.read_u16())?;
+        // An unknown (e.g. future) wVersion must not fail the channel —
+        // negotiate down to the highest known version not above it.
+        let version = Version::negotiate(src.read_u16());
         read_padding!(src, 1);
         let formats = core::iter::repeat_with(|| AudioFormat::decode(src))
             .take(n_formats)
