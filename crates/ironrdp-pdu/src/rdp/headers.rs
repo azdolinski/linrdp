@@ -693,6 +693,15 @@ impl Encode for ShareDataPdu {
             ShareDataPdu::ShutdownRequest | ShareDataPdu::ShutdownDenied => Ok(()),
             ShareDataPdu::SuppressOutput(pdu) => pdu.encode(dst),
             ShareDataPdu::RefreshRectangle(pdu) => pdu.encode(dst),
+            // Raw update bodies (updateType/pointerMessageType already
+            // included in the buffer, matching the decode side which captures
+            // everything after the Share Data Header). Used by the server's
+            // slow-path output fallback (MS-RDPBCGR 2.2.9.1.1).
+            ShareDataPdu::Update(buffer) | ShareDataPdu::Pointer(buffer) => {
+                ironrdp_core::ensure_size!(in: dst, size: buffer.len());
+                dst.write_slice(buffer);
+                Ok(())
+            }
             ShareDataPdu::Compressed { .. } => Err(other_err!("Encoding compressed Share Data PDU is not implemented")),
             _ => Err(other_err!("Encoding not implemented")),
         }

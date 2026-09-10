@@ -72,6 +72,13 @@ use ironrdp_rdpeusb::{InterfaceAlloc, server::UrbdrcControlServer, server::Urbdr
 const LISTENER_BACKLOG: u32 = 1024;
 const AUTO_RECONNECT_COOKIE_UPDATE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
+/// Largest update payload carried in a single slow-path Share Data Update PDU
+/// (MS-RDPBCGR 2.2.9.1.1): the MCS PDU ceiling (65535) minus the Share Data
+/// Header (18), the updateType prefix (2) and X.224/MCS framing overhead.
+/// Slow-path has no fragmentation, so bigger updates are dropped with a
+/// warning rather than corrupted.
+const MAX_SLOWPATH_UPDATE_SIZE: usize = 65_400;
+
 /// How long a single [`ironrdp_acceptor::accept_finalize`] pass may take before
 /// the connection is dropped.
 ///
@@ -695,6 +702,10 @@ pub struct RdpServer {
     /// Core Data `earlyCapabilityFlags`. MS-RDPBCGR 3.3.5.7.1: the Set Error
     /// Info PDU MUST NOT be sent to a client that did not set it.
     client_supports_errinfo: bool,
+    /// Whether the client advertised FASTPATH_OUTPUT_SUPPORTED (2.2.7.1.1).
+    /// When it did not, display updates fall back to slow-path Share Data
+    /// Update PDUs (MS-RDPBCGR 2.2.9.1.1) instead of failing the session.
+    client_fastpath_output: bool,
     connection_handler: Option<Box<dyn ConnectionHandler>>,
     /// Anti-storm net for [`RdpServerOptions::preempt_existing_session`]: the
     /// peer most recently EVICTED by a takeover, and when it last tried to
@@ -1453,6 +1464,7 @@ impl RdpServer {
             udp_tunnel_tx: None,
             heartbeat: None,
             client_supports_errinfo: false,
+            client_fastpath_output: true,
             connection_handler,
             recently_evicted: None,
             display_suppressed: display_suppressed.unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
@@ -2697,6 +2709,7 @@ impl RdpServer {
         writer: &mut impl FramedWrite,
         user_channel_id: u16,
         io_channel_id: u16,
+        fastpath_output: bool,
         buffer: &mut Vec<u8>,
         mut encoder: UpdateEncoder,
         budget: &mut DisplayBudget,
@@ -2715,6 +2728,41 @@ impl RdpServer {
             };
 
             let mut fragmenter = fragmenter?;
+
+            if !fastpath_output {
+                // MS-RDPBCGR 2.2.9.1.1: slow-path graphics/pointer updates —
+                // a Share Data Update PDU carrying the whole update body
+                // (updateType + data) in one shot. Slow-path has no
+                // fragmentation, so an update larger than what fits in a
+                // single MCS PDU is dropped (with a warning) rather than
+                // corrupted.
+                let payload = fragmenter.payload();
+                if payload.len() > MAX_SLOWPATH_UPDATE_SIZE {
+                    warn!(
+                        size = payload.len(),
+                        max = MAX_SLOWPATH_UPDATE_SIZE,
+                        update_code = fragmenter.update_code().as_u8(),
+                        "slow-path update too large for one PDU; dropping"
+                    );
+                    continue;
+                }
+                let mut body = Vec::with_capacity(2 + payload.len());
+                body.extend_from_slice(&u16::from(fragmenter.update_code().as_u8()).to_le_bytes());
+                body.extend_from_slice(payload);
+                let data = encode_share_data_pdu(
+                    rdp::headers::ShareDataPdu::Update(body),
+                    io_channel_id,
+                    io_channel_id,
+                    user_channel_id,
+                )?;
+                budget.acquire(data.len()).await;
+                writer
+                    .write_all(&data)
+                    .await
+                    .map_err(|e| ServerError::io("failed to write slow-path update", e))?;
+                continue;
+            }
+
             if fragmenter.size_hint() > buffer.len() {
                 buffer.resize(fragmenter.size_hint(), 0);
             }
@@ -3295,6 +3343,7 @@ impl RdpServer {
         let mut heartbeat_writer = writer.clone();
         let write_counter = writer.write_counter();
         let ev_receiver = Arc::clone(&self.ev_receiver);
+        let client_fastpath_output = self.client_fastpath_output;
         let s = Rc::new(Mutex::new(self));
 
         let this = Rc::clone(&s);
@@ -3362,6 +3411,7 @@ impl RdpServer {
                             &mut display_writer,
                             user_channel_id,
                             io_channel_id,
+                            client_fastpath_output,
                             &mut buffer,
                             encoder,
                             &mut budget,
@@ -3605,9 +3655,12 @@ impl RdpServer {
         for c in result.capabilities {
             match c {
                 CapabilitySet::General(c) => {
-                    let fastpath = c.extra_flags.contains(GeneralExtraFlags::FASTPATH_OUTPUT_SUPPORTED);
-                    if !fastpath {
-                        return Err(ServerError::unsupported("Fastpath output"));
+                    // MS-RDPBCGR 2.2.7.1.1: a client without
+                    // FASTPATH_OUTPUT_SUPPORTED receives slow-path output
+                    // (2.2.9.1.1) — do not fail the session over it.
+                    self.client_fastpath_output = c.extra_flags.contains(GeneralExtraFlags::FASTPATH_OUTPUT_SUPPORTED);
+                    if !self.client_fastpath_output {
+                        warn!("client does not support fast-path output; falling back to slow-path updates");
                     }
                 }
                 CapabilitySet::VirtualChannel(c) => {

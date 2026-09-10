@@ -48,6 +48,18 @@ impl UpdateFragmenter {
         FASTPATH_HEADER_SIZE + cmp::min(self.data.len(), MAX_FASTPATH_UPDATE_SIZE)
     }
 
+    /// The fast-path update code of the wrapped update. Its numeric value is
+    /// shared with the slow-path `updateType` field (MS-RDPBCGR 2.2.9.1.1).
+    pub(crate) fn update_code(&self) -> UpdateCode {
+        self.code
+    }
+
+    /// The complete (unfragmented) update payload, as carried inside a
+    /// fast-path update PDU's data field.
+    pub(crate) fn payload(&self) -> &[u8] {
+        &self.data
+    }
+
     pub(crate) fn next(&mut self, dst: &mut [u8]) -> Option<usize> {
         let (consumed, written) = self.encode_next(dst)?;
         self.position += consumed;
