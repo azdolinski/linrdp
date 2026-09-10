@@ -573,6 +573,14 @@ pub enum ConnectionConfirm {
     Failure {
         code: FailureCode,
     },
+    /// A Connection Confirm with no RDP Negotiation data at all.
+    ///
+    /// [MS-RDPBCGR] 3.3.5.3.2: "The rdpNegData field is left empty if the
+    /// client did not append any negotiation data to the X.224 Connection
+    /// Request PDU" — the server MUST NOT send negotiation data to such a
+    /// client. Decoding still maps an empty variable part to
+    /// [`Self::Response`] with empty flags/protocol for compatibility.
+    NoNegotiation,
 }
 
 impl_x224_pdu_pod!(ConnectionConfirm);
@@ -602,6 +610,8 @@ impl<'de> X224Pdu<'de> for ConnectionConfirm {
                 dst.write_u16(Self::RDP_NEG_RSP);
                 dst.write_u32(u32::from(*code));
             }
+            // Empty rdpNegData — nothing in the X.224 variable part.
+            ConnectionConfirm::NoNegotiation => {}
         }
 
         Ok(())
@@ -644,6 +654,7 @@ impl<'de> X224Pdu<'de> for ConnectionConfirm {
         match self {
             ConnectionConfirm::Response { .. } => usize::from(Self::RDP_NEG_RSP),
             ConnectionConfirm::Failure { .. } => usize::from(Self::RDP_NEG_FAILURE),
+            ConnectionConfirm::NoNegotiation => 0,
         }
     }
 

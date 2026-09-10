@@ -1114,6 +1114,12 @@ impl Sequence for ClientConnector {
                             ConnectorErrorKind::Negotiation(NegotiationFailure::from(code)),
                         ));
                     }
+                    // Decode maps an empty variable part to `Response` with
+                    // empty flags/protocol, so this arm is unreachable in
+                    // practice; keep it total anyway.
+                    nego::ConnectionConfirm::NoNegotiation => {
+                        (nego::ResponseFlags::empty(), nego::SecurityProtocol::empty())
+                    }
                 };
 
                 info!(?selected_protocol, ?flags, "Server confirmed connection");

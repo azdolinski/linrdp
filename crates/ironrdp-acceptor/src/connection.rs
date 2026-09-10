@@ -409,6 +409,10 @@ pub enum AcceptorState {
     InitiationWaitRequest,
     InitiationSendConfirm {
         requested_protocol: SecurityProtocol,
+        /// Whether the client's X.224 Connection Request carried an RDP
+        /// Negotiation Request (rdpNegData). MS-RDPBCGR 3.3.5.3.2: when it
+        /// did not, the Confirm MUST NOT carry negotiation data either.
+        nego_present: bool,
     },
     SecurityUpgrade {
         requested_protocol: SecurityProtocol,
@@ -547,11 +551,15 @@ impl Sequence for Acceptor {
                     Written::Nothing,
                     AcceptorState::InitiationSendConfirm {
                         requested_protocol: connection_request.protocol,
+                        nego_present: connection_request.nego_data.is_some(),
                     },
                 )
             }
 
-            AcceptorState::InitiationSendConfirm { requested_protocol } => {
+            AcceptorState::InitiationSendConfirm {
+                requested_protocol,
+                nego_present,
+            } => {
                 let protocols = requested_protocol & self.security;
                 let protocol = if protocols.intersects(SecurityProtocol::HYBRID_EX) {
                     SecurityProtocol::HYBRID_EX
@@ -561,6 +569,25 @@ impl Sequence for Acceptor {
                     SecurityProtocol::SSL
                 } else if self.security.is_empty() {
                     SecurityProtocol::empty()
+                } else if !nego_present {
+                    // The client sent no RDP Negotiation Request at all (a
+                    // pre-negotiation client). MS-RDPBCGR 3.3.5.3.2: the
+                    // rdpNegData field of the Confirm MUST be left empty for
+                    // such clients — no RDP_NEG_FAILURE either. It can only
+                    // mean Standard RDP Security, which this server does not
+                    // offer, so answer with the empty Confirm and then drop
+                    // the connection.
+                    let confirm = nego::ConnectionConfirm::NoNegotiation;
+
+                    debug!(message = ?confirm, "Send");
+
+                    ironrdp_core::encode_buf(&X224(confirm), output).map_err(ConnectorError::encode)?;
+
+                    return Err(reason_err!(
+                        "security protocol mismatch",
+                        "client sent no negotiation data and server requires {:?} (Standard RDP Security is not offered)",
+                        self.security,
+                    ));
                 } else {
                     // No common security protocol. Send RDP_NEG_FAILURE so the client
                     // gets a well-formed response instead of a TCP reset (MS-RDPBCGR 2.2.1.2.2).
