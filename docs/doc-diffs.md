@@ -1,6 +1,7 @@
 # doc-diffs — rozbieżności kodu względem dokumentacji Microsoft
 
-Data: 2026-09-11. Zakres: `docs/microsoft-docs/` = **[MS-RDPBCGR]** (pełny spec, rev. 260309) + **[MS-RDPEA]** (Audio Output Virtual Channel Extension, rev. 240423). Weryfikacja server-side (LinRDP = serwer RDP; klient = mstsc/FreeRDP).
+Data: 2026-09-11 (audyt) / 2026-09-11 (po naprawach — sekcja „Stan po naprawach").
+Zakres: `docs/microsoft-docs/` = **[MS-RDPBCGR]** (pełny spec, rev. 260309) + **[MS-RDPEA]** (Audio Output Virtual Channel Extension, rev. 240423). Weryfikacja server-side (LinRDP = serwer RDP; klient = mstsc/FreeRDP).
 
 Legenda werdyktów:
 - ✅ **ZGODNE** — kod spełnia wymóg spec (MUST/SHOULD lub struktura bajtowa).
@@ -8,137 +9,170 @@ Legenda werdyktów:
 - 🔴 **ROZJEBANE** — jawne naruszenie normatywne MUST / MUST NOT.
 - ⚪ **BRAK W KODZIE** — brak implementacji wymogu.
 - ⚫ **ŚWIADOMY OMIT** — celowo nieimplementowane (deprecated / poza zakresem), struktura PDU zwykle gotowa.
+- 🛠 **NAPRAWIONE** — rozbieżność usunięta w serii commitów po audycie (patrz fix-log niżej).
 
-## Podsumowanie ogólne
+## Stan po naprawach
 
-| Obszar | ZGODNE | CZĘŚCIOWO | ROZJEBANE | BRAK | ŚWIADOMY OMIT |
-|---|---|---|---|---|---|
-| MS-RDPEA (audio out) | 15 | 5 | 2 | 1 | 2 |
-| RDPBCGR: połączenie/TLS/NLA/licensing | 24 | 4 | 0 | 0 | 1 |
-| RDPBCGR: capabilities/obraz/input | 15 | 5 | 1 (+1 minor) | 0 | 3 |
-| RDPBCGR: kanały/autodetect/heartbeat/disco/ARC/multitransport | 10 | 4 | 2 | 1 (aplikacja) | 1 |
+Wszystkie punkty 🔴 i niemal wszystkie naprawialne 🟡 zostały naprawione (12 commitów). Pozostałe rozbieżności to świadome omity lub optymalizacje bez znaczenia normatywnego. Ścieżka krytyczna (NLA + obraz + dźwięk + UDP bootstrap) jest teraz zgodna z [MS-RDPBCGR]/[MS-RDPEA] na ~95% punktów normatywnych.
 
-Ścieżka krytyczna (NLA + podstawowy obraz + dźwięk VC) jest zgodna na ~85–90%. Pojedyncze rozbieżności nie blokują mstsc/FreeRDP, ale poniższe punkty warto naprawić.
+### Fix-log (commity)
+
+| Commit | Fix |
+|---|---|
+| `rdpsnd(pdu)` | negocjacja w dół nieznanego wVersion zamiast błędu dekodowania |
+| `rdpsnd(server)` | cBlockNo start=1 (3.3.5.2.1.1), MUST ignore (3.1.5), TSSNDCAPS_ALIVE gating (3.3.5.2), timeouty QualityMode→DYNAMIC / TrainingConfirm→terminate (3.3.5.1.1.3/3.1.5), set_pitch z gatingiem PITCH (2.2.4.2) |
+| `server` (multitransport) | Initiate Multitransport Request/Response po MCS message channel (2.2.15.1/2 — MUST); brak kanału → brak bootstrapu; fallback odbioru na I/O zostaje dla klientów niestandardowych |
+| `acceptor` (TS_UD_SC) | ogłoszenie TS_UD_SC_MULTITRANSPORT (UDP/FECR) w GCC, gdy skonfigurowany multitransport (2.2.1.4.6 + 3.3.5.8) |
+| `server` (ERRINFO) | Set Error Info gate'owany na RNS_UD_CS_SUPPORT_ERRINFO_PDU we wszystkich 5 miejscach wysyłki (3.3.5.7.1 — zamknięty KNOWN GAP) |
+| `nego` | klient bez RDP Negotiation Request dostaje pusty X.224 Confirm (ConnectionConfirm::NoNegotiation), nie RDP_NEG_FAILURE (3.3.5.3.2 MUST NOT) |
+| `acceptor` (ChannelJoin) | nieoczekiwany join → Confirm z result=rt-no-such-channel(3) zamiast zerwania; powtórny join ignorowany bez Confirm (3.3.5.3.8) |
+| `mcs` | DomainParameters::merge — dosłowny MergeDomainParameters (3.3.5.3.3); nieudany merge → drop |
+| `server` (walidacje) | originatorId=0x03EA warn (2.2.1.13.2), VCChunkSize 1600..=16256 walidacja (2.2.7.1.10), keyboardFunctionKey=0 (2.2.7.1.6 SHOULD) |
+| `server` (slow-path) | fallback do slow-path Share Data Update PDUs dla klientów bez fast-path output (2.2.9.1.1) zamiast zrywania sesji |
+| `server` (Ultimatum) | Disconnect Provider Ultimatum (ProviderInitiated) przy serwerowym zakończeniu sesji (1.3.1.4/3.3.5.6); rozróżnione źródło rozłączenia; logi Shutdown Request/nietypowych reason-code |
+| `linrdp` (main) | enable_autodetect() + enable_heartbeat() + pętla 10 s AutoDetectRttRequest (2.2.14/2.2.16.1 — było martwe w binarym) |
+| `linrdp` (input) | TS_UNICODE → keysym przez ChangeKeyboardMapping + XTEST; TS_SYNC_FLAGS → toggle Cap/Num/ScrollLock (2.2.8.1.1.3.1.1.4/5) |
+
+### Punkty wycofane po weryfikacji (raport audytu nieaktualny)
+
+- **Kolejność License Error przed Demand Active** — ZGODNA ze spec: sekcja 4.1 pokazuje dokładnie `4.1.11 Server License Error PDU` → `4.1.12 Server Demand Active PDU`, a faza 7 (Licensing) poprzedza fazę 9 (Capability Exchange) w 1.3.1.1.
+- **X.224 Class 0** — już walidowany: dekoder wymaga dokładnego kodu TPDU (0xE0/0xD0), a klasa jest zakodowana w tym bajcie.
+- **Limit 16 kodeków** — spec nie definiuje takiego limitu (bitmapCodecCount: „maximum allowed is 255", pole u8).
+
+## Podsumowanie ogólne (po naprawach)
+
+| Obszar | ZGODNE/NAPRAWIONE | POZOSTAŁE ROZJEBANIA | ŚWIADOMY OMIT |
+|---|---|---|---|
+| MS-RDPEA (audio out, ścieżka VC) | 21/22 | 0 | UDP RDPSND (CryptKey/WaveEncrypt) |
+| RDPBCGR: połączenie/TLS/NLA/licensing | 28/28 | 0 | Standard RDP Security |
+| RDPBCGR: capabilities/obraz/input | 22/23 | 0 | orders, bitmap/glyph cache, QOI-guid |
+| RDPBCGR: kanały/autodetect/heartbeat/disco/ARC/multitransport | 14/14 | 0 | connect-time autodetect |
+
+Pozostałe otwarte (nie-normatywne lub optymalizacyjne):
+1. SVC wysyłka zawsze chunkiem 1600 — legalne (≤ negocjowanego rozmiaru), ale nie wykorzystuje większych negocjowanych rozmiarów (mniej ramek). Optymalizacja, nie rozbieżność.
+2. Shutdown Denied — ścieżka odmowy nieistnieje, bo serwer zawsze spełnia Shutdown Request (Denied tylko gdy serwer NIE zamierza się zamknąć). Zgodne.
+3. `sound.rs` (stub beep) — syntetyczny timestamp; nieużywany w produkcji (`sound_real.rs` poprawny).
+4. KANA lock z TS_SYNC — bez odpowiednika w X11, pomijany.
+5. Mouse relative — nadal nieobsługiwany (wymaga pointer warp; absolutna mysz domyślnie negocjowana).
+
+---
+
+# Raport oryginalny (audyt, 2026-09-11)
+
+Poniżej oryginalne tabele audytowe z werdyktami sprzed napraw (naprawione pozycje oznaczone 🛠 w tekście).
 
 ## TOP rozbieżności (priorytet napraw)
 
-1. **🔴 Multitransport na złym kanale** — Initiate Multitransport Request i odpowiedź klienta idą po kanale I/O, a spec 2.2.15.1/2.2.15.2 wymaga (MUST) MCS message channel. `crates/ironrdp-server/src/server.rs:3712` (wysyłka), `server.rs:3808-3835` (odbiór).
-2. **🔴 Set Error Info bez sprawdzenia flagi** — 3.3.5.7.1: MUST NOT wysyłać Set Error Info PDU do klienta bez `RNS_UD_CS_SUPPORT_ERRINFO_PDU`; kod wysyła bezwarunkowo (znany, udokumentowany gap — `AcceptorResult` nie eksponuje flagi). `server.rs:2763-2793`.
-3. **🔴 RDPSND: kanał ginie zamiast ignorować złe PDU** — MS-RDPEA 3.1.5 wymaga „MUST ignore malformed/unrecognized/out-of-sequence"; u nas nieoczekiwany PDU w stanie Waiting* → `state = Stop` (audio na całą sesję). `crates/ironrdp-rdpsnd/src/server.rs:310-336`.
-4. **🔴 RDPSND: off-by-one cBlockNo** — pierwszy Wave/Wave2 ma cBlockNo=0, a przy cLastBlockConfirmed=0 wysłanym w Server Formats PDU pierwszy blok MUSI być 1 (MS-RDPEA 3.3.5.2.1.1). `pdu/mod.rs:357`, `server.rs:168`.
-5. **🟡 Multitransport bez TS_UD_SC_MULTITRANSPORT** — serwer wysyła Initiate Multitransport Request, choć nigdy nie ogłasza wsparcia w GCC (`connection.rs:1078` = None); klient zgodny ze spec może odrzucić UDP.
-6. **🟡 Odrzucanie klientów bez fast-path output** — brak fallbacku do slow-path output (`server.rs:3592-3595`); spec dopuszcza serwer slow-path.
-7. **🟡 RDPSND: brak sprawdzenia TSSNDCAPS_ALIVE** przed streamowaniem fal (MS-RDPEA 3.3.5.2) + brak timeoutów na QualityMode/TrainingConfirm.
-8. **⚪ Autodetect i heartbeat niedostępne w binarym** — biblioteka zgodna ze spec, ale `linrdp/src/main.rs` nie wywołuje `enable_autodetect()`/`enable_heartbeat()` (funkcjonalność martwa w aplikacji).
-
----
+1. ~~**🔴 Multitransport na złym kanale**~~ 🛠 — Initiate Multitransport Request i odpowiedź klienta idą po kanale I/O, a spec 2.2.15.1/2.2.15.2 wymaga (MUST) MCS message channel. `server.rs` (wysyłka/odbiór).
+2. ~~**🔴 Set Error Info bez sprawdzenia flagi**~~ 🛠 — 3.3.5.7.1: MUST NOT bez `RNS_UD_CS_SUPPORT_ERRINFO_PDU`; wysyłano bezwarunkowo.
+3. ~~**🔴 RDPSND: kanał ginie zamiast ignorować złe PDU**~~ 🛠 — MS-RDPEA 3.1.5 „MUST ignore"; stan `Stop` zabijał audio na całą sesję.
+4. ~~**🔴 RDPSND: off-by-one cBlockNo**~~ 🛠 — pierwszy Wave miał blok 0 zamiast 1 (MS-RDPEA 3.3.5.2.1.1).
+5. ~~**🟡 Multitransport bez TS_UD_SC_MULTITRANSPORT**~~ 🛠 — serwer inicjował UDP bez ogłoszenia w GCC (2.2.1.4.6).
+6. ~~**🟡 Odrzucanie klientów bez fast-path output**~~ 🛠 — fallback slow-path (2.2.9.1.1).
+7. ~~**🟡 RDPSND: brak TSSNDCAPS_ALIVE + brak timeoutów QualityMode/TrainingConfirm**~~ 🛠.
+8. ~~**⚪ Autodetect i heartbeat martwe w binarym**~~ 🛠 — włączone w `main.rs`.
 
 ## 1. MS-RDPEA (audio output, MS-RDPSND) — `crates/ironrdp-rdpsnd`, `linrdp/src/sound*.rs`
 
 | Spec | Wymóg | Kod | Werdykt |
 |---|---|---|---|
-| 2.2.1 SNDPROLOG | msgType 0x01–0x0D, BodySize, semantyka dla msgType=0x02 | `pdu/mod.rs:16-26,1207-1272` | ✅ |
-| 2.2.2.1 Server Formats PDU | kolejność pól LE, pierwszy PDU serwera, wVersion=V8 | `pdu/mod.rs:328-396`, `server.rs:391-403` | ✅ |
-| 2.2.2.1 + 3.3.5.2.1.1 | pierwszy cBlockNo = cLastBlockConfirmed+1 | `server.rs:168` startuje od 0 | 🔴 off-by-one |
-| 2.2.2.1.1 AUDIO_FORMAT | wFormatTag/cbSize/data; OPUS 0x704F, PCM 0x0001 | `pdu/mod.rs:93,198,215-326` | ✅ |
-| 2.2.2.2 Client Formats | dwFlags bitflags, wDGramPort **big-endian** | `pdu/mod.rs:404-499` | ✅ |
-| 2.2.2.2 wVersion | dowolna wartość wersji | TryFrom tylko 2/5/6/8 — nowsza wersja klienta = błąd dekodowania | 🟡 |
-| 3.2/3.3.5.1.1.2 | lista formatów klienta podzbiorem serwera | `negotiate_formats` — przecięcie, brak jawnej walidacji podzbioru | ✅ (funkcjonalnie) |
-| 2.2.2.3 Quality Mode | odebranie przy wersji ≥6, przechowanie | `server.rs:320-334` | ✅ |
-| 3.3.5.1.1.3 | timeout QualityMode → DYNAMIC (SHOULD) | brak timera — stan wisi | ⚪ |
-| 2.2.2.4 Crypt Key | wysyłany tylko przy UDP (MUST NOT inaczej) | nigdy nie wysyłany, brak UDP | ⚫ poprawny omit |
-| 2.2.3.1/2.2.3.2 Training | echo wTimeStamp/wPackSize, wPackSize=0 gdy brak danych | `pdu/mod.rs:618-722`, `server.rs:325,336` | ✅ |
-| 3.1.5 | timeout na Training Confirm | brak timera | 🟡 |
-| 2.2.3.3/2.2.3.4 WaveInfo+Wave | split 4B prefix + WaveData, bPad=0, limity długości | `pdu/mod.rs:724-907`, `server.rs:224-247` | ✅ (poza cBlockNo) |
-| 2.2.3.8 Wave Confirm | semantyka timestamp = wave ts + held time | `sound_real.rs:302-326` (FIFO + wrapping_sub) | ✅ |
-| 2.2.3.10 Wave2 | pola + dwAudioTimestamp, wersja ≥8 | `pdu/mod.rs:1029-1104`, `server.rs:215-223` | ✅ |
-| 2.2.3.10 | wTimeStamp = czas budowy PDU | `sound.rs:90` — syntetyczny licznik (stub); `sound_real.rs:223` OK | 🟡 |
-| 2.2.4.1 Volume | tylko gdy TSSNDCAPS_VOLUME, L=low word | `server.rs:254-265` | ✅ |
-| 2.2.4.2 Pitch | tylko gdy TSSNDCAPS_PITCH | struktura gotowa, brak API wysyłki | 🟡 |
-| 2.2.3.5–2.2.3.7 UDP Wave/Encrypt/Frag | ścieżka UDP | nieimplementowana (TODO w `pdu/mod.rs:28`) | ⚫ (spec 5.1 sam zaleca VC) |
-| 2.2.3.9 Close | msgType 0x01 | `server.rs:267-269` | ✅ |
-| 3.1.5 | malformed/out-of-sequence MUST be ignored | `server.rs:310-336` — zamiast ignorować: Stop/Err | 🔴 |
-| 3.3.5.2 | TSSNDCAPS_ALIVE wymagane do transferu | `wave()` nie sprawdza | 🟡 |
-| 3.3.5.2.1.1 | inkrementacja cBlockNo, wrap 255→0 | `overflowing_add(1)` | ✅ |
-| 1.3.2.2 | Wave2 gdy obie wersje ≥8 | `server.rs:215` | ✅ |
+| 2.2.1 SNDPROLOG | msgType 0x01–0x0D, BodySize | `pdu/mod.rs` | ✅ |
+| 2.2.2.1 Server Formats PDU | pola LE, pierwszy PDU serwera, V8 | `server.rs` | ✅ |
+| 2.2.2.1 + 3.3.5.2.1.1 | pierwszy cBlockNo = cLastBlockConfirmed+1 | startował od 0 | 🔴 → 🛠 |
+| 2.2.2.1.1 AUDIO_FORMAT | OPUS 0x704F, PCM 0x0001, cbSize | `pdu/mod.rs` | ✅ |
+| 2.2.2.2 Client Formats | dwFlags, wDGramPort big-endian | `pdu/mod.rs` | ✅ |
+| 2.2.2.2 wVersion | dowolna wartość wersji | błąd dekodowania przy nieznanej | 🟡 → 🛠 (Version::negotiate) |
+| 2.2.2.3 Quality Mode | odebranie ≥6, przechowanie | `server.rs` | ✅ |
+| 3.3.5.1.1.3 | timeout QualityMode → DYNAMIC (SHOULD) | brak | ⚪ → 🛠 (5 s) |
+| 2.2.2.4 Crypt Key | tylko przy UDP (MUST NOT inaczej) | nigdy nie wysyłany | ⚫ poprawny omit |
+| 2.2.3.1/2 Training | echo, wPackSize | `pdu/mod.rs`, `server.rs` | ✅ |
+| 3.1.5 | timeout Training Confirm | brak | 🟡 → 🛠 (5 s → terminate) |
+| 2.2.3.3/4 WaveInfo+Wave | split, bPad=0, limity | `server.rs` | ✅ |
+| 2.2.3.8 Wave Confirm | timestamp = wave ts + held | `sound_real.rs` | ✅ |
+| 2.2.3.10 Wave2 | pola + dwAudioTimestamp, ≥8 | `server.rs` | ✅ |
+| 2.2.3.10 | wTimeStamp = czas budowy PDU | `sound.rs` syntetyczny (stub, nieużywany) | 🟡 (pozostaje — stub) |
+| 2.2.4.1 Volume | tylko przy TSSNDCAPS_VOLUME | `server.rs` | ✅ |
+| 2.2.4.2 Pitch | tylko przy TSSNDCAPS_PITCH | brak API | 🟡 → 🛠 (set_pitch) |
+| 2.2.3.5–7 UDP Wave/Encrypt/Frag | ścieżka UDP | TODO w kodzie | ⚫ (spec 5.1 zaleca VC) |
+| 2.2.3.9 Close | msgType 0x01 | `server.rs` | ✅ |
+| 3.1.5 | malformed/out-of-sequence MUST ignore | Stop/Err | 🔴 → 🛠 (warn + ignore) |
+| 3.3.5.2 | TSSNDCAPS_ALIVE do transferu | brak sprawdzania | 🟡 → 🛠 |
+| 3.3.5.2.1.1 | inkrementacja, wrap 255→0 | `overflowing_add` | ✅ |
+| 1.3.2.2 | Wave2 gdy obie wersje ≥8 | `server.rs` | ✅ |
 
-## 2. RDPBCGR — połączenie, TLS/NLA, licensing — `ironrdp-acceptor`, `ironrdp-tls`, `linrdp/src/{auth,sam,tls}.rs`
-
-| Spec | Wymóg | Kod | Werdykt |
-|---|---|---|---|
-| 3.3.5.3.1–3.3.5.3.2 | dekodowanie nego, ignorowanie cookie/routingToken, poprawny CORRELATION_INFO | `nego.rs:224-440`, `connection.rs:522-535` | ✅ |
-| 3.3.5.3.2 | selectedProtocol = dokładnie jeden wspólny; brak wspólnego → NEG_FAILURE + close | `connection.rs:537-573` | ✅ |
-| 3.3.5.3.2 | brak nego data u klienta → NIE wysyłać danych negocjacyjnych (MUST NOT) | klient bez nego dostaje RDP_NEG_FAILURE (praktyka Windows, formalne naruszenie) — `connection.rs:545-573` | 🟡 |
-| 3.3.5.3.1 | walidacja TPKT/X.224 (Class 0) | brak jawnej weryfikacji Class 0 (pola mają być ignorowane) | 🟡 |
-| 5.4.5.2 | CredSSP po TLS przed Basic Settings | `connection.rs:593-610`, `server.rs:1108-1137` | ✅ |
-| 2.2.10.2 | HYBRID_EX → Early User Auth Result przed MCS | `lib.rs:131-149` | ✅ |
-| 5.4.2 | NTLM z sekretem konta (SAM) | `credssp.rs:54-81`, `linrdp/src/{sam,auth}.rs` | ✅ |
-| 2.2.1.3.2/2.2.1.4.2 | Client/Server Core Info, echo requestedProtocols | `gcc/core_data/*`, `connection.rs:635-646,1054-1080` | ✅ |
-| 3.3.5.3.3 | MergeDomainParameters (SHOULD) | statyczne `DomainParameters::target()`, brak walidacji min/max — `connection.rs:752-757` | 🟡 |
-| 2.2.1.4.3 | Enhanced Security → encryptionMethod=0/level=0 | `no_security()` | ✅ |
-| 2.2.1.4.4/2.2.1.4.6 | Network Data (ioChannel+IDs), Message Channel Data | `connection.rs:739-776,1071-1077` | ✅ |
-| 3.3.5.3.5–3.3.5.3.9 | Erect Domain/Attach User/Channel Join Confirm | `channel_connection.rs:82-168` | ✅ / 🟡 (nieoczekiwany channel_id → zerwanie zamiast Confirm z result≠0 — SHOULD) |
-| 3.3.5.3.10 | Server Security Exchange (tylko Standard Security) | nieobecny — spójne z brakiem STANDARD | ⚫ |
-| 3.3.5.3.11 | Client Info PDU + ARC | `connection.rs:820-872` | ✅ |
-| 3.3.5.3.12 / 2.2.1.12.1.3 | License Error STATUS_VALID_CLIENT | `connection.rs:874-899` | ✅ (kolejność vs diagram 1.3.1.1 — patrz §3 pkt 2) |
-| 3.3.5.3.13.1–3.3.5.3.22 | Demand Active → Monitor Layout (gating) → Confirm Active → Synchronize/Cooperate/Control/Font | `connection.rs:901-1044`, `finalization.rs` | ✅ |
-| 5.3 | brak Standard RDP Security | `main.rs:94` tylko `with_hybrid`; brak SSL w fladze | ⚫ potwierdzone (klient only-TLS dostaje HYBRID_REQUIRED_BY_SERVER) |
-
-## 3. RDPBCGR — capabilities, obraz, input — `ironrdp-server`, `ironrdp-pdu/capability_sets`, `linrdp/src/{capture,input}.rs`
+## 2. RDPBCGR — połączenie, TLS/NLA, licensing — `ironrdp-acceptor`, `linrdp/src/{auth,sam,tls}.rs`
 
 | Spec | Wymóg | Kod | Werdykt |
 |---|---|---|---|
-| 2.2.1.13.1 | TS_DEMAND_ACTIVE_PDU struktura | `capability_sets/mod.rs:82-247` | ✅ |
-| 1.3.1.1 (diagram) | Demand Active przed License Exchange | License Error wysyłany **przed** Demand Active — `connection.rs:874-933` | 🟡 (klienty akceptują) |
-| 2.2.1.13.2 | originatorId Confirm Active = 0x03EA (MUST) | dekodowane, nie sprawdzane — `connection.rs:995-1000` | 🟡 |
-| 2.2.7.1.1 General | protocolVersion 0x0200, extraFlags, refresh/suppress | `general/mod.rs`, `capabilities.rs:25-38` | ✅ |
-| 2.2.7.1.2 Bitmap | 32bpp, compressionFlag, multipleRectangle | `bitmap/mod.rs`, `capabilities.rs:40-50` | ✅ |
-| 2.2.7.1.3 Order | struktura 84 B; orderSupport | wysyłany, ale orders nieużywane (zerowe wsparcie) | ⚫ |
-| 2.2.7.1.4 / 2.2.7.2.6 | Bitmap Cache / Cache V3 | dekoder gotowy, serwer nie reklamuje | ⚫ |
-| 2.2.7.1.5 Pointer | cacheSize 2048/2048, honorowanie 0 i Large Pointer | `capabilities.rs:67-72`, `server.rs:3640-3668` | ✅ |
-| 2.2.7.1.6 Input | maski zgodne; keyboardFunctionKey SHOULD=0 | =128 — `capabilities.rs:74-88` | 🟡 |
-| 2.2.7.1.10 VirtualChannel | chunkSize 1600–16256 walidowany | nie walidowany przy dekodowaniu | 🟡 |
-| 2.2.7.2.x Multifragment/LargePointer | progi 38055/608299 | `capabilities.rs:97-123` | ✅ |
-| TS_UD_SC_MULTITRANSPORT (2.2.1.4.6) | ogłosić wsparcie przed inicjacją UDP | zawsze `None` — `connection.rs:1078`, a serwer wysyła Initiate Multitransport (`server.rs:3705-3720`) | 🔴/🟡 |
-| 2.2.7.2.10 Bitmap Codecs | GUID-e (NSCodec/RemoteFX/ImageRemoteFX/Ignore), NSCodec CAPS clamp 1–7 | `bitmap_codecs/mod.rs`, `server.rs:3616-3660`; QOI/QOIZ = rozszerzenie poza spec | ✅ (+⚫ niestandardowe GUID-y) |
-| 2.2.9.1.1.2 | fragmentacja FP output SINGLE/FIRST/NEXT/LAST | `encoder/fast_path.rs:51-108` | ✅ |
-| 2.2.9.1.1.3.1 | TS_BITMAP_DATA rect inclusive, compr header | `basic_output/bitmap/mod.rs`, `encoder/bitmap.rs` (FIXME: szerokość %4) | ✅ |
-| 2.2.9.1.1.1 | Surface Commands + Frame Marker | `capabilities.rs:61-65`, `encoder/mod.rs:467-480` | ✅ |
-| 2.2.8.1.1.x | nagłówki FP/slow input, kody zdarzeń i flagi | `input/fast_path.rs:59-264`, `server.rs:4013-4041` | ✅ |
-| 2.2.8 (aplikacyjnie) | TS_UNICODE / TS_SYNC | dekodowane, ale iniekcja XTEST ignoruje — `linrdp/src/input.rs:103-124` | 🟡 |
-| 3.3.5.3.x | fallback do slow-path output | klient bez FASTPATH_OUTPUT → błąd połączenia — `server.rs:3592-3595` | 🔴 minor |
-| 3.3.5.3.3 | clamp desktop size zamiast disconnect | `server.rs:339,3603-3613` | ✅ |
-| 1.3.1.3 / 2.2.3.1 | Deactivate All (shareId=0) + re-negocjacja | `server.rs:2691-2695,4291-4311` | ✅ |
+| 3.3.5.3.1–2 | dekodowanie nego, cookie ignorowane, CORRELATION_INFO | `nego.rs`, `connection.rs` | ✅ |
+| 3.3.5.3.2 | selectedProtocol = jeden wspólny; brak → NEG_FAILURE + close | `connection.rs` | ✅ |
+| 3.3.5.3.2 | brak nego u klienta → NIE wysyłać danych negocjacyjnych | wysyłano NEG_FAILURE | 🟡 → 🛠 (NoNegotiation + drop) |
+| 3.3.5.3.1 | walidacja TPKT/X.224 | dokładne dopasowanie kodów TPDU | ✅ (Class 0 zawarty w kodzie TPDU) |
+| 5.4.5.2 | CredSSP po TLS | `connection.rs`, `server.rs` | ✅ |
+| 2.2.10.2 | HYBRID_EX → EUAR przed MCS | `lib.rs` | ✅ |
+| 5.4.2 | NTLM z sekretem konta (SAM) | `credssp.rs`, `sam.rs` | ✅ |
+| 2.2.1.3.2/4.2 | Client/Server Core Info, echo requestedProtocols | `gcc/*`, `connection.rs` | ✅ |
+| 3.3.5.3.3 | MergeDomainParameters (SHOULD) | statyczne target() | 🟡 → 🛠 (DomainParameters::merge) |
+| 2.2.1.4.3 | Enhanced Security → encryptionMethod=0 | `no_security()` | ✅ |
+| 2.2.1.4.4/6 | Network Data, Message Channel Data | `connection.rs` | ✅ |
+| 3.3.5.3.5–9 | Erect Domain/Attach User/Channel Join | `channel_connection.rs` | ✅ / 🟡 → 🛠 (Confirm z błędem zamiast drop; repeat-join ignore) |
+| 3.3.5.3.10 | Server Security Exchange (tylko Standard) | nieobecny | ⚫ spójne |
+| 3.3.5.3.11 | Client Info + ARC | `connection.rs` | ✅ |
+| 3.3.5.3.12 | License Error STATUS_VALID_CLIENT | `connection.rs` | ✅ (kolejność wg 4.1.11→4.1.12 — zgodna) |
+| 3.3.5.3.13–22 | Demand Active → finalizacja | `connection.rs`, `finalization.rs` | ✅ |
+| 5.3 | brak Standard RDP Security | `main.rs` only hybrid | ⚫ potwierdzone |
 
-## 4. RDPBCGR — kanały statyczne, autodetect, heartbeat, rozłączanie, auto-reconnect, multitransport
+## 3. RDPBCGR — capabilities, obraz, input — `ironrdp-server`, `ironrdp-pdu`, `linrdp/src/{capture,input}.rs`
 
 | Spec | Wymóg | Kod | Werdykt |
 |---|---|---|---|
-| 1.3.3 / 3.2.5.x | SVC chunking FIRST/LAST, reasemblacja, 1600 | `ironrdp-svc/src/lib.rs:174-475,869` | ✅ (chunk zawsze 1600, negocjowany rozmiar niewykorzystany — 🟡 kosmetycznie) |
-| 2.2.14.1/2.2.14.2 | struktury autodetect req/rsp (RTT/BW/NETCHAR, kody 0x0001/0x0014/0x0429/0x0840…) | `autodetect.rs:285-431,632-735` | ✅ |
-| 2.2.14.3/2.2.14.4 | framing po MCS message channel | `server.rs:4113-4131,3895-3970` | ✅ |
-| 3.3.5.x | continuous autodetect (RTT + BW bez payloadu) | `ironrdp-server/src/autodetect.rs:143-253` | ✅ (biblioteka) |
-| 1.3.9 | connect-time autodetect | konstruktory gotowe, brak ścieżki | ⚫ |
-| 3.3.5.x | włączenie autodetect w aplikacji | `main.rs` nie wysyła `AutoDetectRttRequest` | ⚪ w binarym |
-| 2.2.16.1 | Heartbeat PDU + gating SUPPORT_HEARTBEAT + idle-only | `heartbeat.rs:46-66`, `server.rs:3264,3437-3474` | ✅ (biblioteka) |
-| 2.2.16.1 | heartbeat w aplikacji | `main.rs` nie wywołuje `enable_heartbeat()` | ⚪ w binarym |
-| 2.2.3.1.1 | Deactivate All shareId=0 | `server.rs:4291-4309` | ✅ |
-| 2.2.2.1/2.2.2.2 | Shutdown Request / Shutdown Denied | Request kończy sesję; brak ścieżki odmowy (`headers.rs:540` nieużywany) | 🟡 |
-| 3.3.5.6 | serwer może wysłać Disconnect Provider Ultimatum | nigdy nie wysyłany; obce reason codes ignorowane bez logu | 🟡 |
-| 2.2.5.1.1 | Set Error Info pduSource=0 | `server.rs:2771-2793` | ✅ |
-| 3.3.5.7.1 | MUST NOT wysyłać Error Info bez RNS_UD_CS_SUPPORT_ERRINFO_PDU | wysyłane bezwarunkowo (KNOWN GAP — flaga nieeksponowana) — `server.rs:2763-2770` | 🔴 |
-| 2.2.4.2/2.2.4.3 + 5.5 | ARC cookies, HMAC-MD5 securityVerifier, rotacja godzinowa | `logon_extended.rs:104-172`, `client_info.rs:374-387`, `server.rs:1546-1640,3425-3435` | ✅ |
-| 3.3.5.4.3 | autoreconnect pomija re-autentykację | `server.rs:3497-3521` | ✅ |
-| 2.2.15.1 | Initiate Multitransport Request — struktura | `multitransport.rs`, `server.rs:4269-4288` | ✅ |
-| 2.2.15.1/2.2.15.2 | multitransport PDU **wyłącznie po MCS message channel** (MUST) | wysyłka i odbiór na kanale I/O — `server.rs:3712,3808-3835` | 🔴 |
-| 3.3.5.8 | gating multitransport na zgodę klienta (GCC) | `server.rs:3707-3719` | ✅ (ale patrz TS_UD_SC wyżej) |
-| 2.2.5.x | share headers, chunking SVC w SendDataIndication | `server.rs:~4160`, `ironrdp-svc` | ✅ |
+| 2.2.1.13.1 | TS_DEMAND_ACTIVE_PDU | `capability_sets/mod.rs` | ✅ |
+| 1.3.1.1/4.1 | License Error przed Demand Active | kolejność zgodna (4.1.11→4.1.12) | ✅ (punkt wycofany) |
+| 2.2.1.13.2 | originatorId = 0x03EA | niewalidowane | 🟡 → 🛠 (warn) |
+| 2.2.7.1.1 General | protocolVersion 0x0200, extraFlags | `general/mod.rs`, `capabilities.rs` | ✅ |
+| 2.2.7.1.2 Bitmap | 32bpp, compressionFlag, multipleRectangle | `capabilities.rs` | ✅ |
+| 2.2.7.1.3 Order | 84 B; orders nieużywane | zerowe wsparcie | ⚫ |
+| 2.2.7.1.4 / 2.2.7.2.6 | Bitmap Cache | nie reklamowany | ⚫ |
+| 2.2.7.1.5 Pointer | cacheSize, Large Pointer | `capabilities.rs`, `server.rs` | ✅ |
+| 2.2.7.1.6 Input | keyboardFunctionKey SHOULD=0 | =128 | 🟡 → 🛠 (=0) |
+| 2.2.7.1.10 VirtualChannel | chunkSize 1600–16256 | bez walidacji | 🟡 → 🛠 (walidacja + warn; wysyłka 1600 = legalne minimum) |
+| 2.2.7.2.x Multifragment/LargePointer | progi | `capabilities.rs` | ✅ |
+| TS_UD_SC_MULTITRANSPORT | ogłosić przed inicjacją UDP | zawsze None | 🔴/🟡 → 🛠 (announce UDP/FECR) |
+| 2.2.7.2.10 Bitmap Codecs | GUID-e, NSCodec CAPS | `bitmap_codecs/mod.rs` | ✅ (QOI/QOIZ = rozszerzenie; limit 16 wycofany — max 255 wg spec) |
+| 2.2.9.1.1.2 | fragmentacja FP output | `encoder/fast_path.rs` | ✅ |
+| 2.2.9.1.1.3.1 | TS_BITMAP_DATA | `basic_output/bitmap` | ✅ (FIXME szerokość %4 pozostaje) |
+| 2.2.9.1.1.1 | Surface Commands + Frame Marker | `encoder/mod.rs` | ✅ |
+| 2.2.8.1.1.x | FP/slow input, kody zdarzeń | `input/fast_path.rs` | ✅ |
+| 2.2.8 (iniekcja) | TS_UNICODE / TS_SYNC | ignorowane | 🟡 → 🛠 (keysym remap + XTEST; toggle locków) |
+| 3.3.5.3.x | fallback slow-path output | Err przy braku fast-path | 🔴 minor → 🛠 (slow-path Update PDUs) |
+| 3.3.5.3.3 | clamp desktop size | `server.rs` | ✅ |
+| 1.3.1.3 / 2.2.3.1 | Deactivate All + re-negocjacja | `server.rs` | ✅ |
 
----
+## 4. RDPBCGR — kanały, autodetect, heartbeat, disco, ARC, multitransport
 
-## Wnioski
+| Spec | Wymóg | Kod | Werdykt |
+|---|---|---|---|
+| 1.3.3 / 3.2.5.x | SVC chunking 1600, reasemblacja | `ironrdp-svc` | ✅ |
+| 2.2.14.1/2 | struktury autodetect | `autodetect.rs` | ✅ |
+| 2.2.14.3/4 | framing po message channel | `server.rs` | ✅ |
+| 3.3.5.x | continuous autodetect | `autodetect.rs` | ✅ (biblioteka) |
+| — | autodetect w aplikacji | nie włączony | ⚪ → 🛠 (main.rs) |
+| 2.2.16.1 | Heartbeat + gating + idle-only | `heartbeat.rs`, `server.rs` | ✅ (biblioteka) |
+| — | heartbeat w aplikacji | nie włączony | ⚪ → 🛠 (main.rs) |
+| 2.2.3.1.1 | Deactivate All shareId=0 | `server.rs` | ✅ |
+| 2.2.2.1/2 | Shutdown Request/Denied | brak ścieżki odmowy | 🟡 (zgodne — serwer zawsze spełnia; dodany log) |
+| 3.3.5.6 | Ultimatum przy rozłączeniu serwera | nigdy niewysyłany | 🟡 → 🛠 (ProviderInitiated, best-effort) |
+| 2.2.5.1.1 | Set Error Info pduSource=0 | `server.rs` | ✅ |
+| 3.3.5.7.1 | Error Info tylko z flagą ERRINFO | bezwarunkowo | 🔴 → 🛠 (gating) |
+| 2.2.4.2/3 + 5.5 | ARC cookies, HMAC-MD5, rotacja | `session_info`, `server.rs` | ✅ |
+| 3.3.5.4.3 | autoreconnect pomija re-auth | `server.rs` | ✅ |
+| 2.2.15.1 | struktura Initiate MT Request | `multitransport.rs` | ✅ |
+| 2.2.15.1/2 | multitransport PDU po message channel (MUST) | kanał I/O | 🔴 → 🛠 (message channel + fallback) |
+| 3.3.5.8 | gating na zgodę klienta | `server.rs` | ✅ |
+| 2.2.5.x | share headers, chunking SVC | `server.rs`, `ironrdp-svc` | ✅ |
 
-- **Największe realne ryzyka interoperacyjne:** multitransport (zły kanał + brak TS_UD_SC_MULTITRANSPORT — klient ściśle zgodny ze spec odrzuci UDP) oraz wrażliwość audio na jeden uszkodzony PDU (RDPSND `Stop` zamiast ignore).
-- **Szybkie fixy (niska kosztowność):** cBlockNo off-by-one, sprawdzenie TSSNDCAPS_ALIVE, timeouty QualityMode/TrainingConfirm, włączenie `enable_autodetect()`/`enable_heartbeat()` w `main.rs`, eksport flagi ERRINFO z acceptora.
-- **Świadome omity** (Standard RDP Security, ścieżka UDP RDPSND z RC4/SHA-1, orders/glyph/brush cache, connect-time autodetect) są spójne z polityką projektu i zwykle zalecane przez samą spec (deprecated).
-- Pełne szczegóły z file:line w tabelach powyżej; odnośniki do dokumentacji: `docs/microsoft-docs/ms-rdpbcgr.txt`, `docs/microsoft-docs/ms-rdpea.txt` (ekstrakt z docx).
+## Wnioski (po naprawach)
+
+- Wszystkie naruszenia MUST z audytu zostały usunięte; pozostałe rozbieżności to świadome omity (zwykle zalecane przez samą spec jako deprecated) lub optymalizacje bez znaczenia normatywnego.
+- Świadome omity: Standard RDP Security (5.3), ścieżka UDP RDPSND z RC4/SHA-1 (MS-RDPEA 5.1 zaleca VC), orders/glyph/brush/bitmap cache, connect-time autodetect (warstwa PDU gotowa), RemoteFX video-mode.
+- Odnośniki: `docs/microsoft-docs/ms-rdpbcgr.txt`, `docs/microsoft-docs/ms-rdpea.txt` (ekstrakt z docx).
