@@ -9,6 +9,7 @@ use x11rb::connection::Connection as _;
 use x11rb::protocol::xproto::ConnectionExt as _;
 use x11rb::protocol::xtest::ConnectionExt as _;
 
+use ironrdp_pdu::input::fast_path::SynchronizeFlags;
 use ironrdp_server::{KeyboardEvent, MouseButton, MouseEvent, RdpServerInputHandler};
 
 // XTEST FakeInput event types (X.Org xtest protocol).
@@ -20,10 +21,25 @@ const FAKE_MOTION: u8 = 6;
 // XTEST uses a special device id for synthesized input.
 const XTEST_DEVICE_ID: u8 = 0;
 
+// Lock-key keycodes on the evdev/Xvfb layout (XT scancode + 8): CapsLock
+// 0x3A->66, NumLock 0x45->77, ScrollLock 0x46->78.
+const KEYCODE_CAPS_LOCK: u8 = 66;
+const KEYCODE_NUM_LOCK: u8 = 77;
+const KEYCODE_SCROLL_LOCK: u8 = 78;
+
 #[derive(Debug, Clone)]
 pub(crate) struct X11InputHandler {
     conn: Arc<x11rb::rust_connection::RustConnection>,
     root: u32,
+    /// Keycode remapped on the fly for TS_UNICODE injection (MS-RDPBCGR
+    /// 2.2.8.1.1.3.1.1.4): discovered lazily as a keycode with no keysyms
+    /// bound, then pointed at the needed Unicode keysym before each
+    /// press/release pair.
+    unicode_keycode: Option<u8>,
+    /// Our belief of the X server lock states, tracked so a client
+    /// TS_SYNC_FLAGS event (2.2.8.1.1.3.1.1.5) can toggle the locks toward
+    /// the requested state. Starts all-off, matching a fresh Xvfb.
+    locks: SynchronizeFlags,
 }
 
 impl X11InputHandler {
@@ -35,7 +51,82 @@ impl X11InputHandler {
         Ok(Self {
             conn: Arc::new(conn),
             root,
+            unicode_keycode: None,
+            locks: SynchronizeFlags::empty(),
         })
+    }
+
+    /// Find a keycode with no keysyms bound anywhere (NoSymbol in every
+    /// group) — safe to remap for Unicode injection.
+    fn find_free_keycode(&self) -> Option<u8> {
+        let setup = self.conn.setup();
+        let min = setup.min_keycode;
+        let max = setup.max_keycode;
+        let count = max - min + 1;
+        let reply = self
+            .conn
+            .get_keyboard_mapping(min, count)
+            .ok()?
+            .reply()
+            .ok()?;
+        let per_keycode = usize::from(reply.keysyms_per_keycode.max(1));
+        for (i, chunk) in reply.keysyms.chunks(per_keycode).enumerate() {
+            if chunk.iter().all(|&sym| sym == 0) {
+                return Some(min + i as u8);
+            }
+        }
+        None
+    }
+
+    /// TS_UNICODE (MS-RDPBCGR 2.2.8.1.1.3.1.1.4): remap the scratch keycode
+    /// to the character's keysym and press it. Latin-1 code points use their
+    /// identity keysym; the rest use the Unicode keysym range (0x0100_0000 |
+    /// cp, X11 protocol § "Keysym Encoding").
+    fn send_unicode(&mut self, code: u16) {
+        let Some(ch) = char::from_u32(u32::from(code)) else {
+            return;
+        };
+        let cp = u32::from(ch);
+        let keysym = if (0x20..=0x7e).contains(&cp) { cp } else { 0x0100_0000 | cp };
+
+        if self.unicode_keycode.is_none() {
+            self.unicode_keycode = self.find_free_keycode();
+            if let Some(kc) = self.unicode_keycode {
+                tracing::debug!(keycode = kc, "using keycode for TS_UNICODE injection");
+            } else {
+                tracing::warn!("no free keycode for TS_UNICODE injection; unicode input dropped");
+            }
+        }
+        let Some(keycode) = self.unicode_keycode else { return };
+
+        if let Err(e) = self
+            .conn
+            .change_keyboard_mapping(1, keycode, 1, &[keysym])
+        {
+            tracing::warn!(error = %e, "ChangeKeyboardMapping failed for unicode input");
+            return;
+        }
+        // Wait for the mapping change to land before synthesizing the key.
+        let _ = x11rb::wrapper::ConnectionExt::sync(self.conn.as_ref());
+        self.fake_key(keycode, true);
+        self.fake_key(keycode, false);
+    }
+
+    /// TS_SYNC_FLAGS (2.2.8.1.1.3.1.1.5): bring the X server lock states in
+    /// line with the client's by toggling the corresponding lock keys.
+    fn synchronize(&mut self, want: SynchronizeFlags) {
+        let toggles = [
+            (want.contains(SynchronizeFlags::CAPS_LOCK), self.locks.contains(SynchronizeFlags::CAPS_LOCK), KEYCODE_CAPS_LOCK, SynchronizeFlags::CAPS_LOCK),
+            (want.contains(SynchronizeFlags::NUM_LOCK), self.locks.contains(SynchronizeFlags::NUM_LOCK), KEYCODE_NUM_LOCK, SynchronizeFlags::NUM_LOCK),
+            (want.contains(SynchronizeFlags::SCROLL_LOCK), self.locks.contains(SynchronizeFlags::SCROLL_LOCK), KEYCODE_SCROLL_LOCK, SynchronizeFlags::SCROLL_LOCK),
+        ];
+        for (desired, current, keycode, flag) in toggles {
+            if desired != current {
+                self.fake_key(keycode, true);
+                self.fake_key(keycode, false);
+                self.locks.toggle(flag);
+            }
+        }
     }
 
     fn fake_key(&self, keycode: u8, pressed: bool) {
@@ -86,11 +177,12 @@ impl RdpServerInputHandler for X11InputHandler {
                     self.fake_key(kc, false);
                 }
             }
-            KeyboardEvent::UnicodePressed(_) | KeyboardEvent::UnicodeReleased(_) => {
-                // No direct unicode path via XTEST; keysym mapping is out of
-                // scope for this build — ignore silently.
+            KeyboardEvent::UnicodePressed(code) => self.send_unicode(code),
+            KeyboardEvent::UnicodeReleased(_) => {
+                // send_unicode emits the full press/release pair on the
+                // pressed event; nothing to do on release.
             }
-            KeyboardEvent::Synchronize(_) => {}
+            KeyboardEvent::Synchronize(flags) => self.synchronize(flags),
         }
         let _ = self.conn.flush();
     }
