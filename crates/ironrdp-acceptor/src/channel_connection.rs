@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use ironrdp_connector::{
-    ConnectorError, ConnectorErrorExt as _, ConnectorResult, MonotonicInstant, Sequence, State, Written, reason_err,
+    ConnectorError, ConnectorErrorExt as _, ConnectorResult, MonotonicInstant, Sequence, State, Written,
 };
 use ironrdp_core::WriteBuf;
 use ironrdp_pdu::mcs;
@@ -25,13 +25,18 @@ pub enum ChannelConnectionState {
     SendAttachUserConfirm,
     WaitChannelJoinRequest {
         remaining: HashSet<u16>,
+        joined: HashSet<u16>,
     },
     SendChannelJoinConfirm {
         remaining: HashSet<u16>,
         channel_id: u16,
+        joined: HashSet<u16>,
     },
     AllJoined,
 }
+
+/// T.125 Result code for a channel the server never announced: rt-no-such-channel.
+const RT_NO_SUCH_CHANNEL: u8 = 3;
 
 impl State for ChannelConnectionState {
     fn name(&self) -> &'static str {
@@ -111,29 +116,49 @@ impl Sequence for ChannelConnectionSequence {
                     ironrdp_core::encode_buf(&X224(attach_user_confirm), output).map_err(ConnectorError::encode)?;
 
                 let next_state = match self.channel_ids.take() {
-                    Some(channel_ids) => ChannelConnectionState::WaitChannelJoinRequest { remaining: channel_ids },
+                    Some(channel_ids) => ChannelConnectionState::WaitChannelJoinRequest {
+                        remaining: channel_ids,
+                        joined: HashSet::new(),
+                    },
                     None => ChannelConnectionState::AllJoined,
                 };
 
                 (Written::from_size(written)?, next_state)
             }
 
-            ChannelConnectionState::WaitChannelJoinRequest { mut remaining } => {
+            ChannelConnectionState::WaitChannelJoinRequest { mut remaining, joined } => {
                 let channel_request = ironrdp_core::decode::<X224<mcs::ChannelJoinRequest>>(input)
                     .map_err(ConnectorError::decode)
                     .map(|p| p.0)?;
 
                 debug!(message = ?channel_request, "Received");
 
+                if joined.contains(&channel_request.channel_id) {
+                    // MS-RDPBCGR 3.3.5.3.8: a Channel Join Request for a
+                    // channel that is already joined SHOULD be ignored — no
+                    // confirm is sent.
+                    debug!(channel = channel_request.channel_id, "channel already joined; ignoring");
+                    self.state = ChannelConnectionState::WaitChannelJoinRequest { remaining, joined };
+                    return Ok(Written::Nothing);
+                }
+
                 let is_expected = remaining.remove(&channel_request.channel_id);
 
                 if !is_expected {
-                    return Err(reason_err!(
-                        "ChannelJoinConfirm",
-                        "unexpected channel_id in MCS Channel Join Request: got {}, expected one of: {:?}",
-                        channel_request.channel_id,
-                        remaining,
-                    ));
+                    // MS-RDPBCGR 3.3.5.3.8: answer the join with a Channel
+                    // Join Confirm carrying a non-zero Result instead of
+                    // dropping the whole connection.
+                    debug!(channel = channel_request.channel_id, "unexpected channel join; rejecting");
+                    let reject = mcs::ChannelJoinConfirm {
+                        result: RT_NO_SUCH_CHANNEL,
+                        initiator_id: self.user_channel_id,
+                        requested_channel_id: channel_request.channel_id,
+                        channel_id: channel_request.channel_id,
+                    };
+                    let written =
+                        ironrdp_core::encode_buf(&X224(reject), output).map_err(ConnectorError::encode)?;
+                    self.state = ChannelConnectionState::WaitChannelJoinRequest { remaining, joined };
+                    return Ok(Written::from_size(written)?);
                 }
 
                 (
@@ -141,11 +166,16 @@ impl Sequence for ChannelConnectionSequence {
                     ChannelConnectionState::SendChannelJoinConfirm {
                         remaining,
                         channel_id: channel_request.channel_id,
+                        joined,
                     },
                 )
             }
 
-            ChannelConnectionState::SendChannelJoinConfirm { remaining, channel_id } => {
+            ChannelConnectionState::SendChannelJoinConfirm {
+                remaining,
+                channel_id,
+                mut joined,
+            } => {
                 let channel_confirm = mcs::ChannelJoinConfirm {
                     result: 0,
                     initiator_id: self.user_channel_id,
@@ -158,10 +188,12 @@ impl Sequence for ChannelConnectionSequence {
                 let written =
                     ironrdp_core::encode_buf(&X224(channel_confirm), output).map_err(ConnectorError::encode)?;
 
+                joined.insert(channel_id);
+
                 let next_state = if remaining.is_empty() {
                     ChannelConnectionState::AllJoined
                 } else {
-                    ChannelConnectionState::WaitChannelJoinRequest { remaining }
+                    ChannelConnectionState::WaitChannelJoinRequest { remaining, joined }
                 };
 
                 (Written::from_size(written)?, next_state)
