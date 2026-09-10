@@ -1,8 +1,9 @@
 use ironrdp_core::{Decode as _, ReadCursor, impl_as_any};
 use ironrdp_pdu::gcc::ChannelName;
-use ironrdp_pdu::{PduResult, decode_err, pdu_other_err};
+use ironrdp_pdu::{PduResult, pdu_other_err};
 use ironrdp_svc::{CompressionCondition, SvcMessage, SvcProcessor, SvcProcessorMessages, SvcServerProcessor};
-use tracing::{debug, error};
+use std::time::{Duration, Instant};
+use tracing::{debug, error, warn};
 
 use crate::pdu::{self, ClientAudioFormatPdu, QualityMode};
 
@@ -11,6 +12,13 @@ pub type RdpsndSvcMessages = SvcProcessorMessages<RdpsndServer>;
 pub trait RdpsndError: core::error::Error + Send + Sync + 'static {}
 
 impl<T> RdpsndError for T where T: core::error::Error + Send + Sync + 'static {}
+
+/// MS-RDPEA 3.3.5.1.1.3: if the Quality Mode PDU does not arrive in time, the
+/// server SHOULD fall back to the DYNAMIC quality mode.
+const QUALITY_MODE_TIMEOUT: Duration = Duration::from_secs(5);
+/// MS-RDPEA 3.1.5 state machine: a Training Confirm that never arrives
+/// terminates the audio output state machine for this channel.
+const TRAINING_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Message sent by the event loop.
 #[derive(Debug)]
@@ -153,6 +161,9 @@ pub struct RdpsndServer {
     quality_mode: Option<QualityMode>,
     block_no: u8,
     format_no: Option<u16>,
+    /// When the current waiting state was entered — drives the Quality Mode
+    /// and Training Confirm timeouts (MS-RDPEA 3.1.5 / 3.3.5.1.1.3).
+    state_entered: Instant,
 }
 
 impl RdpsndServer {
@@ -165,7 +176,11 @@ impl RdpsndServer {
             client_format: None,
             quality_mode: None,
             format_no: None,
-            block_no: 0,
+            // MS-RDPEA 3.3.5.2.1.1: the first wave's cBlockNo MUST be one more
+            // than the cLastBlockConfirmed sent in the Server Audio Formats
+            // and Version PDU (always 0 on our side), so start at 1.
+            block_no: 1,
+            state_entered: Instant::now(),
         }
     }
 
@@ -198,6 +213,19 @@ impl RdpsndServer {
     }
 
     pub fn wave(&mut self, data: Vec<u8>, ts: u32) -> PduResult<RdpsndSvcMessages> {
+        // Advance any expired waiting-state timeout first — a silent client
+        // must not wedge the channel forever.
+        let mut messages = self.advance_timeouts();
+        if self.state == RdpsndState::Stop {
+            debug!("rdpsnd channel terminated by timeout; dropping wave");
+            return Ok(RdpsndSvcMessages::new(messages));
+        }
+        // MS-RDPEA 3.3.5.2: audio data MUST NOT be transferred unless the
+        // client set TSSNDCAPS_ALIVE in its Client Audio Formats PDU.
+        if !self.flags()?.contains(pdu::AudioFormatFlags::ALIVE) {
+            debug!("client did not set TSSNDCAPS_ALIVE; dropping wave");
+            return Ok(RdpsndSvcMessages::new(messages));
+        }
         let version = self.version()?;
         let format_no = self
             .format_no
@@ -212,7 +240,7 @@ impl RdpsndServer {
         let wire_timestamp = u16::from_le_bytes([timestamp_lo, timestamp_hi]);
 
         // The server doesn't wait for wave confirm, apparently FreeRDP neither.
-        let msg = if version >= pdu::Version::V8 {
+        if version >= pdu::Version::V8 {
             let pdu = pdu::Wave2Pdu {
                 block_no: self.block_no,
                 timestamp: wire_timestamp,
@@ -220,7 +248,7 @@ impl RdpsndServer {
                 format_no,
                 data: data.into(),
             };
-            RdpsndSvcMessages::new(vec![pdu::ServerAudioOutputPdu::Wave2(pdu).into()])
+            messages.push(pdu::ServerAudioOutputPdu::Wave2(pdu).into());
         } else {
             // Pre-v8: WaveInfo PDU (§2.2.3.3), then a bare Wave payload (§2.2.3.4).
             if data.len() < usize::from(pdu::WavePdu::MIN_AUDIO_LENGTH) {
@@ -243,12 +271,53 @@ impl RdpsndServer {
             let wave_data = pdu::WaveDataPdu {
                 data: data[4..].to_vec(),
             };
-            RdpsndSvcMessages::new(vec![pdu::ServerAudioOutputPdu::Wave(info).into(), wave_data.into()])
-        };
+            messages.push(pdu::ServerAudioOutputPdu::Wave(info).into());
+            messages.push(wave_data.into());
+        }
 
         self.block_no = self.block_no.overflowing_add(1).0;
 
-        Ok(msg)
+        Ok(RdpsndSvcMessages::new(messages))
+    }
+
+    /// Send a Pitch PDU (MS-RDPEA 2.2.4.2). Gated on TSSNDCAPS_PITCH exactly
+    /// like `set_volume` is on TSSNDCAPS_VOLUME.
+    pub fn set_pitch(&mut self, pitch: u32) -> PduResult<RdpsndSvcMessages> {
+        if !self.flags()?.contains(pdu::AudioFormatFlags::PITCH) {
+            return Err(pdu_other_err!("client doesn't support pitch"));
+        }
+        let pdu = pdu::PitchPdu { pitch };
+        Ok(RdpsndSvcMessages::new(vec![
+            pdu::ServerAudioOutputPdu::Pitch(pdu).into(),
+        ]))
+    }
+
+    /// Advance the MS-RDPEA 3.1.5 state machine past expired waits:
+    ///
+    /// - Quality Mode timeout (3.3.5.1.1.3): assume DYNAMIC and send Training.
+    /// - Training Confirm timeout: terminate the channel state machine.
+    ///
+    /// Returns any PDU that must be sent as a result (the Training PDU).
+    fn advance_timeouts(&mut self) -> Vec<SvcMessage> {
+        let elapsed = self.state_entered.elapsed();
+        match self.state {
+            RdpsndState::WaitingForQualityMode if elapsed >= QUALITY_MODE_TIMEOUT => {
+                warn!("no Quality Mode PDU from client; assuming DYNAMIC quality (MS-RDPEA 3.3.5.1.1.3)");
+                self.quality_mode = Some(QualityMode::Dynamic);
+                self.state = RdpsndState::WaitingForTrainingConfirm;
+                self.state_entered = Instant::now();
+                self.training_pdu()
+                    .map(Into::into)
+                    .unwrap_or_default()
+            }
+            RdpsndState::WaitingForTrainingConfirm if elapsed >= TRAINING_CONFIRM_TIMEOUT => {
+                warn!("no Training Confirm PDU from client; terminating audio output (MS-RDPEA 3.1.5)");
+                self.state = RdpsndState::Stop;
+                self.handler.stop();
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
     }
 
     pub fn set_volume(&mut self, volume_left: u16, volume_right: u16) -> PduResult<RdpsndSvcMessages> {
@@ -307,39 +376,50 @@ impl SvcProcessor for RdpsndServer {
     }
 
     fn process(&mut self, payload: &[u8]) -> PduResult<Vec<SvcMessage>> {
-        let pdu = pdu::ClientAudioOutputPdu::decode(&mut ReadCursor::new(payload)).map_err(|e| decode_err!(e))?;
+        // MS-RDPEA 3.1.5: malformed packets MUST be ignored — a single
+        // corrupted PDU must not take down audio for the whole session.
+        let pdu = match pdu::ClientAudioOutputPdu::decode(&mut ReadCursor::new(payload)) {
+            Ok(pdu) => pdu,
+            Err(e) => {
+                debug!(error = %e, "ignoring malformed rdpsnd PDU");
+                return Ok(vec![]);
+            }
+        };
         debug!(?pdu);
-        let msg = match self.state {
+        // A silent client must not wedge a waiting state forever.
+        let mut msg = self.advance_timeouts();
+        let state_msg = match self.state {
             RdpsndState::WaitingForClientFormats => {
+                // MS-RDPEA 3.1.5: out-of-sequence packets MUST be ignored.
                 let pdu::ClientAudioOutputPdu::AudioFormat(af) = pdu else {
-                    error!("Invalid PDU");
-                    self.state = RdpsndState::Stop;
-                    return Ok(vec![]);
+                    warn!("ignoring out-of-sequence rdpsnd PDU (waiting for client formats)");
+                    return Ok(msg);
                 };
                 self.client_format = Some(af);
                 if self.version()? >= pdu::Version::V6 {
                     self.state = RdpsndState::WaitingForQualityMode;
+                    self.state_entered = Instant::now();
                     vec![]
                 } else {
                     self.state = RdpsndState::WaitingForTrainingConfirm;
+                    self.state_entered = Instant::now();
                     self.training_pdu()?.into()
                 }
             }
             RdpsndState::WaitingForQualityMode => {
                 let pdu::ClientAudioOutputPdu::QualityMode(pdu) = pdu else {
-                    error!("Invalid PDU");
-                    self.state = RdpsndState::Stop;
-                    return Ok(vec![]);
+                    warn!("ignoring out-of-sequence rdpsnd PDU (waiting for quality mode)");
+                    return Ok(msg);
                 };
                 self.quality_mode = Some(pdu.quality_mode);
                 self.state = RdpsndState::WaitingForTrainingConfirm;
+                self.state_entered = Instant::now();
                 self.training_pdu()?.into()
             }
             RdpsndState::WaitingForTrainingConfirm => {
                 let pdu::ClientAudioOutputPdu::TrainingConfirm(_) = pdu else {
-                    error!("Invalid PDU");
-                    self.state = RdpsndState::Stop;
-                    return Ok(vec![]);
+                    warn!("ignoring out-of-sequence rdpsnd PDU (waiting for training confirm)");
+                    return Ok(msg);
                 };
                 let client_format = self.client_format.as_ref().expect("available in this state");
                 // Formats common to server and client, in the server's
@@ -377,6 +457,8 @@ impl SvcProcessor for RdpsndServer {
                 if let pdu::ClientAudioOutputPdu::WaveConfirm(c) = pdu {
                     debug!(?c);
                     self.handler.wave_confirm(c.block_no, c.timestamp);
+                } else {
+                    debug!("ignoring unexpected rdpsnd PDU in Ready state");
                 }
                 vec![]
             }
@@ -385,6 +467,7 @@ impl SvcProcessor for RdpsndServer {
                 vec![]
             }
         };
+        msg.extend(state_msg);
         Ok(msg)
     }
 
@@ -399,6 +482,7 @@ impl SvcProcessor for RdpsndServer {
         });
 
         self.state = RdpsndState::WaitingForClientFormats;
+        self.state_entered = Instant::now();
         Ok(vec![SvcMessage::from(pdu)])
     }
 }
