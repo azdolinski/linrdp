@@ -3709,12 +3709,20 @@ impl RdpServer {
                 .multitransport_flags
                 .contains(ironrdp_pdu::gcc::MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR)
             {
-                let pdu = encode_multitransport_request(&mt, result.io_channel_id, result.user_channel_id)?;
-                writer
-                    .write_all(&pdu)
-                    .await
-                    .map_err(|e| ServerError::io("write multitransport request", e))?;
-                info!(request_id = mt.request_id, "Sent Initiate Multitransport Request (UDP FECR)");
+                // MS-RDPBCGR 2.2.15.1: the Initiate Multitransport Request
+                // PDU MUST only be sent over the MCS message channel — so a
+                // session without one (client never requested it) cannot
+                // bootstrap UDP and stays TCP-only.
+                if let Some(message_channel_id) = result.message_channel_id {
+                    let pdu = encode_multitransport_request(&mt, message_channel_id, result.user_channel_id)?;
+                    writer
+                        .write_all(&pdu)
+                        .await
+                        .map_err(|e| ServerError::io("write multitransport request", e))?;
+                    info!(request_id = mt.request_id, "Sent Initiate Multitransport Request (UDP FECR)");
+                } else {
+                    warn!("No MCS message channel; cannot send Initiate Multitransport Request (staying TCP-only)");
+                }
             } else {
                 debug!("Client did not announce UDP multitransport support; staying TCP-only");
             }
@@ -3803,13 +3811,15 @@ impl RdpServer {
     }
 
     async fn handle_io_channel_data(&mut self, data: SendDataRequest<'_>) -> ServerResult<bool> {
-        // Multitransport PDUs use a BasicSecurityHeader (flagsHi == 0) where
-        // every other I/O-channel PDU has a ShareControlHeader (pduType in
-        // those bytes, always non-zero). The client's Initiate Multitransport
-        // Response would fail ShareControlHeader decoding, so discriminate
-        // first and consume it here (MS-RDPBCGR 2.2.15.2). The response just
-        // reports the client-side bootstrap outcome; the tunnel itself is
-        // validated over UDP against the security cookie.
+        // Defensive fallback: per MS-RDPBCGR 2.2.15.2 the client's Initiate
+        // Multitransport Response arrives on the MCS message channel (handled
+        // in `handle_message_channel_data`), but tolerate non-conforming
+        // clients that echo it back on the I/O channel. Multitransport PDUs
+        // use a BasicSecurityHeader (flagsHi == 0) where every other
+        // I/O-channel PDU has a ShareControlHeader (pduType in those bytes,
+        // always non-zero), so discriminate first. The response just reports
+        // the client-side bootstrap outcome; the tunnel itself is validated
+        // over UDP against the security cookie.
         {
             let ud: &[u8] = data.user_data.as_ref();
             if ud.len() >= rdp::headers::BASIC_SECURITY_HEADER_SIZE as usize {
@@ -3893,9 +3903,32 @@ impl RdpServer {
     }
 
     fn handle_message_channel_data(&mut self, data: SendDataRequest<'_>) {
-        // The MCS message channel currently carries only the auto-detect
-        // response. It is framed by a Basic Security Header (SEC_AUTODETECT_RSP),
-        // not a Share Control header.
+        // The MCS message channel carries PDUs framed by a Basic Security
+        // Header rather than a Share Control header. Discriminate on the
+        // flag bits: multitransport responses (SEC_TRANSPORT_RSP,
+        // MS-RDPBCGR 2.2.15.2) and auto-detect responses
+        // (SEC_AUTODETECT_RSP, 2.2.14.4).
+        let ud: &[u8] = data.user_data.as_ref();
+        if ud.len() >= rdp::headers::BASIC_SECURITY_HEADER_SIZE as usize {
+            let flags_raw = u16::from_le_bytes([ud[0], ud[1]]);
+            if let Some(flags) = rdp::headers::BasicSecurityHeaderFlags::from_bits(flags_raw) {
+                if flags.contains(rdp::headers::BasicSecurityHeaderFlags::TRANSPORT_RSP) {
+                    match decode::<rdp::multitransport::MultitransportResponsePdu>(ud) {
+                        Ok(pdu) => {
+                            info!(
+                                request_id = pdu.request_id,
+                                hr_response = format!("{:#010X}", pdu.hr_response),
+                                "Received Multitransport Response"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(error = format!("{e:#}"), "Malformed Multitransport Response; ignoring");
+                        }
+                    }
+                    return;
+                }
+            }
+        }
         match decode::<rdp::autodetect::AutoDetectRspPdu>(data.user_data.as_ref()) {
             Ok(pdu) => {
                 if let Some(ref mut ad) = self.autodetect {
@@ -4260,15 +4293,14 @@ fn encode_share_data_pdu(
 }
 
 /// Encode a Server Initiate Multitransport Request PDU (MS-RDPBCGR 2.2.15.1)
-/// for the RDP I/O channel.
+/// for the MCS message channel.
 ///
-/// Like every other I/O-channel PDU it rides an MCS Send Data Indication, but
-/// its payload is framed by a Basic Security Header (SEC_TRANSPORT_REQ) rather
-/// than a Share Control header — the same discrimination the client applies
-/// when routing it out of `decode_io_channel`.
+/// The PDU rides an MCS Send Data Indication on the negotiated message
+/// channel — the spec's MUST — framed by a Basic Security Header
+/// (SEC_TRANSPORT_REQ) rather than a Share Control header.
 fn encode_multitransport_request(
     mt: &MultiTransportRequest,
-    io_channel_id: u16,
+    message_channel_id: u16,
     user_channel_id: u16,
 ) -> ServerResult<Vec<u8>> {
     let pdu = rdp::multitransport::MultitransportRequestPdu {
@@ -4282,7 +4314,7 @@ fn encode_multitransport_request(
     let user_data = encode_vec(&pdu).map_err(ServerError::encode)?.into();
     let mcs_pdu = SendDataIndication {
         initiator_id: user_channel_id,
-        channel_id: io_channel_id,
+        channel_id: message_channel_id,
         user_data,
     };
     encode_vec(&X224(mcs_pdu)).map_err(ServerError::encode)
