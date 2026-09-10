@@ -142,6 +142,28 @@ async fn main() -> anyhow::Result<()> {
         .with_credential_validator(Some(validator))
         .build();
 
+    // Protocol-level network auto-detect (MS-RDPBCGR 2.2.14) and server
+    // heartbeat (2.2.16.1): both were implemented in ironrdp-server but never
+    // enabled by the binary. Auto-detect feeds the RTT/bandwidth handles the
+    // display pacing uses; heartbeat lets clients detect dead connections.
+    server.enable_autodetect();
+    server.enable_heartbeat(ironrdp_server::heartbeat::HeartbeatConfig::default());
+
+    // Continuous auto-detect (1.3.9): periodic RTT probes keep the bandwidth
+    // estimate fresh. The library emits probes on demand — drive it with a
+    // timer.
+    {
+        let events = server.event_sender().clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            interval.tick().await; // first tick fires immediately; skip it
+            loop {
+                interval.tick().await;
+                let _ = events.send(ironrdp_server::ServerEvent::AutoDetectRttRequest);
+            }
+        });
+    }
+
     // UDP multitransport (MS-RDPEMT): the request parameters are shared by
     // the TCP bootstrap PDU and the UDP accept loop, binding the two
     // transports to one session via the security cookie. The event channel
