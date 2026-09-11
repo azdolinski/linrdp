@@ -389,7 +389,6 @@ fn capture_thread(tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>, stop: Shared<
     use pulse::mainloop::standard::Mainloop;
     use pulse::sample::Format;
     use pulse::stream::{self, FlagSet as StreamFlags};
-    use std::sync::atomic::Ordering;
 
     let mut mainloop = Mainloop::new().ok_or_else(|| anyhow::anyhow!("pulse mainloop"))?;
     let mut context = Context::new(&mainloop, "linrdp-capture")

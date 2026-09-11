@@ -132,11 +132,26 @@ async fn main() -> anyhow::Result<()> {
                     ironrdp_pdu::rdp::capability_sets::NsCodec {
                         is_dynamic_fidelity_allowed: true,
                         is_subsampling_allowed: true,
-                        color_loss_level: 3,
+                        // Server preference: minimal chroma loss. The
+                        // client's capability is a ceiling, not a target —
+                        // see the encoder selection in ironrdp-server.
+                        color_loss_level: 1,
                     },
                 ),
             },
+            // RemoteFX image mode (MS-RDPRFX): what a Windows server
+            // negotiates with mstsc-class clients. The encoder priority in
+            // ironrdp-server picks it over NSCodec whenever the client
+            // offers it; NSCodec stays as the fallback for NSCodec-only
+            // clients (macOS Microsoft Remote Desktop / Windows App).
+            ironrdp_pdu::rdp::capability_sets::Codec {
+                id: 5,
+                property: ironrdp_pdu::rdp::capability_sets::CodecProperty::ImageRemoteFx(
+                    ironrdp_pdu::rdp::capability_sets::RemoteFxContainer::ServerContainer(4),
+                ),
+            },
         ]))
+        .with_remotefx_entropy_coder(Some(ironrdp_pdu::rdp::capability_sets::EntropyBits::Rlgr3))
         .with_cliprdr_factory(Some(cliprdr))
         .with_sound_factory(Some(Box::new(sound_real::SystemSoundFactory::default())))
         .with_credential_validator(Some(validator))

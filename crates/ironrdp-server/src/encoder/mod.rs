@@ -265,6 +265,13 @@ impl UpdateEncoder {
             .set_desktop_size(size);
     }
 
+    /// Monotonic frame-id counter: the number of Frame Marker groups sent so
+    /// far, and the id the next group will carry. The display loop watches it
+    /// advance to know when a paced frame went out (MS-RDPBCGR 2.2.2.3).
+    pub(crate) fn frame_counter(&self) -> u32 {
+        self.frame_counter
+    }
+
     fn rgba_pointer(ptr: RGBAPointer) -> ServerResult<UpdateFragmenter> {
         let xor_mask = ptr.data;
 

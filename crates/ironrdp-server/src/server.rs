@@ -766,6 +766,18 @@ pub struct RdpServer {
     /// alone does not fix.
     autodetect_bandwidth: Arc<AtomicU32>,
 
+    /// Frame Acknowledge accounting (MS-RDPBCGR 2.2.2.3), shared between the
+    /// display loop (paces frame emission on the client's presentation rate)
+    /// and the slow-path input handler (records incoming Frame Acknowledge
+    /// PDUs).
+    frame_ack_state: Arc<FrameAckState>,
+
+    /// Client-advertised `maxUnackFrameCount` (MS-RDPBCGR 2.2.7.2.11). Zero
+    /// (or no Frame Acknowledge capability set at all) means the client does
+    /// not ack frames — pacing must stay off in that case, or the display
+    /// loop would deadlock waiting for acks that never arrive.
+    frame_ack_limit: u32,
+
     /// Optional Server Auto-Reconnect Cookie (MS-RDPBCGR 2.2.4.2
     /// `ARC_SC_PRIVATE_PACKET`). When `Some`, the server validates a returning
     /// `ARC_CS_PRIVATE_PACKET`, replaces its random after every connection, and
@@ -1490,6 +1502,8 @@ impl RdpServer {
                 handle.store(u32::MAX, Ordering::Relaxed);
                 handle
             },
+            frame_ack_state: Arc::default(),
+            frame_ack_limit: 0,
             auto_reconnect_cookie: None,
             previous_auto_reconnect_cookie: None,
             auto_reconnect_sent: false,
@@ -3337,6 +3351,8 @@ impl RdpServer {
         };
         let mut display_updates = self.display.lock().await.updates().await?;
         let display_bandwidth = Arc::clone(&self.autodetect_bandwidth);
+        let frame_ack_state = Arc::clone(&self.frame_ack_state);
+        let frame_ack_limit = self.frame_ack_limit;
         let mut writer = SharedWriter::new(writer);
         let mut display_writer = writer.clone();
         let mut event_writer = writer.clone();
@@ -3407,6 +3423,27 @@ impl RdpServer {
             loop {
                 match display_updates.next_update().await {
                     Ok(Some(update)) => {
+                        if frame_ack_limit > 0 && matches!(update, DisplayUpdate::Bitmap(_)) {
+                            // MS-RDPBCGR 2.2.2.3: the client presents frames
+                            // at its own pace (maxUnackFrameCount) and acks
+                            // each presented frame. Waiting here — instead of
+                            // queueing the next grab — is what keeps live
+                            // video latency bounded: a queued frame is stale
+                            // the moment the client gets to it. Pointer and
+                            // other small updates bypass the gate entirely.
+                            let deadline = Instant::now() + FRAME_ACK_TIMEOUT;
+                            while frame_ack_state.unacked() >= frame_ack_limit {
+                                if Instant::now() >= deadline {
+                                    warn!(
+                                        unacked = frame_ack_state.unacked(),
+                                        "frame ack overdue — emitting anyway (client stalled?)"
+                                    );
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(4)).await;
+                            }
+                        }
+                        let frames_before = encoder.frame_counter();
                         match Self::dispatch_display_update(
                             update,
                             &mut display_writer,
@@ -3420,6 +3457,12 @@ impl RdpServer {
                         .await?
                         {
                             (RunState::Continue, enc) => {
+                                // A frame marker group went out when the
+                                // encoder's id counter advanced — publish it
+                                // as the pacing "sent" watermark.
+                                if enc.frame_counter() != frames_before {
+                                    frame_ack_state.sent.store(enc.frame_counter(), Ordering::Relaxed);
+                                }
                                 encoder = enc;
                                 continue;
                             }
@@ -3734,10 +3777,23 @@ impl RdpServer {
                             }
                             #[cfg(feature = "nscodec")]
                             CodecProperty::NsCodec(client_ns) if self.opts.has_nscodec() => {
-                                // Re-use the client's confirmed color-loss
-                                // level so the server encodes at the same
-                                // shift the client decodes against.
-                                update_codecs.set_nscodec(Some((codec.id, client_ns.color_loss_level)));
+                                // MS-RDPNSC 2.2.1: the client's
+                                // color_loss_level is the MAXIMUM loss it can
+                                // decode (a ceiling, not a target), and each
+                                // frame's header carries the level actually
+                                // used — the mechanism behind dynamic
+                                // fidelity. Encoding every frame at the
+                                // client's ceiling (our old behavior) shifts
+                                // chroma by 2^CLL and visibly washes out
+                                // colors and text edges. Encode at the
+                                // minimum loss instead: always within the
+                                // client's advertised maximum.
+                                debug!(
+                                    client_max_cll = client_ns.color_loss_level,
+                                    encode_cll = 1,
+                                    "NSCodec selected at minimal color loss"
+                                );
+                                update_codecs.set_nscodec(Some((codec.id, 1)));
                             }
                             CodecProperty::NsCodec(_) => (),
                             #[cfg(feature = "qoi")]
@@ -3769,6 +3825,19 @@ impl RdpServer {
                     // 384x384. `UpdateEncoder` uses these flags to decide which pointer
                     // updates it can send at all, and at what size.
                     large_pointer_flags = lp.flags;
+                }
+                CapabilitySet::FrameAcknowledge(caps) => {
+                    // MS-RDPBCGR 2.2.7.2.11 + 2.2.2.3: the client acks each
+                    // presented frame (Frame Acknowledge PDU) and tolerates at
+                    // most this many unacknowledged ones. That ack stream is
+                    // the pacing signal the display loop uses to skip frames
+                    // instead of queueing them into growing latency. Zero or a
+                    // missing capability set disables pacing — the client will
+                    // never ack, and waiting would deadlock the display.
+                    self.frame_ack_limit = caps.max_unacknowledged_frame_count;
+                    if self.frame_ack_limit > 0 {
+                        debug!(limit = self.frame_ack_limit, "frame-acknowledge pacing enabled");
+                    }
                 }
                 _ => {}
             }
@@ -3986,6 +4055,17 @@ impl RdpServer {
                     if self.display_suppressed.swap(false, Ordering::Relaxed) {
                         debug!("client RefreshRectangle cleared suppress-output state");
                     }
+                }
+
+                // MS-RDPBCGR 2.2.2.3: the client finished presenting the
+                // frame with this id. Ids are monotonic, so the ack releases
+                // every frame up to and including it — advance the watermark
+                // the display loop paces on (never backwards: a delayed ack
+                // for an old frame must not un-release newer ones).
+                rdp::headers::ShareDataPdu::FrameAcknowledge(pdu) => {
+                    let acked_up_to = pdu.frame_id.wrapping_add(1);
+                    let prev = self.frame_ack_state.acked.fetch_max(acked_up_to, Ordering::Relaxed);
+                    trace!(frame_id = pdu.frame_id, prev_acked = prev, "client acknowledged frame");
                 }
 
                 unexpected => {
@@ -4343,6 +4423,31 @@ const BITMAP_BW_SHARE: f64 = 0.7;
 /// Never shape below this, even if a measurement glitch reports almost
 /// nothing: a floor keeps the session usable instead of freezing solid.
 const BITMAP_BW_FLOOR_KBPS: u32 = 1_000;
+
+/// How long the display loop waits for a Frame Acknowledge before emitting
+/// the next frame anyway. The ack should arrive within a frame or two of the
+/// send; if it never does (client stall, ack-less client misbehaving), this
+/// keeps the display crawling instead of freezing solid.
+const FRAME_ACK_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// MS-RDPBCGR 2.2.2.3 frame accounting for display pacing.
+///
+/// Frame ids are monotonic, so "acked frame N" releases every frame ≤ N:
+/// `acked` stores `frame id + 1` and `sent` stores the number of frame
+/// markers emitted (which is also the id the next frame will carry).
+#[derive(Debug, Default)]
+struct FrameAckState {
+    sent: AtomicU32,
+    acked: AtomicU32,
+}
+
+impl FrameAckState {
+    fn unacked(&self) -> u32 {
+        self.sent
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.acked.load(Ordering::Relaxed))
+    }
+}
 
 impl DisplayBudget {
     fn new(bandwidth_kbps: Arc<AtomicU32>) -> Self {
