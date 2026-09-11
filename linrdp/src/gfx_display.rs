@@ -256,7 +256,12 @@ impl EgfxUpdates {
             return;
         };
 
-        if self.pending_full {
+        // Repay the full-paint debt ONLY outside motion mode. Inside it, a
+        // rate-limited skip flags pending_full and the next H.264 frame
+        // covers the pixels — repaying mid-motion with a lossless repaint
+        // alternates the whole screen between exact and 4:2:0 looks at the
+        // H.264 cadence (~6.5 Hz), which is exactly the visible flicker.
+        if self.pending_full && !self.in_motion {
             self.send_clear(handle, data, width, height, 0, 0, width, height)
                 .await;
             return;
