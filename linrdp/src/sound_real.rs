@@ -95,7 +95,7 @@ impl SoundServerFactory for SystemSoundFactory {
             in_flight: Arc::new(AtomicIsize::new(0)),
             last_confirm_ms: Arc::new(AtomicU64::new(0)),
             clock: new_shared(None),
-            sent_ts: new_shared(VecDeque::new()),
+            sent: new_shared(std::array::from_fn(|_| None)),
             held_ewma_ms: Arc::new(AtomicU32::new(0)),
         })
     }
@@ -115,14 +115,29 @@ struct SystemSoundHandler {
     last_confirm_ms: Arc<AtomicU64>,
     /// Origin of `last_confirm_ms`, set in `start`.
     clock: Shared<Option<Instant>>,
-    /// FIFO of the wire `wTimeStamp`s of recently sent waves (MS-RDPEA
-    /// 2.2.3.8: confirms arrive roughly in order and answer the wave's own
-    /// timestamp plus held time, so the front entry matches each confirm).
-    sent_ts: Shared<VecDeque<u16>>,
+    /// Per-block record of sent waves, indexed by cBlockNo (mod 256), for
+    /// matching Wave Confirms to the wave they answer. mstsc confirms each
+    /// block up to twice — once on enqueue, once after playback — so a FIFO
+    /// of sent timestamps desyncs after the first confirm; the play-confirm
+    /// (the one carrying the real client backlog) must land on ITS wave.
+    sent: Shared<[Option<SentWave>; 256]>,
     /// EWMA of the client residence time (ms): how long the client held a
     /// wave between receiving and playing it — the spec's direct measure of
     /// audio backlog at the client.
     held_ewma_ms: Arc<AtomicU32>,
+}
+
+/// One sent wave's confirm-matching state (MS-RDPEA 2.2.3.8).
+#[derive(Debug, Copy, Clone)]
+struct SentWave {
+    /// The wire `wTimeStamp` the wave carried.
+    wire_ts: u16,
+    /// Largest held time observed across the confirm(s) for this block so far
+    /// (the play-confirm reports a larger value than the enqueue-confirm).
+    best_held: u16,
+    /// Whether any confirm was already counted against `in_flight` for this
+    /// block — a block confirmed twice must only free one slot.
+    confirmed: bool,
 }
 
 impl ServerEventSender for SystemSoundHandler {
@@ -176,13 +191,21 @@ impl RdpsndServerHandler for SystemSoundHandler {
         let in_flight = Arc::clone(&self.in_flight);
         let last_confirm_ms = Arc::clone(&self.last_confirm_ms);
         let held_ewma_ms = Arc::clone(&self.held_ewma_ms);
-        let sent_ts = Arc::clone(&self.sent_ts);
+        let sent = Arc::clone(&self.sent);
         let started = Instant::now();
         self.task = Some(tokio::spawn(async move {
             let mut chunk_count: u64 = 0;
+            // Mirror of RdpsndServer's cBlockNo sequence (starts at 1, wraps).
+            let mut send_block_no: u8 = 1;
             // Current Opus bitrate (i32 bits/s) for the dynamic quality logic.
             let mut opus_bitrate: i32 = 64_000;
             while let Some(chunk) = rx.recv().await {
+                // Skip pure digital silence: streaming silence forever keeps
+                // the client's audio path permanently buffered and wastes
+                // ~150 kB/s of transport; the client needs no idle carrier.
+                if chunk.iter().all(|&b| b == 0) {
+                    continue;
+                }
                 chunk_count += 1;
                 // Adaptive pacing (MS-RDPEA 2.2.3.8): the confirm's held time
                 // is how much audio sits buffered at the client. If it grows
@@ -269,15 +292,21 @@ impl RdpsndServerHandler for SystemSoundHandler {
                 };
                 let _ = ev_sender.send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(payload, ts)));
                 in_flight.fetch_add(1, Ordering::Relaxed);
-                // FIFO of wire timestamps (low 16 bits, matching what
-                // RdpsndServer::wave() puts on the wire) for wave_confirm.
+                // Record the wave under the cBlockNo `RdpsndServer::wave()`
+                // will stamp on it, so `wave_confirm(block_no, ts)` can match
+                // the confirm to ITS wave. The mirror counter follows the same
+                // 1-based wrapping sequence the crate uses (MS-RDPEA
+                // 3.3.5.2.1.1); nothing may drop waves between this point and
+                // `wave()` or the mapping desyncs.
                 {
-                    let mut q = sent_ts.lock().expect("poisoned");
-                    q.push_back(ts as u16);
-                    while q.len() > 16 {
-                        q.pop_front();
-                    }
+                    let mut ring = sent.lock().expect("poisoned");
+                    ring[usize::from(send_block_no)] = Some(SentWave {
+                        wire_ts: ts as u16,
+                        best_held: 0,
+                        confirmed: false,
+                    });
                 }
+                send_block_no = send_block_no.overflowing_add(1).0;
             }
         }));
         Ok(())
@@ -298,30 +327,45 @@ impl RdpsndServerHandler for SystemSoundHandler {
     /// Per MS-RDPSND 2.2.3.8 the returned `timestamp` is the wave's own
     /// `wTimeStamp` plus how long the client held it, so
     /// `timestamp - wave_timestamp` is the client-side residence time. Used
-    /// here only to decrement the in-flight count.
+    /// Client finished playing (or dropped) a wave — release flow control.
+    ///
+    /// Per MS-RDPEA 2.2.3.8 the returned `timestamp` is the wave's own
+    /// `wTimeStamp` plus how long the client held it, so
+    /// `timestamp - wave_timestamp` is the client-side residence time.
+    ///
+    /// mstsc confirms each block up to TWICE (once on enqueue with a small
+    /// held time, once after playback with the real one), so matching is by
+    /// the confirm's `block_no` against the per-block ring filled at send
+    /// time — a plain FIFO desyncs on the second confirm and both the
+    /// in-flight count and the backlog gauge go silent.
     fn wave_confirm(&mut self, block_no: u8, timestamp: u16) {
-        let prev = self.in_flight.fetch_sub(1, Ordering::Relaxed);
-        if prev <= 0 {
-            // A confirm without a matching in-flight wave (e.g. after a drop
-            // storm or a channel restart) — reset so the counter can't go
-            // negative and wedge the flow control open/closed.
-            self.in_flight.store(0, Ordering::Relaxed);
+        if let Some(entry) = self.sent.lock().expect("poisoned")[usize::from(block_no)].as_mut() {
+            // Held time for THIS wave: the play-confirm reports the full
+            // client residence time; keep the best (largest) per block.
+            let held_raw = timestamp.wrapping_sub(entry.wire_ts);
+            let held = if held_raw > 5_000 { 0 } else { u32::from(held_raw) }; // discard wraps/garbage
+            let best = held.max(u32::from(entry.best_held));
+            entry.best_held = best as u16;
+
+            if !entry.confirmed {
+                // A block confirmed twice frees exactly one in-flight slot.
+                entry.confirmed = true;
+                let prev = self.in_flight.fetch_sub(1, Ordering::Relaxed);
+                if prev <= 0 {
+                    // A confirm without a matching in-flight wave (e.g. after
+                    // a drop storm or a channel restart) — reset so the
+                    // counter can't go negative.
+                    self.in_flight.store(0, Ordering::Relaxed);
+                }
+            }
+
+            let ewma = self.held_ewma_ms.load(Ordering::Relaxed);
+            let next = if ewma == 0 { best } else { ewma - ewma / 4 + best / 4 };
+            self.held_ewma_ms.store(next, Ordering::Relaxed);
+            tracing::trace!(block_no, held_ms = held, best_ms = best, ewma_ms = next, "wave confirm");
         }
         if let Some(origin) = *self.clock.lock().expect("poisoned") {
             self.last_confirm_ms.store(origin.elapsed().as_millis() as u64, Ordering::Relaxed);
-        }
-
-        // MS-RDPEA 2.2.3.8: the confirm's `timestamp` is the wave's own
-        // `wTimeStamp` plus how many milliseconds the client held it. Match it
-        // against the FIFO of sent timestamps to get the client's audio
-        // backlog — the spec's built-in desync gauge.
-        if let Some(sent) = self.sent_ts.lock().expect("poisoned").pop_front() {
-            let held = timestamp.wrapping_sub(sent);
-            let held = if held > 5_000 { 0 } else { u32::from(held) }; // discard wraps/garbage
-            let ewma = self.held_ewma_ms.load(Ordering::Relaxed);
-            let next = if ewma == 0 { held } else { ewma - ewma / 4 + held / 4 };
-            self.held_ewma_ms.store(next, Ordering::Relaxed);
-            tracing::trace!(block_no, held_ms = held, ewma_ms = next, "wave confirm");
         }
     }
 }

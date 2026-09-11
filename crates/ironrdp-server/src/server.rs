@@ -2799,22 +2799,15 @@ impl RdpServer {
         user_channel_id: u16,
         message_channel_id: Option<u16>,
     ) -> ServerResult<RunState> {
-        // Avoid wave messages queuing up and causing extra delay. When a
-        // batch carries more than `WAVE_KEEP` waves, drop the OLDEST ones
-        // and keep the most recent — playing stale audio just bakes the
-        // latency in permanently, so a one-time dispatch stall (e.g. a video
-        // encode holding the server lock) would otherwise become a permanent
-        // audio offset.
-        //
-        // This is still a naive solution; better long-term: compute the
-        // actual delay, add IO priority, encode audio, use UDP, etc. 4 frames
-        // is roughly low hundreds of ms in regular setups.
-        const WAVE_KEEP: usize = 4;
-        let wave_total = events
-            .iter()
-            .filter(|e| matches!(e, ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(..))))
-            .count();
-        let mut wave_skip = wave_total.saturating_sub(WAVE_KEEP);
+        // NOTE: waves are no longer shed here. The old WAVE_KEEP drop broke
+        // two invariants the app-side flow control relies on: a wave dropped
+        // after the handler counted it in-flight is never confirmed (wedging
+        // the counter until the self-heal timeout), and skipping a wave
+        // desyncs any block-number-based confirm matching (MS-RDPEA
+        // 2.2.3.8). Backlog control belongs where the backlog is measured —
+        // the sound handler drops waves based on the client's held-time
+        // reports before they ever reach this loop.
+        let mut wave_skip: usize = 0;
         for event in events.drain(..) {
             trace!(?event, "Dispatching");
             match event {
