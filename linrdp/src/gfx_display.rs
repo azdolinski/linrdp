@@ -27,7 +27,9 @@ use ironrdp_pdu::geometry::ExclusiveRectangle;
 use ironrdp_server::{
     DesktopSize, DisplayUpdate, RdpServerDisplay, RdpServerDisplayUpdates, ServerResult,
 };
-use openh264::encoder::{BitRate, Encoder as OpenH264, EncoderConfig, FrameRate, RateControlMode, UsageType};
+use openh264::encoder::{
+    BitRate, Encoder as OpenH264, EncoderConfig, FrameRate, RateControlMode, UsageType, VuiConfig,
+};
 
 use crate::capture::{Grab, ScreenGrabber, X11Display, POLL_INTERVAL};
 use crate::gfx::GfxSession;
@@ -487,7 +489,12 @@ fn make_h264_encoder() -> anyhow::Result<OpenH264> {
         .max_frame_rate(FrameRate::from_hz(30.0))
         .usage_type(UsageType::ScreenContentRealTime)
         .rate_control_mode(RateControlMode::Quality)
-        .skip_frames(false);
+        .skip_frames(false)
+        // Signal the colorspace in the SPS VUI: the planes are full-range
+        // BT.709 (MS-RDPEGFX §3.3.8.3.1), and without this flag a
+        // spec-compliant decoder assumes limited range (Y 16..235) and
+        // crushes our dark-theme desktop (luma ~20) to near-black.
+        .vui(VuiConfig::bt709().full_range(true));
     OpenH264::with_api_config(api, config).map_err(|e| anyhow::anyhow!("openh264 init: {e}"))
 }
 
