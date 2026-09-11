@@ -121,6 +121,11 @@ impl X11Display {
         tracing::info!(width = w, height = h, "X screen resized via xrandr");
         Ok(())
     }
+
+    /// A fresh damage-tracking poller over this display's root window.
+    pub(crate) fn grabber(&self) -> ScreenGrabber {
+        ScreenGrabber::new(Arc::clone(&self.conn), self.root, self.width, self.height)
+    }
 }
 
 #[async_trait::async_trait]
@@ -182,40 +187,72 @@ impl RdpServerDisplay for X11Display {
 
     async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
         Ok(Box::new(Updates {
-            conn: Arc::clone(&self.conn),
-            root: self.root,
-            width: self.width,
-            height: self.height,
-            prev_frame: None,
+            grabber: self.grabber(),
             first: true,
         }))
     }
 }
 
-// NOTE: `Updates` reads the CURRENT root geometry on every grab (query via
+// NOTE: the grabber reads the CURRENT root geometry on every grab (query via
 // get_geometry) so a DisplayControl resize mid-session is picked up without
 // reconnecting.
 
-struct Updates {
+/// A full-screen grab plus the damage computed against the previous grab.
+///
+/// The data is bottom-up BGRX (X11 ZPixmap at depth 24), `width * 4` stride.
+pub(crate) struct Grab {
+    pub(crate) data: Vec<u8>,
+    pub(crate) width: u16,
+    pub(crate) height: u16,
+    /// Changed bounding box `(x, y, w, h)` versus the previous grab; `None`
+    /// when nothing changed. A geometry change forces full-screen damage.
+    pub(crate) damage: Option<(u16, u16, u16, u16)>,
+}
+
+impl Grab {
+    /// Crop the damage rectangle into a legacy-path `DisplayUpdate`.
+    pub(crate) fn legacy_display_update(&self) -> Option<DisplayUpdate> {
+        let (x, y, w, h) = self.damage?;
+        let stride = usize::from(self.width) * 4;
+        let mut region = Vec::with_capacity(usize::from(w) * usize::from(h) * 4);
+        for row in y..y + h {
+            let start = usize::from(row) * stride + usize::from(x) * 4;
+            region.extend_from_slice(&self.data[start..start + usize::from(w) * 4]);
+        }
+        Some(DisplayUpdate::Bitmap(BitmapUpdate {
+            x,
+            y,
+            width: NonZeroU16::new(w).expect("non-zero width"),
+            height: NonZeroU16::new(h).expect("non-zero height"),
+            format: PixelFormat::BgrX32,
+            data: region.into(),
+            stride: NonZeroUsize::new(usize::from(w) * 4).expect("non-zero stride"),
+        }))
+    }
+}
+
+/// Reusable screen poller: grabs the X11 root and computes tile-level damage
+/// against the previous grab. Shared by the legacy bitmap path (`Updates`)
+/// and the EGFX display backend.
+pub(crate) struct ScreenGrabber {
     conn: Arc<x11rb::rust_connection::RustConnection>,
     root: u32,
     width: u16,
     height: u16,
     prev_frame: Option<Vec<u8>>,
-    first: bool,
 }
 
-/// Tile edge length for change detection (MS-RDPBCGR-style dirty-region
-/// granularity; the server encoder re-diffs the delivered region against its
-/// own framebuffer, so only actually-changed sub-rectangles are encoded).
-const TILE: u16 = 64;
+impl ScreenGrabber {
+    pub(crate) fn new(conn: Arc<x11rb::rust_connection::RustConnection>, root: u32, width: u16, height: u16) -> Self {
+        Self {
+            conn,
+            root,
+            width,
+            height,
+            prev_frame: None,
+        }
+    }
 
-/// Screen polling interval: ~60 Hz capture, each grab delivered as one
-/// bitmap update — the encoder wraps it in a single Frame Marker group
-/// (MS-RDPBCGR 2.2.9.2.3) so the client presents it atomically.
-const POLL_INTERVAL: Duration = Duration::from_millis(16);
-
-impl Updates {
     fn current_geometry(&self) -> (u16, u16) {
         self.conn
             .get_geometry(self.root)
@@ -243,54 +280,13 @@ impl Updates {
             .map(|r| (r.data, w, h))
     }
 
-    fn make_update(data: Vec<u8>, x: u16, y: u16, width: u16, height: u16) -> DisplayUpdate {
-        DisplayUpdate::Bitmap(BitmapUpdate {
-            x,
-            y,
-            width: NonZeroU16::new(width).expect("non-zero width"),
-            height: NonZeroU16::new(height).expect("non-zero height"),
-            format: PixelFormat::BgrX32,
-            data: data.into(),
-            stride: NonZeroUsize::new(usize::from(width) * 4).expect("non-zero stride"),
-        })
-    }
-
-    /// Extract one sub-rectangle from a full frame buffer.
-    fn crop(data: &[u8], stride: usize, x: u16, y: u16, w: u16, h: u16) -> Vec<u8> {
-        let mut out = Vec::with_capacity(usize::from(w) * usize::from(h) * 4);
-        for row in y..y + h {
-            let start = usize::from(row) * stride + usize::from(x) * 4;
-            out.extend_from_slice(&data[start..start + usize::from(w) * 4]);
-        }
-        out
-    }
-}
-
-#[async_trait::async_trait]
-impl RdpServerDisplayUpdates for Updates {
-    async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
-        // Returning `None` terminates the session, so poll until something
-        // actually changes instead of reporting an empty poll.
-        loop {
-            let interval = if self.first { Duration::ZERO } else { POLL_INTERVAL };
-            tokio::time::sleep(interval).await;
-
-            match self.poll_once()? {
-                Some(update) => return Ok(Some(update)),
-                None => continue,
-            }
-        }
-    }
-}
-
-impl Updates {
-    fn poll_once(&mut self) -> ServerResult<Option<DisplayUpdate>> {
-        let Some((data, width, height)) = tokio::task::block_in_place(|| self.grab()) else {
-            return Ok(None);
-        };
+    /// Grab the current screen contents and diff them against the previous
+    /// grab. Returns `None` on a transient X11 failure (retry next tick).
+    pub(crate) fn poll(&mut self) -> Option<Grab> {
+        let (data, width, height) = tokio::task::block_in_place(|| self.grab())?;
         let stride = usize::from(width) * 4;
         if data.len() != stride * usize::from(height) {
-            return Ok(None); // geometry changed mid-grab; retry next tick
+            return None; // geometry changed mid-grab; retry next tick
         }
 
         if self.width != width || self.height != height {
@@ -303,17 +299,12 @@ impl Updates {
         }
 
         // Bounding box of changed tiles vs the previous grab. One grab is
-        // delivered as ONE bitmap update: the encoder diffs it against its own
-        // framebuffer (only real changes are encoded) and wraps the result in
-        // a single Frame Marker BEGIN/END group, so the client presents the
-        // whole grab atomically — no mixed-age tiles during video playback.
+        // delivered as ONE update: the consumer either wraps it in a single
+        // Frame Marker BEGIN/END group (legacy path) or one EGFX frame, so
+        // the client presents the whole grab atomically — no mixed-age tiles
+        // during video playback.
         let damage = match &self.prev_frame {
-            None => {
-                if self.first {
-                    tracing::info!(w = width, h = height, "first real frame captured");
-                }
-                Some((0u16, 0u16, width, height))
-            }
+            None => Some((0u16, 0u16, width, height)),
             Some(prev) => {
                 let mut min_x = u16::MAX;
                 let mut min_y = u16::MAX;
@@ -339,16 +330,49 @@ impl Updates {
             }
         };
 
-        self.first = false;
-        self.prev_frame = Some(data);
+        // Keep the frame as the diff baseline only when something changed —
+        // an unchanged grab is byte-identical to the stored baseline already,
+        // so skipping the (large) copy keeps idle polling cheap.
+        if damage.is_some() {
+            self.prev_frame = Some(data.clone());
+        }
+        Some(Grab { data, width, height, damage })
+    }
+}
 
-        match damage {
-            Some((x, y, w, h)) => {
-                let frame = self.prev_frame.as_ref().expect("just stored");
-                let region = Self::crop(frame, stride, x, y, w, h);
-                Ok(Some(Self::make_update(region, x, y, w, h)))
+/// Tile edge length for change detection (MS-RDPBCGR-style dirty-region
+/// granularity; the server encoder re-diffs the delivered region against its
+/// own framebuffer, so only actually-changed sub-rectangles are encoded).
+const TILE: u16 = 64;
+
+/// Screen polling interval: ~60 Hz capture, each grab delivered as one
+/// bitmap update — the encoder wraps it in a single Frame Marker group
+/// (MS-RDPBCGR 2.2.9.2.3) so the client presents it atomically.
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(16);
+
+struct Updates {
+    grabber: ScreenGrabber,
+    first: bool,
+}
+
+#[async_trait::async_trait]
+impl RdpServerDisplayUpdates for Updates {
+    async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
+        // Returning `None` terminates the session, so poll until something
+        // actually changes instead of reporting an empty poll.
+        loop {
+            let interval = if self.first { Duration::ZERO } else { POLL_INTERVAL };
+            tokio::time::sleep(interval).await;
+
+            if let Some(grab) = self.grabber.poll() {
+                if self.first && grab.damage.is_some() {
+                    tracing::info!(w = grab.width, h = grab.height, "first real frame captured");
+                }
+                self.first = false;
+                if let Some(update) = grab.legacy_display_update() {
+                    return Ok(Some(update));
+                }
             }
-            None => Ok(None), // nothing changed this poll
         }
     }
 }

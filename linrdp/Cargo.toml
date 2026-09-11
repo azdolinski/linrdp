@@ -6,7 +6,8 @@ license.workspace = true
 description = "RDP server for Linux — connect to a Linux desktop from any Windows/macOS RDP client"
 
 [dependencies]
-ironrdp-server = { path = "../crates/ironrdp-server", features = ["helper", "usb", "nscodec"] }
+ironrdp-server = { path = "../crates/ironrdp-server", features = ["helper", "usb", "nscodec", "egfx"] }
+ironrdp-egfx = { path = "../crates/ironrdp-egfx", features = ["openh264-bundled"] }
 ironrdp-connector = { path = "../crates/ironrdp-connector" }
 ironrdp-cliprdr = { path = "../crates/ironrdp-cliprdr" }
 ironrdp-cliprdr-native = { path = "../crates/ironrdp-cliprdr-native" }
@@ -28,6 +29,9 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"
 byteorder = "1"
 arboard = "3.6"
 ironrdp-dvc = { path = "../crates/ironrdp-dvc" }
+ironrdp-svc = { path = "../crates/ironrdp-svc" }
+ironrdp-graphics = { path = "../crates/ironrdp-graphics" }
+openh264 = { version = "0.9", default-features = false, features = ["source"] }
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"

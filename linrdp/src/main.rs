@@ -9,6 +9,8 @@
 mod auth;
 mod capture;
 mod clipboard;
+mod gfx;
+mod gfx_display;
 mod input;
 mod mic;
 mod sam;
@@ -89,11 +91,27 @@ async fn main() -> anyhow::Result<()> {
     let cliprdr: Box<dyn CliprdrServerFactory> =
         Box::new(clipboard::X11CliprdrServerFactory::default());
 
+    // Graphics pipeline (MS-RDPEGFX): H.264 video + lossless ClearCodec for
+    // text on clients that negotiate it (mstsc). The shared session carries
+    // the per-connection pipeline handle from the DVC side to the display
+    // loop; the suppressed flag is shared so the backend stops emitting
+    // frames while the client is minimized.
+    let gfx_session = Arc::new(gfx::GfxSession::new());
+    let display_suppressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     let mut server = RdpServer::builder()
         .with_addr(bind_addr)
         .with_hybrid(acceptor, identity.pub_key.clone())
         .with_input_handler(X11InputHandler::connect().expect("X11 unavailable for input"))
-        .with_display_handler(X11Display::connect().expect("X11 display unavailable"))
+        .with_display_handler(gfx_display::EgfxDisplay::new(
+            X11Display::connect().expect("X11 display unavailable"),
+            Arc::clone(&gfx_session),
+            Arc::clone(&display_suppressed),
+        ))
+        .with_gfx_factory(Some(Box::new(gfx::LinrdpGfxFactory::new(Arc::clone(
+            &gfx_session,
+        )))))
+        .with_display_suppressed_handle(display_suppressed)
         .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
             width: 3840,
             height: 2160,
