@@ -3419,11 +3419,16 @@ impl RdpServer {
         let dispatch_display = async move {
             let mut buffer = vec![0u8; 4096];
             let mut budget = DisplayBudget::new(Arc::clone(&display_bandwidth));
+            // Latched off after the first overdue ack: a client whose acks
+            // don't track our frame ids (observed with mstsc on the legacy
+            // path — the ack watermark never advanced) would otherwise stall
+            // the display to one frame per FRAME_ACK_TIMEOUT forever.
+            let mut frame_ack_pacing = frame_ack_limit > 0;
 
             loop {
                 match display_updates.next_update().await {
                     Ok(Some(update)) => {
-                        if frame_ack_limit > 0 && matches!(update, DisplayUpdate::Bitmap(_)) {
+                        if frame_ack_pacing && matches!(update, DisplayUpdate::Bitmap(_)) {
                             // MS-RDPBCGR 2.2.2.3: the client presents frames
                             // at its own pace (maxUnackFrameCount) and acks
                             // each presented frame. Waiting here — instead of
@@ -3436,8 +3441,9 @@ impl RdpServer {
                                 if Instant::now() >= deadline {
                                     warn!(
                                         unacked = frame_ack_state.unacked(),
-                                        "frame ack overdue — emitting anyway (client stalled?)"
+                                        "frame ack overdue — disabling frame-ack pacing for this session"
                                     );
+                                    frame_ack_pacing = false;
                                     break;
                                 }
                                 tokio::time::sleep(Duration::from_millis(4)).await;

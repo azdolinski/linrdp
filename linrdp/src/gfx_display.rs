@@ -390,11 +390,7 @@ impl EgfxUpdates {
         let ts = self.timestamp_ms();
 
         let joined = tokio::task::spawn_blocking(move || {
-            let rgba = bgrx_to_rgba_padded(&data, w, h, pw, ph);
-            let yuv = openh264::formats::YUVBuffer::from_rgb_source(openh264::formats::RgbaSliceU8::new(
-                &rgba,
-                (usize::from(pw), usize::from(ph)),
-            ));
+            let yuv = bgrx_to_yuv420(&data, usize::from(w), usize::from(h), usize::from(pw), usize::from(ph));
             // Materialize the bitstream inside the closure: EncodedBitStream
             // borrows the encoder's internal buffer and is not Send.
             let bitstream = encoders.h264.as_mut().map(|enc| enc.encode(&yuv).map(|bs| bs.to_vec()));
@@ -495,24 +491,61 @@ fn make_h264_encoder() -> anyhow::Result<OpenH264> {
     OpenH264::with_api_config(api, config).map_err(|e| anyhow::anyhow!("openh264 init: {e}"))
 }
 
-/// Convert a BGRX grab into a macroblock-padded RGBA buffer (OpenH264's
-/// `from_rgb_source` conversion expects RGBA). The padding region is left
-/// black — the destination rectangle crops it away.
-fn bgrx_to_rgba_padded(src: &[u8], w: u16, h: u16, pw: u16, ph: u16) -> Vec<u8> {
-    let stride = usize::from(w) * 4;
-    let pstride = usize::from(pw) * 4;
-    let mut out = vec![0u8; pstride * usize::from(ph)];
-    for row in 0..usize::from(h) {
-        let s = &src[row * stride..row * stride + stride];
-        let d = &mut out[row * pstride..row * pstride + stride];
-        for (sp, dp) in s.chunks_exact(4).zip(d.chunks_exact_mut(4)) {
-            dp[0] = sp[2]; // R
-            dp[1] = sp[1]; // G
-            dp[2] = sp[0]; // B
-            dp[3] = 0xFF;
+/// Convert a BGRX grab into macroblock-padded I420 planes, **full-range
+/// BT.709**.
+///
+/// MS-RDPEGFX §3.3.8.3.1 normatively mandates full-range luma (0..255, no
+/// 16..235 studio swing) with the BT.709 matrix — the same conversion
+/// FreeRDP's `prim_YUV` implements on the decode side and mstsc expects.
+/// OpenH264's own `YUVBuffer::from_rgb_source` converter is limited-range
+/// BT.601 (luma +16 offset), which decodes on the client as washed-out,
+/// shifted colors — visibly pulsing when interleaved with lossless
+/// ClearCodec updates (IronRDP issue #1924 documents the same trap).
+///
+/// The padding region is black (Y=0, Cb=Cr=128) — the destination rectangle
+/// crops it away.
+fn bgrx_to_yuv420(src: &[u8], w: usize, h: usize, pw: usize, ph: usize) -> openh264::formats::YUVBuffer {
+    let stride = w * 4;
+    let mut yuv = vec![0u8; 3 * (pw * ph) / 2];
+    let (y_len, u_len) = (pw * ph, pw * ph / 4);
+    let (y_plane, rest) = yuv.split_at_mut(y_len);
+    let (u_plane, v_plane) = rest.split_at_mut(u_len);
+
+    // Pixel accessor: real (R, G, B) inside the frame, black in the padding.
+    let px = |x: usize, y: usize| -> (i32, i32, i32) {
+        if x < w && y < h {
+            let off = y * stride + x * 4;
+            (i32::from(src[off + 2]), i32::from(src[off + 1]), i32::from(src[off]))
+        } else {
+            (0, 0, 0)
+        }
+    };
+
+    for j in 0..ph / 2 {
+        for i in 0..pw / 2 {
+            let p00 = px(i * 2, j * 2);
+            let p01 = px(i * 2, j * 2 + 1);
+            let p10 = px(i * 2 + 1, j * 2);
+            let p11 = px(i * 2 + 1, j * 2 + 1);
+
+            // Chroma: average of the 2x2 block.
+            let r = (p00.0 + p01.0 + p10.0 + p11.0) / 4;
+            let g = (p00.1 + p01.1 + p10.1 + p11.1) / 4;
+            let b = (p00.2 + p01.2 + p10.2 + p11.2) / 4;
+            let cb = ((-29 * r - 99 * g + 128 * b) >> 8) + 128;
+            let cr = ((128 * r - 116 * g - 12 * b) >> 8) + 128;
+            u_plane[j * (pw / 2) + i] = cb.clamp(0, 255) as u8;
+            v_plane[j * (pw / 2) + i] = cr.clamp(0, 255) as u8;
+
+            // Luma per pixel (full-range BT.709: 54/183/18, sum 255).
+            for (p, (dx, dy)) in [(p00, (0, 0)), (p01, (0, 1)), (p10, (1, 0)), (p11, (1, 1))] {
+                let y_val = (54 * p.0 + 183 * p.1 + 18 * p.2) >> 8;
+                y_plane[(j * 2 + dy) * pw + (i * 2 + dx)] = y_val.clamp(0, 255) as u8;
+            }
         }
     }
-    out
+
+    openh264::formats::YUVBuffer::from_vec(yuv, pw, ph)
 }
 
 /// Crop a rectangle out of a BGRX grab into tightly-packed BGRA (ClearCodec
