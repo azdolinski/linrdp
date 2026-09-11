@@ -120,6 +120,9 @@ impl RdpServerDisplay for EgfxDisplay {
             pending_full: true,
             in_motion: false,
             motion_until: Instant::now(),
+            hb_polls: 0,
+            hb_damaged: 0,
+            hb_last: Instant::now(),
             avc_disabled: false,
             started: Instant::now(),
             stat_frames: 0,
@@ -152,6 +155,11 @@ struct EgfxUpdates {
     /// between exact and 4:2:0-lossy colors — the user-visible pulse).
     in_motion: bool,
     motion_until: Instant,
+    /// Heartbeat counters: make a stalled loop (no damage, wedged grab,
+    /// stuck suppress) visible in the logs instead of silent.
+    hb_polls: u64,
+    hb_damaged: u64,
+    hb_last: Instant,
     /// Client negotiated EGFX without AVC (AVC_DISABLED), or the H.264
     /// encoder failed to initialize — lossless ClearCodec only.
     avc_disabled: bool,
@@ -175,8 +183,13 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
             }
 
             let Some(grab) = self.grabber.poll() else {
+                self.hb_polls += 1;
+                self.heartbeat(false);
                 continue;
             };
+            self.hb_polls += 1;
+            self.hb_damaged += u64::from(grab.damage.is_some());
+            self.heartbeat(true);
 
             let Some(handle) = self.session.handle() else {
                 // No EGFX connection — legacy bitmap path.
@@ -221,6 +234,35 @@ impl EgfxUpdates {
                 h264.force_intra_frame();
             }
             self.pending_full = true;
+        }
+
+        // mstsc re-advertises capabilities right after connecting (decoder
+        // recovery): the client deletes every surface, but the connection
+        // handle is unchanged, so the generation check above does not fire.
+        // Frames sent to the vanished surface are dropped by the client —
+        // the screen stays black/frozen while our stats look healthy. Detect
+        // it by asking the pipeline server whether our surface still exists.
+        if let Some(surface) = self.surface {
+            let alive = handle
+                .lock()
+                .expect("GfxServerHandle mutex poisoned")
+                .get_surface(surface.id)
+                .is_some();
+            if !alive {
+                tracing::warn!(
+                    surface = surface.id,
+                    "EGFX surface vanished (client re-advertised caps) — re-creating"
+                );
+                self.surface = None;
+                if let Some(Encoders {
+                    h264: Some(h264), ..
+                }) = self.encoders.as_mut()
+                {
+                    h264.force_intra_frame();
+                }
+                self.ensure_surface(handle, grab.width, grab.height);
+                self.pending_full = true;
+            }
         }
 
         // Backpressure (MS-RDPEGFX 2.2.4.3): the client is behind — skip the
@@ -487,6 +529,26 @@ impl EgfxUpdates {
 
     fn timestamp_ms(&self) -> u32 {
         u32::try_from(self.started.elapsed().as_millis()).unwrap_or(u32::MAX)
+    }
+
+    /// One INFO line every 5 s: polls vs. damaged grabs (a stall shows as
+    /// polls without damage — wedged X grab or genuinely static screen),
+    /// plus the suppress flag and EGFX frame pacing state.
+    fn heartbeat(&mut self, _grabbed: bool) {
+        if self.hb_last.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        tracing::info!(
+            polls = self.hb_polls,
+            damaged = self.hb_damaged,
+            suppressed = self.suppressed.load(Ordering::Relaxed),
+            in_motion = self.in_motion,
+            pending_full = self.pending_full,
+            "EGFX display heartbeat (5s window)"
+        );
+        self.hb_polls = 0;
+        self.hb_damaged = 0;
+        self.hb_last = Instant::now();
     }
 
     fn record_drained(&mut self, bytes: usize) {
