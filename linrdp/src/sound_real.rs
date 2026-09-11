@@ -211,9 +211,22 @@ impl RdpsndServerHandler for SystemSoundHandler {
                 // is how much audio sits buffered at the client. If it grows
                 // past the comfort threshold, skip this wave — the client
                 // already has more than it can play on time.
-                let held = held_ewma_ms.load(Ordering::Relaxed);
+                //
+                // The gauge is only refreshed by confirms, and confirms only
+                // come for waves we actually send — so while the threshold is
+                // dropping waves it would freeze at its last reading forever.
+                // Age it with wall time instead: while nothing is being sent
+                // the client drains its buffer in real time, so the backlog
+                // implied by a stale reading shrinks second for second. The
+                // 150 ms grace keeps normal-flow readings (a confirm every
+                // ~40-80 ms) untouched.
+                let now_ms = started.elapsed().as_millis() as u64;
+                let since_confirm = now_ms.saturating_sub(last_confirm_ms.load(Ordering::Relaxed));
+                let held = held_ewma_ms
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(u32::try_from(since_confirm.saturating_sub(150)).unwrap_or(u32::MAX));
                 if held > 400 {
-                    tracing::debug!(held_ms = held, "[rdpsnd-sender] dropping wave — client backlog high");
+                    tracing::debug!(held_ms = held, stale_ms = since_confirm, "[rdpsnd-sender] dropping wave — client backlog high");
                     continue;
                 }
 
@@ -222,11 +235,10 @@ impl RdpsndServerHandler for SystemSoundHandler {
                 // — drop it. Live audio tolerates a dropped 40 ms chunk far
                 // better than seconds of accumulating latency.
                 if in_flight.load(Ordering::Relaxed) >= MAX_IN_FLIGHT {
-                    // Self-heal: waves dropped downstream of us (e.g. the
-                    // session loop's stale-wave drop) are never confirmed, so
-                    // the count can wedge high while the client is actually
-                    // keeping up. If no confirm arrived recently, assume the
-                    // count is stale and restart it.
+                    // Self-heal: waves dropped downstream of us are never
+                    // confirmed, so the count can wedge high while the client
+                    // is actually keeping up. If no confirm arrived recently,
+                    // assume the count is stale and restart it.
                     let now_ms = started.elapsed().as_millis() as u64;
                     let last = last_confirm_ms.load(Ordering::Relaxed);
                     if now_ms.saturating_sub(last) > 1500 {
