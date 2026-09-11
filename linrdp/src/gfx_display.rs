@@ -53,6 +53,14 @@ const H264_BITRATE_BPS: u32 = 12_000_000;
 /// encoding a huge lossless rect costs more than it is worth.
 const CLEAR_MAX_PIXELS: usize = 2_500_000;
 
+/// After the last motion frame, keep the display in "motion mode" this
+/// long: while active, small lossless ClearCodec updates are suppressed so
+/// static UI does not flip-flop between the lossless and the (inherently
+/// lossy 4:2:0) H.264 looks — the visible "pulsing". When the window
+/// lapses, one full lossless repaint snaps the whole screen crisp again,
+/// mirroring how Windows RDP presents video regions.
+const MOTION_LINGER: Duration = Duration::from_millis(250);
+
 /// CPU-heavy encoders, moved in and out of `spawn_blocking` per frame.
 struct Encoders {
     h264: Option<OpenH264>,
@@ -110,6 +118,8 @@ impl RdpServerDisplay for EgfxDisplay {
             generation: None,
             last_h264: Instant::now() - H264_MIN_INTERVAL,
             pending_full: true,
+            in_motion: false,
+            motion_until: Instant::now(),
             avc_disabled: false,
             started: Instant::now(),
             stat_frames: 0,
@@ -137,6 +147,11 @@ struct EgfxUpdates {
     /// partial lossless updates are blocked until it is cleared, or pixels
     /// from the skipped frame could stay stale forever.
     pending_full: bool,
+    /// Motion-mode state: H.264 frames were sent recently. While active,
+    /// lossless partials are suppressed (they make static UI alternate
+    /// between exact and 4:2:0-lossy colors — the user-visible pulse).
+    in_motion: bool,
+    motion_until: Instant,
     /// Client negotiated EGFX without AVC (AVC_DISABLED), or the H.264
     /// encoder failed to initialize — lossless ClearCodec only.
     avc_disabled: bool,
@@ -222,6 +237,14 @@ impl EgfxUpdates {
             damage,
         } = grab;
 
+        // Motion-mode exit: the linger window lapsed — snap the whole
+        // screen back to lossless with one full repaint (even with no new
+        // damage, the last H.264 frame left everything in 4:2:0 quality).
+        if self.in_motion && Instant::now() >= self.motion_until {
+            self.in_motion = false;
+            self.pending_full = true;
+        }
+
         let Some(damage) = damage else {
             // Nothing changed — unless a full frame is still owed (e.g. a
             // motion frame was skipped and the screen went static right
@@ -253,6 +276,15 @@ impl EgfxUpdates {
                 return;
             }
             self.send_h264(handle, data, width, height).await;
+            self.in_motion = true;
+            self.motion_until = Instant::now() + MOTION_LINGER;
+        } else if self.in_motion {
+            // Small damage inside the motion window: suppress the lossless
+            // partial. Sending it would flip these pixels to exact colors,
+            // only for the next full-frame H.264 to re-lossy them — that
+            // alternation is the visible pulse. The next motion frame (or
+            // the linger-exit repaint) delivers these pixels consistently.
+            self.pending_full = true;
         } else {
             self.send_clear(handle, data, width, height, dx, dy, dw, dh)
                 .await;
