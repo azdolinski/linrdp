@@ -24,11 +24,6 @@ pub(crate) struct X11Display {
     xauthority: String,
 }
 
-fn v_blank_lines_total(height: u32, refresh: u32) -> u32 {
-    let min_vbi_lines = (550 * refresh + 999) / 1000;
-    ((min_vbi_lines + 3) / 4 * 4).max(23)
-}
-
 impl X11Display {
     /// Connect to `$DISPLAY` (or `:99`) and take the root window geometry.
     pub(crate) fn connect() -> anyhow::Result<Self> {
@@ -47,59 +42,6 @@ impl X11Display {
             display_name,
             xauthority: std::env::var("XAUTHORITY").unwrap_or_default(),
         })
-    }
-
-    /// CVT v1.2 timing (standard blanking) for Xvfb mode creation — values
-    /// follow the VESA CVT formula so Xvfb accepts the mode.
-    fn cvt_timings(
-        width: u16,
-        height: u16,
-        refresh: u32,
-    ) -> (u16, u16, u32, u16, u16, u16, u16, u16, u16) {
-        // CVT (Coordinated Video Timings) v1.2 — matches the values produced
-        // by `cvt`/`xrandr --newmode` for Xvfb (verified: 2880×1800@60 →
-        // dot 338.00 MHz, htotal 3568, vtotal 1893).
-        let w = width as u32;
-        let h = height as u32;
-
-        // Horizontal: blanking = 160 px rounded up to multiple of 8.
-        const CELL_GRAN: u32 = 8;
-        let h_blank = ((w + 160) / CELL_GRAN) * CELL_GRAN - w;
-        let h_total = w + h_blank;
-        let hsync_start = w + 88; // hblank/2 (CVT: centered sync)
-        let hsync_end = hsync_start + 32;
-
-        // Vertical: blanking scaled with resolution (CVT: min 460 lines @60Hz
-        // for typical desktop heights).
-        let v_lines_est = (h + 450) * refresh / 1000; // estimated lines incl. blank
-        let v_blank = v_lines_est - h;
-        let v_blank = ((v_blank + 1) / 2) * 2; // even
-        let v_total = h + v_blank;
-        let vsync_start = h + 3;
-        let vsync_end = vsync_start + 10;
-
-        // Pixel clock (kHz) so that refresh = dot / (htotal*vtotal).
-        let dot_clock = h_total * v_total * refresh / 1000;
-
-        (
-            h_total as u16,
-            v_total as u16,
-            dot_clock,
-            hsync_start as u16,
-            hsync_end as u16,
-            vsync_start as u16,
-            vsync_end as u16,
-            32, // hsync width
-            10, // vsync width
-        )
-    }
-
-    fn v_blank_lines(&self, height: u32, refresh: u32) -> u32 {
-        // Minimum VBLANK lines per CVT (scaled by lines): ≈ 460 lines at
-        // 60 Hz regardless of height (CVT v1.2 min VBI time = 550 µs → lines).
-        let min_vbi_lines = (550 * refresh + 999) / 1000; // 550 µs at refresh Hz
-        let lines = (min_vbi_lines + 3) / 4 * 4; // multiple of 4
-        lines.max(23) // floor
     }
 
     /// Current root-window geometry.
@@ -132,16 +74,12 @@ impl X11Display {
             Ok(())
         };
 
-        let need_mode = !std::process::Command::new("xrandr")
-            .args(["--verbose"])
-            .env("DISPLAY", self.display_name.as_str())
-            .env("XAUTHORITY", self.xauthority.as_str())
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&mode_name))
-            .unwrap_or(false);
-
-        if need_mode {
-            // Standard CVT timing for width×height @60Hz (as computed by cvt).
+        // Fast path: switch straight to the mode if one with this exact name
+        // already exists. Modes persist in the X server across linrdp
+        // restarts, so reconnects usually land here.
+        let switched = run(&["--output", "screen", "--mode", &mode_name]);
+        if switched.is_err() {
+            // Create a standard CVT timing for width×height @60Hz.
             let output = std::process::Command::new("cvt")
                 .args([width.to_string().as_str(), height.to_string().as_str(), "60"])
                 .env("DISPLAY", self.display_name.as_str())
@@ -149,20 +87,30 @@ impl X11Display {
                 .output()
                 .context("spawn cvt")?;
             let cvt_out = String::from_utf8_lossy(&output.stdout).to_string();
-            // cvt prints: Modeline "2880x1800_60.00" 338.00 2880 2968 3264 3568 ...
+            // cvt prints: Modeline "2880x1800_60.00" 442.00 2880 3104 3416 3952 ...
             let modeline = cvt_out
                 .lines()
                 .find(|l| l.contains("Modeline"))
                 .context("cvt produced no modeline")?;
             let params: Vec<&str> = modeline.split_whitespace().skip(1).collect();
-            let name = params.first().copied().context("no mode name").map(str::to_owned)?;
+            // The name comes back wrapped in quotes — strip them, or the mode
+            // gets created under a name that includes the `"` characters and
+            // can never be selected by the clean name used above.
+            let name = params
+                .first()
+                .copied()
+                .context("no mode name")
+                .map(|n| n.trim_matches('"').to_owned())?;
             let nums: Vec<&str> = params[1..].to_vec();
             let mut a: Vec<&str> = vec!["--newmode", &name];
             a.extend(nums);
-            run(&a)?;
-            run(&["--addmode", "screen", &name])?;
+            // newmode/addmode failures are fine when the mode is already
+            // registered (e.g. added to the output in a previous run) — the
+            // definitive check is whether the final mode switch applies.
+            let _ = run(&a);
+            let _ = run(&["--addmode", "screen", &name]);
+            run(&["--output", "screen", "--mode", &mode_name])?;
         }
-        run(&["--output", "screen", "--mode", &mode_name])?;
 
         let (w, h) = self.query_root_geometry()?;
         if w != width || h != height {
