@@ -207,6 +207,13 @@ pub(crate) struct Grab {
     /// Changed bounding box `(x, y, w, h)` versus the previous grab; `None`
     /// when nothing changed. A geometry change forces full-screen damage.
     pub(crate) damage: Option<(u16, u16, u16, u16)>,
+    /// How many 64x64 tiles actually changed (vs. how many the bounding box
+    /// spans). A blinking cursor in one corner plus a clock in the other
+    /// produces a full-screen bounding box with ~zero changed tiles — the
+    /// bbox alone is a terrible motion signal.
+    pub(crate) changed_tiles: u32,
+    /// Total tile count covering the screen.
+    pub(crate) total_tiles: u32,
 }
 
 impl Grab {
@@ -298,18 +305,20 @@ impl ScreenGrabber {
             self.prev_frame = None;
         }
 
-        // Bounding box of changed tiles vs the previous grab. One grab is
-        // delivered as ONE update: the consumer either wraps it in a single
-        // Frame Marker BEGIN/END group (legacy path) or one EGFX frame, so
-        // the client presents the whole grab atomically — no mixed-age tiles
-        // during video playback.
-        let damage = match &self.prev_frame {
-            None => Some((0u16, 0u16, width, height)),
+        // Bounding box AND changed-tile count vs the previous grab. One grab
+        // is delivered as ONE update: the consumer either wraps it in a
+        // single Frame Marker BEGIN/END group (legacy path) or one EGFX
+        // frame, so the client presents the whole grab atomically — no
+        // mixed-age tiles during video playback.
+        let total_tiles = u32::from((width + TILE - 1) / TILE) * u32::from((height + TILE - 1) / TILE);
+        let (damage, changed_tiles) = match &self.prev_frame {
+            None => (Some((0u16, 0u16, width, height)), total_tiles),
             Some(prev) => {
                 let mut min_x = u16::MAX;
                 let mut min_y = u16::MAX;
                 let mut max_x = 0u16; // exclusive
                 let mut max_y = 0u16; // exclusive
+                let mut changed = 0u32;
                 let mut y = 0u16;
                 while y < height {
                     let mut x = 0u16;
@@ -317,6 +326,7 @@ impl ScreenGrabber {
                         let w = TILE.min(width - x);
                         let h = TILE.min(height - y);
                         if !tile_eq_same_pos(prev, &data, stride, x, y, w, h) {
+                            changed += 1;
                             min_x = min_x.min(x);
                             min_y = min_y.min(y);
                             max_x = max_x.max(x + w);
@@ -326,7 +336,10 @@ impl ScreenGrabber {
                     }
                     y += TILE;
                 }
-                (min_x != u16::MAX).then(|| (min_x, min_y, max_x - min_x, max_y - min_y))
+                (
+                    (min_x != u16::MAX).then(|| (min_x, min_y, max_x - min_x, max_y - min_y)),
+                    changed,
+                )
             }
         };
 
@@ -336,7 +349,14 @@ impl ScreenGrabber {
         if damage.is_some() {
             self.prev_frame = Some(data.clone());
         }
-        Some(Grab { data, width, height, damage })
+        Some(Grab {
+            data,
+            width,
+            height,
+            damage,
+            changed_tiles,
+            total_tiles,
+        })
     }
 }
 
