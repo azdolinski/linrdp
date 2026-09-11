@@ -19,24 +19,28 @@ mod sound_real;
 mod tls;
 mod udp;
 mod usb;
+mod x11_selection;
 
 use core::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use ironrdp_cliprdr::backend::{CliprdrBackend, CliprdrBackendFactory};
-use ironrdp_server::{CliprdrServerFactory, RdpServer, ServerEventSender};
-use tokio::sync::mpsc::UnboundedSender;
+use ironrdp_server::{CliprdrServerFactory, RdpServer};
 
 use crate::capture::X11Display;
 use crate::input::X11InputHandler;
 
 const HELP: &str = "\
 USAGE:
-  linrdp [--bind-addr <ADDR>] [--usb]
+  linrdp [--bind-addr <ADDR>] [--usb] [--log-file <PATH>]
 
 Serves a real Linux desktop over RDP (auth: system accounts from /etc/shadow).
 Default bind: 0.0.0.0:3389. --usb enables USB device redirection (MS-RDPEUSB).
+
+Logging: written to /var/log/linrdp/linrdp.log when that directory can be
+created (falling back to the terminal), or to the file given with --log-file.
+Verbosity: LINRDP_LOG env var (default \"info,ironrdp=warn\").
 ";
 
 #[tokio::main]
@@ -66,7 +70,9 @@ async fn main() -> anyhow::Result<()> {
         .opt_value_from_str("--bind-addr")?
         .unwrap_or_else(|| "0.0.0.0:3389".parse().expect("valid default bind addr"));
 
-    setup_logging();
+    let log_file: Option<String> = args.opt_value_from_str("--log-file")?;
+
+    setup_logging(log_file.as_deref());
 
     tracing::info!(%bind_addr, "LinRDP starting — auth: /etc/shadow accounts");
 
@@ -112,6 +118,14 @@ async fn main() -> anyhow::Result<()> {
             &gfx_session,
         )))))
         .with_display_suppressed_handle(display_suppressed)
+        // Preempt any live session when an authenticated client connects.
+        // Without this the accept loop blocks on the running session and
+        // every new TCP connection hangs silently in the kernel backlog
+        // (verified: four probes, zero accepts, zero logs) — a reconnecting
+        // mstsc stares at a black screen until the old session ends. With
+        // preemption, the newcomer negotiates as a candidate and evicts the
+        // old session, so "reconnect while a session lives" just works.
+        .with_preempt_existing_session(true)
         .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
             width: 3840,
             height: 2160,
@@ -216,9 +230,50 @@ async fn main() -> anyhow::Result<()> {
 }
 
 
-fn setup_logging() {
+fn setup_logging(log_file: Option<&str>) {
     use tracing_subscriber::EnvFilter;
 
     let filter = EnvFilter::try_from_env("LINRDP_LOG").unwrap_or_else(|_| EnvFilter::new("info,ironrdp=warn"));
-    let _ = tracing_subscriber::fmt().compact().with_env_filter(filter).try_init();
+
+    // Prefer a file (--log-file, or /var/log/linrdp/linrdp.log when the
+    // directory can be created) so logs survive the terminal; the fallback
+    // is the terminal itself.
+    let default_path = std::path::Path::new("/var/log/linrdp/linrdp.log");
+    let path = match log_file {
+        Some(path) => std::path::PathBuf::from(path),
+        None => {
+            let dir = default_path.parent().expect("non-root default log path");
+            if std::fs::create_dir_all(dir).is_ok() {
+                default_path.to_path_buf()
+            } else {
+                PathBuf::new()
+            }
+        }
+    };
+
+    let file = if path.as_os_str().is_empty() {
+        None
+    } else {
+        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(file) => Some(file),
+            Err(error) => {
+                eprintln!("linrdp: cannot open {} ({error}); logging to the terminal", path.display());
+                None
+            }
+        }
+    };
+
+    match file {
+        Some(file) => {
+            eprintln!("linrdp: logging to {}", path.display());
+            let _ = tracing_subscriber::fmt()
+                .compact()
+                .with_env_filter(filter)
+                .with_writer(std::sync::Mutex::new(file))
+                .try_init();
+        }
+        None => {
+            let _ = tracing_subscriber::fmt().compact().with_env_filter(filter).try_init();
+        }
+    }
 }
