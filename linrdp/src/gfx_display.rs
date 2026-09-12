@@ -740,13 +740,15 @@ impl EgfxUpdates {
         }
 
         // The X screen was resized for this session: the desktop churns for
-        // a moment (WM re-layout, wallpaper) and video pushed mid-churn is
+        // a moment (WM re-layout, wallpaper), and H.264 pushed mid-churn is
         // decoded but never composed by mstsc — the frozen first session.
-        // Hold everything; the moment the settle passes, the pending_full
-        // below repaints the whole screen with clean, settled pixels.
-        if Instant::now() < self.settle_until {
-            self.pending_full = true;
-            return;
+        // Lossless ClearCodec is safe to send during the churn (the very
+        // first paint must go out immediately or the user stares at black),
+        // so the settle clamps everything to the lossless path instead of
+        // holding frames.
+        let settling = Instant::now() < self.settle_until;
+        if settling {
+            self.in_motion = false;
         }
 
         let Grab {
@@ -793,8 +795,9 @@ impl EgfxUpdates {
         // bounding box: a blinking cursor in one corner and a clock in the
         // other span the whole screen as a bbox but are ~0.1% of the tiles —
         // bbox-based detection kept such screens in soft H.264 mode forever.
-        let motion = u64::from(changed_tiles) * MOTION_DENOM as u64 > u64::from(total_tiles)
-            || u64::from(changed_tiles) * (64 * 64) > CLEAR_MAX_PIXELS as u64;
+        let motion = !settling
+            && (u64::from(changed_tiles) * MOTION_DENOM as u64 > u64::from(total_tiles)
+                || u64::from(changed_tiles) * (64 * 64) > CLEAR_MAX_PIXELS as u64);
 
         if motion && !self.avc_disabled {
             if self.last_h264.elapsed() < H264_MIN_INTERVAL {

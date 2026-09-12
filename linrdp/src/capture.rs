@@ -292,6 +292,57 @@ pub(crate) struct CursorImage {
     pub(crate) xor: Vec<u8>,
 }
 
+/// Convert an XFixes cursor sprite (native-endian CARD32 ARGB, top-down,
+/// premultiplied alpha) into the RDP 32-bpp pointer xor mask: bytes `R,G,B,A`
+/// per pixel in bottom-up rows, straight alpha.
+///
+/// Byte 3 is not a filler: for New/Large Pointer Updates it is the ONLY
+/// transparency source (we send no AND mask — mstsc composites 32-bpp
+/// pointers src-over with this alpha). Forcing it opaque renders the cursor
+/// as a solid black box around the arrow, and passing premultiplied RGB
+/// through makes soft edges darker than intended.
+fn argb_to_rdp_xor(src: &[u32], width: u16, height: u16) -> Vec<u8> {
+    let stride = usize::from(width) * 4;
+    let mut xor = vec![0u8; stride * usize::from(height)];
+    for row in 0..usize::from(height) {
+        let src_row = &src[row * usize::from(width)..(row + 1) * usize::from(width)];
+        // Destination row is the vertically mirrored one (pointer masks
+        // travel bottom-up like bitmaps).
+        let dst_row = usize::from(height) - 1 - row;
+        let dst = &mut xor[dst_row * stride..(dst_row + 1) * stride];
+        for (s, d) in src_row.iter().zip(dst.chunks_exact_mut(4)) {
+            let argb = *s;
+            let a = ((argb >> 24) & 0xFF) as u32;
+            let (r, g, b) = (
+                ((argb >> 16) & 0xFF) as u32,
+                ((argb >> 8) & 0xFF) as u32,
+                (argb & 0xFF) as u32,
+            );
+            match a {
+                0 => {
+                    // Fully transparent pixels can carry garbage RGB; zero
+                    // them so premultiplied == straight at this extreme.
+                    d[..4].copy_from_slice(&[0, 0, 0, 0]);
+                }
+                255 => {
+                    d[..4].copy_from_slice(&[r as u8, g as u8, b as u8, 255]);
+                }
+                _ => {
+                    // Un-premultiply (Windows cursor resources are straight
+                    // ARGB; XFixes hands us premultiplied).
+                    d[..4].copy_from_slice(&[
+                        (r * 255 / a).min(255) as u8,
+                        (g * 255 / a).min(255) as u8,
+                        (b * 255 / a).min(255) as u8,
+                        a as u8,
+                    ]);
+                }
+            }
+        }
+    }
+    xor
+}
+
 impl CursorImage {
     /// Cheap identity of the shape (size + hotspot + pixels) for cache
     /// lookups — recomputed per call, callers memoize the result.
@@ -510,29 +561,11 @@ impl ScreenGrabber {
         let hot_x = u16::try_from(cur.xhot).ok()?;
         let hot_y = u16::try_from(cur.yhot).ok()?;
 
-        // XFixes pixels are native-endian CARD32 ARGB (a<<24|r<<16|g<<8|b);
-        // the RDP 32-bpp xor mask wants 0x00BBGGRR u32s (bytes R,G,B,x) in
-        // bottom-up rows — reorder channels and flip vertically in one pass.
-        let src = cur.cursor_image;
         let src_len = usize::from(width) * usize::from(height);
-        if src.len() < src_len {
+        if cur.cursor_image.len() < src_len {
             return None;
         }
-        let stride = usize::from(width) * 4;
-        let mut xor = vec![0u8; src_len * 4];
-        for row in 0..usize::from(height) {
-            let src_row = &src[row * usize::from(width)..(row + 1) * usize::from(width)];
-            // Destination row is the vertically mirrored one.
-            let dst_row = usize::from(height) - 1 - row;
-            let dst = &mut xor[dst_row * stride..(dst_row + 1) * stride];
-            for (s, d) in src_row.iter().zip(dst.chunks_exact_mut(4)) {
-                let argb = *s;
-                d[0] = ((argb >> 16) & 0xFF) as u8; // R
-                d[1] = ((argb >> 8) & 0xFF) as u8; // G
-                d[2] = (argb & 0xFF) as u8; // B
-                d[3] = 0xFF; // ignored byte; keep opaque for good measure
-            }
-        }
+        let xor = argb_to_rdp_xor(&cur.cursor_image[..src_len], width, height);
 
         Some(CursorImage {
             width,
@@ -667,4 +700,38 @@ fn tile_eq_same_pos(prev_frame: &[u8], tile: &[u8], stride: usize, x: u16, y: u1
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::argb_to_rdp_xor;
+
+    #[test]
+    fn cursor_conversion_preserves_alpha_and_flips_rows() {
+        // 1x2 sprite: top = opaque white arrow pixel, bottom = transparent
+        // (with garbage RGB, as themes leave in fully transparent pixels).
+        let top = 0xFFFF_FFFFu32; // a=255 r=255 g=255 b=255
+        let bottom = 0x0056_3412u32; // a=0, garbage rgb
+        let xor = argb_to_rdp_xor(&[top, bottom], 1, 2);
+        // Rows are bottom-up: first stored row = source bottom row, RGB
+        // zeroed and alpha 0 so the client composites nothing there.
+        assert_eq!(&xor[0..4], &[0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(&xor[4..8], &[0xFF, 0xFF, 0xFF, 0xFF]); // opaque white
+    }
+
+    #[test]
+    fn cursor_conversion_unpremultiplies_soft_edges() {
+        // Premultiplied 50% white: a=128, rgb=128/255*128 -> un-premult to ~255.
+        let px = (128u32 << 24) | (128 << 16) | (128 << 8) | 128;
+        let xor = argb_to_rdp_xor(&[px], 1, 1);
+        assert_eq!(xor[3], 128); // alpha passes through
+        assert_eq!(&xor[0..3], &[255, 255, 255]); // straight 50% white
+    }
+
+    #[test]
+    fn cursor_conversion_opaque_keeps_rgb() {
+        let px = 0xFF00_FF80u32; // a=255 r=0 g=255 b=128
+        let xor = argb_to_rdp_xor(&[px], 1, 1);
+        assert_eq!(&xor[0..4], &[0x00, 0xFF, 0x80, 0xFF]);
+    }
 }

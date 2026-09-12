@@ -471,7 +471,10 @@ fn capture_thread(tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>, stop: Shared<
     let mut last_send = std::time::Instant::now();
     loop {
         iteration += 1;
-        if iteration <= 10 || iteration % 100 == 0 {
+        // A liveness line at debug rate would be thousands per minute
+        // (this loop spins fast when PulseAudio returns immediately);
+        // once a minute is enough to prove the loop is running.
+        if iteration <= 10 || iteration % 10_000_000 == 0 {
             tracing::debug!(iteration, "capture loop alive");
         }
         let stop_requested = stop.lock().map(|g| *g).unwrap_or(false);
