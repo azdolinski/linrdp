@@ -94,14 +94,19 @@ impl X11InputHandler {
         let (conn, screen_num) = x11rb::rust_connection::RustConnection::connect(Some(display_name.as_str()))
             .with_context(|| format!("connect to X display {display_name}"))?;
         let root = conn.setup().roots.get(screen_num).context("no X screen")?.root;
-        Ok(Self {
+        let mut handler = Self {
             conn: Arc::new(conn),
             root,
             unicode_keycode: None,
             locks: SynchronizeFlags::empty(),
             pressed_keys: HashSet::new(),
             last_reconnect_attempt: None,
-        })
+        };
+        // A previous linrdp process killed while a key was held left that
+        // key pressed in the X server forever (auto-repeat included) —
+        // clean the slate before serving the first session.
+        handler.release_all();
+        Ok(handler)
     }
 
     /// The desktop X server (Xvfb) is a separate systemd unit that can crash
@@ -129,6 +134,9 @@ impl X11InputHandler {
                 // must be rediscovered before the next TS_UNICODE event.
                 self.unicode_keycode = None;
                 tracing::warn!("X server connection for input was dead — reconnected");
+                // Also clear any key state on the (new) server, just in case
+                // it retained state across a restart.
+                self.release_all();
                 true
             }
             Err(_) => false,
@@ -193,6 +201,24 @@ impl X11InputHandler {
 
     /// TS_SYNC_FLAGS (2.2.8.1.1.3.1.1.5): the client is resynchronizing its
     /// keyboard state. Release every key we still believe is held — a lost
+    /// XTEST global reset — FakeInput with keycode 0 releases every key the
+    /// X server currently holds down (button 0 + ButtonPress likewise for
+    /// buttons). This covers presses the per-session tracker cannot know
+    /// about: keys held by a previous linrdp process when it was killed
+    /// (nobody ever sends their release), or held by a session that was
+    /// preempted mid-press — both otherwise repeat in X forever (the
+    /// terminal-scrolling-forever symptom).
+    fn release_all(&mut self) {
+        let keys = self.conn.xtest_fake_input(FAKE_KEY_PRESS, 0, 0, self.root, 0, 0, XTEST_DEVICE_ID);
+        let buttons = self.conn.xtest_fake_input(FAKE_BUTTON_PRESS, 0, 0, self.root, 0, 0, XTEST_DEVICE_ID);
+        if keys.is_ok() && buttons.is_ok() {
+            tracing::debug!("keyboard synchronize: XTEST release-all sent");
+        } else {
+            tracing::debug!("XTEST release-all partially failed (non-fatal)");
+        }
+        self.pressed_keys.clear();
+    }
+
     /// key-release (network hiccup, client crash mid-press) must not leave a
     /// key stuck down on the X server — then bring the lock states in line
     /// with the client's by toggling the corresponding lock keys.
@@ -203,9 +229,10 @@ impl X11InputHandler {
                 "keyboard synchronize: releasing held key(s)"
             );
         }
-        for keycode in std::mem::take(&mut self.pressed_keys) {
-            self.fake_key(keycode, false);
-        }
+        // Global reset first: the client is resynchronizing keyboard state
+        // (session start or focus), which is also the moment keys stuck by
+        // earlier sessions/processes must go.
+        self.release_all();
 
         let toggles = [
             (want.contains(SynchronizeFlags::CAPS_LOCK), self.locks.contains(SynchronizeFlags::CAPS_LOCK), KEYCODE_CAPS_LOCK, SynchronizeFlags::CAPS_LOCK),

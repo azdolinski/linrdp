@@ -145,7 +145,9 @@ async fn main() -> anyhow::Result<()> {
         .with_hybrid(acceptor, identity.pub_key.clone())
         .with_input_handler(X11InputHandler::connect().expect("X11 unavailable for input"))
         .with_display_handler(gfx_display::EgfxDisplay::new(
-            X11Display::connect(fixed_size).expect("X11 display unavailable"),
+            Arc::new(capture::X11DisplayFactory::new(
+                X11Display::connect(fixed_size).expect("X11 display unavailable"),
+            )),
             Arc::clone(&gfx_session),
             Arc::clone(&display_suppressed),
             Arc::clone(&autodetect_rtt),

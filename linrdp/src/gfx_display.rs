@@ -140,9 +140,43 @@ struct SurfaceState {
     pad_height: u16,
 }
 
+/// One per-session frame producer (X11 grabber, PipeWire stream, ...).
+///
+/// `poll_and_cursor` runs inside `spawn_blocking`; a source Box that is lost
+/// with an abandoned blocking task is simply rebuilt by the factory
+/// (`try_attach` / [`DisplaySourceFactory::updates_source`]).
+pub(crate) trait FrameSource: Send + 'static {
+    /// Poll for a frame (plus the cursor sprite when `cursor_due`).
+    /// `None` = nothing this tick — the caller retries.
+    fn poll_and_cursor(&mut self, cursor_due: bool) -> Option<(Grab, Option<CursorImage>)>;
+    /// Best-effort (re)attach attempt when detached; throttled by the caller.
+    fn try_attach(&mut self) {}
+    /// Whether a poll can currently produce frames.
+    fn is_attached(&self) -> bool {
+        true
+    }
+    /// Log-friendly source identifier (display name, stream node, ...).
+    fn name(&self) -> &str;
+    /// While in the future: the source just changed geometry and frames
+    /// should be held until it settles (WM re-layout after a RandR resize,
+    /// a PipeWire format change).
+    fn settle_until(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+/// Process-wide frame-source factory: answers display-size negotiation for
+/// new connections and mints per-session [`FrameSource`]s.
+pub(crate) trait DisplaySourceFactory: Send + Sync + 'static {
+    fn size(&self) -> DesktopSize;
+    fn request_initial_size(&self, client_size: DesktopSize) -> DesktopSize;
+    fn request_layout(&self, layout: ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout);
+    fn updates_source(&self) -> Box<dyn FrameSource>;
+}
+
 /// Display backend that routes frames over EGFX when available.
 pub(crate) struct EgfxDisplay {
-    x11: X11Display,
+    factory: Arc<dyn DisplaySourceFactory>,
     session: Arc<GfxSession>,
     suppressed: Arc<AtomicBool>,
     /// Latest auto-detect RTT (ms) and session-minimum RTT (ms), shared with
@@ -155,7 +189,7 @@ pub(crate) struct EgfxDisplay {
 
 impl EgfxDisplay {
     pub(crate) fn new(
-        x11: X11Display,
+        factory: Arc<dyn DisplaySourceFactory>,
         session: Arc<GfxSession>,
         suppressed: Arc<AtomicBool>,
         rtt: Arc<AtomicU32>,
@@ -163,7 +197,7 @@ impl EgfxDisplay {
         pointer_cache: Arc<AtomicU16>,
     ) -> Self {
         Self {
-            x11,
+            factory,
             session,
             suppressed,
             rtt,
@@ -176,21 +210,23 @@ impl EgfxDisplay {
 #[async_trait::async_trait]
 impl RdpServerDisplay for EgfxDisplay {
     async fn size(&mut self) -> DesktopSize {
-        self.x11.size().await
+        self.factory.size()
     }
 
     async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
-        self.x11.request_initial_size(client_size).await
+        self.factory.request_initial_size(client_size)
     }
 
     fn request_layout(&mut self, layout: ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout) {
-        self.x11.request_layout(layout)
+        self.factory.request_layout(layout)
     }
 
     async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+        let source = self.factory.updates_source();
+        let settle_until = source.settle_until();
         Ok(Box::new(EgfxUpdates {
-            grabber: Some(self.x11.grabber()),
-            display_name: self.x11.display_name().to_owned(),
+            factory: Arc::clone(&self.factory),
+            source: Some(source),
             session: Arc::clone(&self.session),
             suppressed: Arc::clone(&self.suppressed),
             encoders: None,
@@ -202,8 +238,8 @@ impl RdpServerDisplay for EgfxDisplay {
             motion_until: Instant::now(),
             caps_reset_until: Instant::now(),
             egfx_latched: false,
-            settle_until: self.x11.settle_until(),
-            last_grabber_connect: Instant::now() - Duration::from_secs(1),
+            settle_until,
+            last_attach_attempt: Instant::now() - Duration::from_secs(1),
             hb_polls: 0,
             hb_damaged: 0,
             hb_last: Instant::now(),
@@ -233,8 +269,11 @@ impl RdpServerDisplay for EgfxDisplay {
 }
 
 struct EgfxUpdates {
-    grabber: Option<ScreenGrabber>,
-    display_name: String,
+    factory: Arc<dyn DisplaySourceFactory>,
+    /// The per-session frame source; `None` while a source lost with an
+    /// abandoned blocking task is awaited (rebuilt from the factory,
+    /// throttled by `last_attach_attempt`).
+    source: Option<Box<dyn FrameSource>>,
     session: Arc<GfxSession>,
     suppressed: Arc<AtomicBool>,
     /// Taken out per frame for `spawn_blocking`; re-created if a blocking
@@ -265,8 +304,8 @@ struct EgfxUpdates {
     /// Once a session has used EGFX, never fall back to legacy bitmap
     /// updates (a client decoder reset briefly clears `ready`).
     egfx_latched: bool,
-    /// Throttle for (re)connecting the X grabber when none is present.
-    last_grabber_connect: Instant,
+    /// Throttle for (re)attaching a missing source.
+    last_attach_attempt: Instant,
     /// Heartbeat counters: make a stalled loop (no damage, wedged grab,
     /// stuck suppress) visible in the logs instead of silent.
     hb_polls: u64,
@@ -442,76 +481,70 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
 
 impl EgfxUpdates {
     /// Grab one frame (plus the cursor sprite when `cursor_due`) with a hard
-    /// timeout, (re)connecting to the X server as needed. `None` means
-    /// "nothing this tick" — the caller retries.
+    /// timeout. A source that wedges inside its poll is abandoned with the
+    /// blocking task and rebuilt from the factory next tick — a frozen X
+    /// server never errors, it just never replies, and a PipeWire stream can
+    /// stall the same way.
     async fn grabbed(&mut self, cursor_due: bool) -> Option<(Grab, Option<CursorImage>)> {
-        let Some(mut grabber) = self.grabber.take() else {
-            self.maybe_reconnect_grabber().await;
+        if self
+            .source
+            .as_ref()
+            .is_some_and(|s| s.is_attached())
+        {
+            // Fast path: poll the live source.
+        } else {
+            self.maybe_attach_source();
             return None;
-        };
+        }
+        let mut source = self.source.take().expect("source checked above");
         self.hb_polls += 1;
         let joined = tokio::time::timeout(
             GRAB_TIMEOUT,
             tokio::task::spawn_blocking(move || {
-                let (grab, cursor) = grabber.poll_and_cursor(cursor_due);
-                (grabber, grab, cursor)
+                let polled = source.poll_and_cursor(cursor_due);
+                (source, polled)
             }),
         )
         .await;
         match joined {
-            Ok(Ok((grabber, grab, cursor))) => {
-                self.grabber = Some(grabber);
-                self.hb_damaged += u64::from(grab.as_ref().is_some_and(|g| g.damage.is_some()));
-                self.heartbeat(true);
-                grab.map(|g| (g, cursor))
+            Ok(Ok((source, polled))) => {
+                let name = source.name().to_owned();
+                self.source = Some(source);
+                self.hb_damaged += u64::from(polled.as_ref().is_some_and(|(g, _)| g.damage.is_some()));
+                self.heartbeat(&name);
+                polled
             }
             Ok(Err(join_err)) => {
-                // The poll panicked: the grabber was lost with the task, the
-                // loop rebuilds one next tick. (A panic in an async task
+                // The poll panicked: the source was lost with the task, the
+                // factory rebuilds one next tick. (A panic in an async task
                 // would otherwise kill the display loop silently.)
-                tracing::warn!(error = %join_err, "X grab task panicked — rebuilding grabber");
+                tracing::warn!(error = %join_err, "frame source poll panicked — rebuilding source");
                 None
             }
             Err(_) => {
-                // Frozen X server: the socket is alive but replies never
-                // come. The task (and the grabber inside it) is abandoned;
-                // a fresh connection replaces it, and the dropped
-                // prev_frame forces a full repaint once X responds again.
-                tracing::warn!(
-                    display = %self.display_name,
-                    timeout = ?GRAB_TIMEOUT,
-                    "X grab timed out — X server frozen? abandoning its connection"
-                );
+                // Frozen source (dead X server, wedged PipeWire): the task
+                // and the source inside it are abandoned; a fresh one from
+                // the factory replaces it, and the dropped prev_frame forces
+                // a full repaint once frames flow again.
+                tracing::warn!(timeout = ?GRAB_TIMEOUT, "frame source poll timed out — abandoning it");
                 None
             }
         }
     }
 
-    /// Throttled reconnect for a missing/abandoned grabber.
-    async fn maybe_reconnect_grabber(&mut self) {
-        if self.last_grabber_connect.elapsed() < Duration::from_secs(1) {
+    /// Throttled rebuild/reattach of a missing source. One attempt per
+    /// second keeps a dead source from turning into a factory storm.
+    fn maybe_attach_source(&mut self) {
+        if self.last_attach_attempt.elapsed() < Duration::from_secs(1) {
             return;
         }
-        self.last_grabber_connect = Instant::now();
-        let display_name = self.display_name.clone();
-        let joined = tokio::time::timeout(
-            CONNECT_TIMEOUT,
-            tokio::task::spawn_blocking(move || ScreenGrabber::connect_new(&display_name)),
-        )
-        .await;
-        match joined {
-            Ok(Ok(Some(grabber))) => {
-                tracing::info!(display = %self.display_name, "X grabber (re)connected");
-                self.grabber = Some(grabber);
-            }
-            Ok(Ok(None)) => {
-                tracing::warn!(display = %self.display_name, "X connect failed — screen unavailable, retrying");
-            }
-            Ok(Err(join_err)) => {
-                tracing::warn!(error = %join_err, "X connect task panicked — retrying");
-            }
-            Err(_) => {
-                tracing::warn!(display = %self.display_name, "X connect timed out — X server frozen? retrying");
+        self.last_attach_attempt = Instant::now();
+        match self.source.as_mut() {
+            Some(source) => source.try_attach(),
+            None => {
+                let source = self.factory.updates_source();
+                tracing::info!(source = source.name(), "frame source rebuilt");
+                self.source = Some(source);
             }
         }
     }
@@ -1021,11 +1054,12 @@ impl EgfxUpdates {
     /// One INFO line every 5 s: polls vs. damaged grabs (a stall shows as
     /// polls without damage — wedged X grab or genuinely static screen),
     /// plus the suppress flag and EGFX frame pacing state.
-    fn heartbeat(&mut self, _grabbed: bool) {
+    fn heartbeat(&mut self, source: &str) {
         if self.hb_last.elapsed() < Duration::from_secs(5) {
             return;
         }
         tracing::info!(
+            source,
             polls = self.hb_polls,
             damaged = self.hb_damaged,
             suppressed = self.suppressed.load(Ordering::Relaxed),

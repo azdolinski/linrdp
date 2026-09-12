@@ -180,22 +180,20 @@ impl X11Display {
     pub(crate) fn display_name(&self) -> &str {
         &self.display_name
     }
-}
 
-#[async_trait::async_trait]
-impl RdpServerDisplay for X11Display {
-    async fn size(&mut self) -> DesktopSize {
-        DesktopSize {
-            width: self.width,
-            height: self.height,
-        }
+    /// Current screen geometry (see [`Self::display_name`] for the factory
+    /// that consumes this).
+    pub(crate) fn width(&self) -> u16 {
+        self.width
     }
 
-    /// Adopt the client's requested desktop size (target.md #4: "match size of
-    /// screen — same experience as Windows RDP"). The X11 root is captured at
-    /// whatever geometry it has; we intersect the request with the physical
-    /// screen so the RDP framebuffer matches what the client can show.
-    async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
+    pub(crate) fn height(&self) -> u16 {
+        self.height
+    }
+
+    /// Synchronous core of `request_initial_size` (the RdpServerDisplay
+    /// method delegates here so the source factory can call it directly).
+    pub(crate) fn request_initial_size_sync(&mut self, client_size: DesktopSize) -> DesktopSize {
         tracing::info!(?client_size, "request_initial_size called");
         if let Some((w, h)) = self.fixed_size {
             // Fixed desktop: never touch the X screen per-connection. The
@@ -225,10 +223,9 @@ impl RdpServerDisplay for X11Display {
         }
     }
 
-    /// Client-driven resize (mstsc "Smart resize", MS-RDPBCGR 2.2.11.3
-    /// Display Control Monitor Layout): resize the X screen to the first
-    /// requested monitor geometry so the desktop fills the client window.
-    fn request_layout(&mut self, layout: ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout) {
+    /// Synchronous core of `request_layout` (see
+    /// [`Self::request_initial_size_sync`]).
+    pub(crate) fn request_layout_sync(&mut self, layout: ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout) {
         tracing::info!(?layout, "client requested layout change");
         if self.fixed_size.is_some() {
             tracing::debug!("fixed desktop size — ignoring client layout change");
@@ -249,6 +246,31 @@ impl RdpServerDisplay for X11Display {
             self.width = gw;
             self.height = gh;
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl RdpServerDisplay for X11Display {
+    async fn size(&mut self) -> DesktopSize {
+        DesktopSize {
+            width: self.width,
+            height: self.height,
+        }
+    }
+
+    /// Adopt the client's requested desktop size (target.md #4: "match size of
+    /// screen — same experience as Windows RDP"). The X11 root is captured at
+    /// whatever geometry it has; we intersect the request with the physical
+    /// screen so the RDP framebuffer matches what the client can show.
+    async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
+        self.request_initial_size_sync(client_size)
+    }
+
+    /// Client-driven resize (mstsc "Smart resize", MS-RDPBCGR 2.2.11.3
+    /// Display Control Monitor Layout): resize the X screen to the first
+    /// requested monitor geometry so the desktop fills the client window.
+    fn request_layout(&mut self, layout: ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout) {
+        self.request_layout_sync(layout)
     }
 
     async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
@@ -592,43 +614,7 @@ impl ScreenGrabber {
             self.prev_frame = None;
         }
 
-        // Bounding box AND changed-tile count vs the previous grab. One grab
-        // is delivered as ONE update: the consumer either wraps it in a
-        // single Frame Marker BEGIN/END group (legacy path) or one EGFX
-        // frame, so the client presents the whole grab atomically — no
-        // mixed-age tiles during video playback.
-        let total_tiles = u32::from((width + TILE - 1) / TILE) * u32::from((height + TILE - 1) / TILE);
-        let (damage, changed_tiles) = match &self.prev_frame {
-            None => (Some((0u16, 0u16, width, height)), total_tiles),
-            Some(prev) => {
-                let mut min_x = u16::MAX;
-                let mut min_y = u16::MAX;
-                let mut max_x = 0u16; // exclusive
-                let mut max_y = 0u16; // exclusive
-                let mut changed = 0u32;
-                let mut y = 0u16;
-                while y < height {
-                    let mut x = 0u16;
-                    while x < width {
-                        let w = TILE.min(width - x);
-                        let h = TILE.min(height - y);
-                        if !tile_eq_same_pos(prev, &data, stride, x, y, w, h) {
-                            changed += 1;
-                            min_x = min_x.min(x);
-                            min_y = min_y.min(y);
-                            max_x = max_x.max(x + w);
-                            max_y = max_y.max(y + h);
-                        }
-                        x += TILE;
-                    }
-                    y += TILE;
-                }
-                (
-                    (min_x != u16::MAX).then(|| (min_x, min_y, max_x - min_x, max_y - min_y)),
-                    changed,
-                )
-            }
-        };
+        let (damage, changed_tiles, total_tiles) = compute_tile_damage(self.prev_frame.as_deref(), &data, width, height);
 
         // Keep the frame as the diff baseline only when something changed —
         // an unchanged grab is byte-identical to the stored baseline already,
@@ -700,6 +686,129 @@ fn tile_eq_same_pos(prev_frame: &[u8], tile: &[u8], stride: usize, x: u16, y: u1
         }
     }
     true
+}
+
+/// Bounding box AND changed-tile count of `cur` vs `prev` (both tightly
+/// packed BGRX, `width * 4` stride). `prev == None` means full damage — the
+/// first grab after (re)connect or resize.
+///
+/// One grab is delivered as ONE update: the consumer either wraps it in a
+/// single Frame Marker BEGIN/END group (legacy path) or one EGFX frame, so
+/// the client presents the whole grab atomically — no mixed-age tiles during
+/// video playback. Shared by the X11 grabber and the Wayland/PipeWire source.
+pub(crate) fn compute_tile_damage(
+    prev: Option<&[u8]>,
+    cur: &[u8],
+    width: u16,
+    height: u16,
+) -> (Option<(u16, u16, u16, u16)>, u32, u32) {
+    let stride = usize::from(width) * 4;
+    let total_tiles = u32::from((width + TILE - 1) / TILE) * u32::from((height + TILE - 1) / TILE);
+    match prev {
+        None => (Some((0u16, 0u16, width, height)), total_tiles, total_tiles),
+        Some(prev) => {
+            let mut min_x = u16::MAX;
+            let mut min_y = u16::MAX;
+            let mut max_x = 0u16; // exclusive
+            let mut max_y = 0u16; // exclusive
+            let mut changed = 0u32;
+            let mut y = 0u16;
+            while y < height {
+                let mut x = 0u16;
+                while x < width {
+                    let w = TILE.min(width - x);
+                    let h = TILE.min(height - y);
+                    if !tile_eq_same_pos(prev, cur, stride, x, y, w, h) {
+                        changed += 1;
+                        min_x = min_x.min(x);
+                        min_y = min_y.min(y);
+                        max_x = max_x.max(x + w);
+                        max_y = max_y.max(y + h);
+                    }
+                    x += TILE;
+                }
+                y += TILE;
+            }
+            (
+                (min_x != u16::MAX).then(|| (min_x, min_y, max_x - min_x, max_y - min_y)),
+                changed,
+                total_tiles,
+            )
+        }
+    }
+}
+
+/// X11 adapter over [`X11Display`] implementing the source traits the EGFX
+/// display loop drives (see `gfx_display::FrameSource`). The grabber and its
+/// crash/freeze self-healing stay in [`ScreenGrabber`]; this only feeds the
+/// generic display machinery.
+pub(crate) struct X11DisplayFactory {
+    display: std::sync::Mutex<X11Display>,
+}
+
+impl X11DisplayFactory {
+    pub(crate) fn new(display: X11Display) -> Self {
+        Self {
+            display: std::sync::Mutex::new(display),
+        }
+    }
+}
+
+impl crate::gfx_display::DisplaySourceFactory for X11DisplayFactory {
+    fn size(&self) -> ironrdp_connector::DesktopSize {
+        let display = self.display.lock().expect("display lock poisoned");
+        let (width, height) = (display.width(), display.height());
+        ironrdp_connector::DesktopSize { width, height }
+    }
+
+    fn request_initial_size(&self, client_size: ironrdp_connector::DesktopSize) -> ironrdp_connector::DesktopSize {
+        let mut display = self.display.lock().expect("display lock poisoned");
+        display.request_initial_size_sync(client_size)
+    }
+
+    fn request_layout(&self, layout: ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout) {
+        let mut display = self.display.lock().expect("display lock poisoned");
+        display.request_layout_sync(layout);
+    }
+
+    fn updates_source(&self) -> Box<dyn crate::gfx_display::FrameSource> {
+        let display = self.display.lock().expect("display lock poisoned");
+        Box::new(X11Source {
+            grabber: Some(display.grabber()),
+            display_name: display.display_name().to_owned(),
+        })
+    }
+}
+
+/// Per-session X11 frame source: one grabber over the factory's connection.
+struct X11Source {
+    grabber: Option<ScreenGrabber>,
+    display_name: String,
+}
+
+impl crate::gfx_display::FrameSource for X11Source {
+    fn poll_and_cursor(&mut self, cursor_due: bool) -> Option<(Grab, Option<CursorImage>)> {
+        let Some(grabber) = self.grabber.as_mut() else {
+            return None;
+        };
+        let (grab, cursor) = grabber.poll_and_cursor(cursor_due);
+        grab.map(|g| (g, cursor))
+    }
+
+    fn try_attach(&mut self) {
+        if self.grabber.is_none() {
+            tracing::warn!(display = %self.display_name, "X grabber lost — reconnecting");
+            self.grabber = ScreenGrabber::connect_new(&self.display_name);
+        }
+    }
+
+    fn is_attached(&self) -> bool {
+        self.grabber.is_some()
+    }
+
+    fn name(&self) -> &str {
+        &self.display_name
+    }
 }
 
 #[cfg(test)]
