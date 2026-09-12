@@ -109,6 +109,14 @@ const ENC_RC_FPS_MAX: f64 = 30.0;
 /// rebuilds the encoder, so the throttle also bounds encoder churn.
 const QUALITY_UPDATE_INTERVAL: Duration = Duration::from_millis(1500);
 
+/// Adaptive quality is only evaluated while sustained motion flows: at least
+/// this many H.264 frames must have been sent since the previous evaluation.
+/// A quiet screen sends almost no bytes, and reading that goodput as "slow
+/// network" dragged the quality to the floor — video resumed after a pause
+/// then started blocky and sharpened over seconds. Below the threshold the
+/// quality is HELD, so a resumed video starts at the quality it left with.
+const MIN_MOTION_FRAMES_PER_EVAL: u64 = 22;
+
 /// Adaptive-quality bounds and step sizes (KRdp: MinAdaptiveQuality,
 /// QualityStepUp, QualityStepDown). Quality moves down faster than up, so a
 /// degrading link sheds bitrate quickly and re-gains it cautiously.
@@ -341,6 +349,8 @@ impl RdpServerDisplay for EgfxDisplay {
             last_grab_start: Instant::now(),
             grab_ms: 0.0,
             process_ms: 0.0,
+            motion_frames: 0,
+            motion_frames_mark: 0,
         }))
     }
 }
@@ -432,6 +442,10 @@ struct EgfxUpdates {
     /// encode + send), for the heartbeat. EWMA, alpha 0.25.
     grab_ms: f64,
     process_ms: f64,
+    /// H.264 frames sent since the last adaptive-quality evaluation — the
+    /// "is motion actually flowing" gate (see MIN_MOTION_FRAMES_PER_EVAL).
+    motion_frames: u64,
+    motion_frames_mark: u64,
     /// Cursor shape cache: shape hash → cache slot. Bounded by the client's
     /// negotiated pointer cache size; LRU eviction frees a slot on overflow.
     cursor_cache: HashMap<u64, CursorCacheEntry>,
@@ -679,6 +693,8 @@ impl EgfxUpdates {
         match tokio::time::timeout(remaining, pending.handle).await {
             Ok(Ok((source, polled))) => {
                 self.hb_damaged += u64::from(polled.as_ref().is_some_and(|(g, _)| g.damage.is_some()));
+                let grab_ms = pending.started.elapsed().as_secs_f64() * 1000.0;
+                self.grab_ms = if self.grab_ms == 0.0 { grab_ms } else { self.grab_ms * 0.75 + grab_ms * 0.25 };
                 let name = source.name().to_owned();
                 self.source = Some(source);
                 self.heartbeat(&name);
@@ -1076,6 +1092,16 @@ impl EgfxUpdates {
         if goodput_kbit == 0 || goodput_kbit == u32::MAX {
             return; // no measurement yet — keep the bootstrap full-quality target
         }
+        // Hold while motion is not sustained (see MIN_MOTION_FRAMES_PER_EVAL):
+        // measured goodput on a quiet screen is what WE are sending, not what
+        // the network supports. The timestamp is intentionally left fresh so
+        // the cheap gate re-runs per frame until motion resumes.
+        let motion_delta = self.motion_frames - self.motion_frames_mark;
+        self.motion_frames_mark = self.motion_frames;
+        if motion_delta < MIN_MOTION_FRAMES_PER_EVAL {
+            self.last_quality_update = Instant::now();
+            return;
+        }
         self.last_quality_update = Instant::now();
 
         let Some(surface) = self.surface else { return };
@@ -1340,6 +1366,7 @@ impl EgfxUpdates {
         if sent.is_some() {
             self.stat_h264 += 1;
             self.producer_frames += 1;
+            self.motion_frames += 1;
             self.last_h264 = Instant::now();
             self.pending_full = false;
         } else {
