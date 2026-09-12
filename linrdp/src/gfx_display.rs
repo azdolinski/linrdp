@@ -9,7 +9,8 @@
 //!   uses for static content;
 //! - small damage (typing, cursor, UI): a lossless ClearCodec rectangle;
 //! - large damage (video, scrolling): a full-frame **H.264 AVC420** encode
-//!   (OpenH264 in `ScreenContentRealTime` mode, quality rate control).
+//!   (OpenH264, camera-class coding tools with multi-threaded size-limited
+//!   slices, bitrate-target rate control).
 //!
 //! If the channel is not negotiated (older clients, macOS Microsoft Remote
 //! Desktop), or it goes down mid-session, the loop transparently falls back
@@ -82,6 +83,23 @@ const LEGACY_GRACE: Duration = Duration::from_millis(1500);
 /// resolution anchor (7.5 Mbit/s at 4K); this only bounds pathological frames.
 /// (Kept as an absolute last-resort clamp for the rate controller.)
 const H264_BITRATE_CEILING_BPS: u32 = 12_000_000;
+
+/// OpenH264 multi-threading works through size-limited slices (single-slice
+/// mode internally forces `iMultipleThreadIdc = 1`); 32 KB slices split a
+/// 2880x1800 frame into enough parallel units with negligible per-slice
+/// header overhead. Measured on this machine (`examples/h264_bench.rs`):
+/// screen-content single-slice 424 ms/frame -> camera-mode sliced 32 ms.
+const ENCODER_SLICE_BYTES: u32 = 32 * 1024;
+
+/// Bounds for the rate-control frame-rate assumption fed to OpenH264. The RC
+/// spreads the target bitrate across this many frames per second, so it has
+/// to track the rate we actually produce: at a fixed 30 fps assumption while
+/// really producing 9 fps, the encoder emits a third of its target and the
+/// goodput-driven quality adaptation reads that as "slow network" (a
+/// downward spiral measured in production). Clamped low so the very first
+/// frames get a sane per-frame budget before the producer rate is measured.
+const ENC_RC_FPS_MIN: f64 = 8.0;
+const ENC_RC_FPS_MAX: f64 = 30.0;
 
 /// Re-evaluate the adaptive encoder quality at most this often (KRdp:
 /// `QualityUpdateInterval`). Each evaluation loads two atomics and at most
@@ -316,7 +334,8 @@ impl RdpServerDisplay for EgfxDisplay {
             quality: 100,
             // First evaluation can run as soon as the first measurement lands.
             last_quality_update: Instant::now() - QUALITY_UPDATE_INTERVAL,
-            enc_bitrate_bps: None,
+            enc_built: None,
+            last_grab_start: Instant::now(),
         }))
     }
 }
@@ -397,9 +416,13 @@ struct EgfxUpdates {
     /// first frames go out at full anchor bitrate before any measurement.
     quality: u8,
     last_quality_update: Instant,
-    /// Bitrate the running H.264 encoder was built with; `None` until the
-    /// first motion frame creates one. Drives rebuild-on-change hysteresis.
-    enc_bitrate_bps: Option<u32>,
+    /// Encoder config the running H.264 instance was built with:
+    /// `(target bitrate bps, rate-control fps)`. `None` until the first
+    /// motion frame creates one. Drives rebuild-on-change hysteresis.
+    enc_built: Option<(u32, f32)>,
+    /// When the last capture poll was started — paces grab starts to the
+    /// poll interval in the event-driven loop.
+    last_grab_start: Instant,
     /// Cursor shape cache: shape hash → cache slot. Bounded by the client's
     /// negotiated pointer cache size; LRU eviction frees a slot on overflow.
     cursor_cache: HashMap<u64, CursorCacheEntry>,
@@ -438,7 +461,7 @@ struct CursorCacheEntry {
 
 /// A grab poll in flight — the one-frame prefetch that pipelines capture
 /// against encoding: the next X11/PipeWire poll runs in a blocking task while
-/// the previous grab is being converted and encoded. The frame source lives
+/// the previous frame is being converted and encoded. The frame source lives
 /// inside the task until the poll completes, so `EgfxUpdates::source` is
 /// `None` for the duration (`try_consume_grab` puts it back).
 struct PendingGrab {
@@ -450,10 +473,9 @@ struct PendingGrab {
 impl RdpServerDisplayUpdates for EgfxUpdates {
     async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
         loop {
-            tokio::time::sleep(POLL_INTERVAL).await;
-
             // Client minimized (Suppress Output): skip emission entirely.
             if self.suppressed.load(Ordering::Relaxed) {
+                tokio::time::sleep(POLL_INTERVAL).await;
                 continue;
             }
 
@@ -473,21 +495,34 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
                     && Self::lock_handle(&handle).should_backpressure()
                 {
                     self.pending_full = true;
+                    tokio::time::sleep(POLL_INTERVAL).await;
                     continue;
                 }
             }
 
-            // Start the next capture before consuming the previous grab: the
-            // poll (GetImage + tile diff) runs concurrently with the previous
-            // frame's YUV conversion + encode instead of serializing behind
-            // it. Per-frame cost drops from grab+encode to ~max(encode, grab).
-            self.maybe_start_grab(cursor_due);
-
-            let Some((grab, cursor)) = self.try_consume_grab().await else {
-                // Prefetch still running — a stashed cursor update can go out now.
-                if let Some(update) = self.pending_cursor.take() {
-                    return Ok(Some(update));
+            // Start the next capture when the pacing interval has passed;
+            // otherwise wait out the remainder. When encoding is slower than
+            // the interval (motion) this never sleeps — the encoder paces the
+            // loop and the capture runs concurrently with it.
+            if self.pending_grab.is_none() {
+                let since_last = self.last_grab_start.elapsed();
+                if since_last < POLL_INTERVAL {
+                    tokio::time::sleep(POLL_INTERVAL - since_last).await;
+                    continue;
                 }
+                self.maybe_start_grab(cursor_due);
+                if self.pending_grab.is_none() {
+                    // Could not start (source lost, rebuild throttled): idle
+                    // briefly instead of spinning.
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                    continue;
+                }
+            }
+
+            // Event-driven consume: await the in-flight poll directly instead
+            // of sleeping a fixed tick, so the per-frame period is
+            // max(pacing, encode) rather than pacing + encode.
+            let Some((grab, cursor)) = self.try_consume_grab().await else {
                 continue;
             };
 
@@ -566,7 +601,7 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
                     "EGFX frame processing stalled — resetting encoders and motion state"
                 );
                 self.encoders = None;
-                self.enc_bitrate_bps = None;
+                self.enc_built = None;
                 self.in_motion = false;
                 self.pending_full = true;
             }
@@ -591,42 +626,27 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
 }
 
 impl EgfxUpdates {
-    /// Kick off the next capture poll unless one is already in flight.
-    ///
-    /// The poll runs in a blocking task and its result is picked up by
-    /// [`Self::try_consume_grab`] on a later tick — that split is what lets
+    /// Kick off the next capture poll. The poll runs in a blocking task and
+    /// [`Self::try_consume_grab`] awaits its result — that split is what lets
     /// the next GetImage + tile diff overlap the previous frame's conversion
-    /// and encode. A poll that exceeds [`GRAB_TIMEOUT`] is abandoned with the
-    /// task (the source inside it is lost; the factory rebuilds one, and the
-    /// dropped baseline forces a full repaint once frames flow again).
+    /// and encode.
     fn maybe_start_grab(&mut self, cursor_due: bool) {
-        match &mut self.pending_grab {
-            Some(pending) => {
-                if !pending.handle.is_finished() && pending.started.elapsed() > GRAB_TIMEOUT {
-                    tracing::warn!(timeout = ?GRAB_TIMEOUT, "frame source poll timed out — abandoning it");
-                    // A blocking task cannot be interrupted; dropping the
-                    // handle detaches it and the result is discarded.
-                    self.pending_grab = None;
-                }
-                // In flight (or just abandoned this tick — the source rebuild
-                // is throttled by `maybe_attach_source` below, next tick).
-                return;
-            }
-            None => {
-                if self
-                    .source
-                    .as_ref()
-                    .is_some_and(|s| s.is_attached())
-                {
-                    // Fast path: poll the live source.
-                } else {
-                    self.maybe_attach_source();
-                    return;
-                }
-            }
+        if self.pending_grab.is_some() {
+            return; // one poll at a time
+        }
+        if self
+            .source
+            .as_ref()
+            .is_some_and(|s| s.is_attached())
+        {
+            // Fast path: poll the live source.
+        } else {
+            self.maybe_attach_source();
+            return;
         }
         let mut source = self.source.take().expect("source checked above");
         self.hb_polls += 1;
+        self.last_grab_start = Instant::now();
         let handle = tokio::task::spawn_blocking(move || {
             let polled = source.poll_and_cursor(cursor_due);
             (source, polled)
@@ -637,28 +657,30 @@ impl EgfxUpdates {
         });
     }
 
-    /// Consume the prefetched grab once its blocking poll has finished.
-    /// `None` = still running (or being rebuilt after a timeout) — retry next
-    /// tick; the frame source stays inside the task meanwhile.
+    /// Await the in-flight capture poll (event-driven: no fixed tick sleep).
+    /// A poll exceeding [`GRAB_TIMEOUT`] is abandoned — the source inside the
+    /// task is lost and the factory rebuilds one, with the dropped baseline
+    /// forcing a full repaint once frames flow again.
     async fn try_consume_grab(&mut self) -> Option<(Grab, Option<CursorImage>)> {
         let pending = self.pending_grab.take()?;
-        if !pending.handle.is_finished() {
-            self.pending_grab = Some(pending);
-            return None;
-        }
-        match pending.handle.await {
-            Ok((source, polled)) => {
+        let remaining = GRAB_TIMEOUT.saturating_sub(pending.started.elapsed());
+        match tokio::time::timeout(remaining, pending.handle).await {
+            Ok(Ok((source, polled))) => {
                 self.hb_damaged += u64::from(polled.as_ref().is_some_and(|(g, _)| g.damage.is_some()));
                 let name = source.name().to_owned();
                 self.source = Some(source);
                 self.heartbeat(&name);
                 polled
             }
-            Err(join_err) => {
+            Ok(Err(join_err)) => {
                 // The poll panicked: the source was lost with the task, the
                 // factory rebuilds one next tick. (A panic in an async task
                 // would otherwise kill the display loop silently.)
                 tracing::warn!(error = %join_err, "frame source poll panicked — rebuilding source");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(timeout = ?GRAB_TIMEOUT, "frame source poll timed out — abandoning it");
                 None
             }
         }
@@ -1061,7 +1083,12 @@ impl EgfxUpdates {
 
         let avg_rtt = self.rtt.load(Ordering::Relaxed);
         let min_rtt = self.rtt_baseline.load(Ordering::Relaxed);
-        let congested = min_rtt != u32::MAX
+        // Sub-millisecond LAN samples are whole-millisecond quantized (0/1 ms)
+        // and would make `avg > min*1.5` fire on pure noise — KRdp guards the
+        // same comparison with `min > 0`. Only declare congestion when the
+        // session minimum is at least the plausibility floor, i.e. there is
+        // enough resolution for queueing to show up at all.
+        let congested = f64::from(min_rtt) >= MIN_VALID_RTT_MS
             && avg_rtt != u32::MAX
             && f64::from(avg_rtt) > f64::from(min_rtt) * 1.5;
         if congested {
@@ -1111,6 +1138,23 @@ impl EgfxUpdates {
         )]
         let bps = (kbit * 1000.0).clamp(250_000.0, f64::from(H264_BITRATE_CEILING_BPS)) as u32;
         bps
+    }
+
+    /// Rate-control frame-rate assumption for the encoder: the measured
+    /// producer rate, clamped. OpenH264 spreads the target bitrate across
+    /// this many frames per second, so it has to match what we actually
+    /// produce — otherwise the emitted stream undershoots the target by
+    /// (assumed/actual) and the goodput-driven adaptation misreads that as a
+    /// slow network.
+    fn h264_rc_fps(&self) -> f32 {
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "clamped to ENC_RC_FPS_MIN..ENC_RC_FPS_MAX"
+        )]
+        let fps = self.producer_fps.clamp(ENC_RC_FPS_MIN, ENC_RC_FPS_MAX) as f32;
+        fps
     }
 
     /// Lossless ClearCodec rectangle for small damage (or the full surface,
@@ -1190,29 +1234,36 @@ impl EgfxUpdates {
             return;
         }
 
-        // Adaptive bitrate: (re)build the encoder whenever the target moved by
-        // more than 10% from what the running one was built with. Quality
+        // Adaptive encoder config: (re)build whenever the target bitrate
+        // drifted more than 10% or the rate-control frame-rate assumption
+        // more than 25% from what the running one was built with. Quality
         // steps are throttled to QUALITY_UPDATE_INTERVAL, so this settles
         // quickly; the openh264 wrapper has no runtime bitrate option, and a
         // fresh encoder conveniently opens with an IDR, re-syncing the client
-        // after the rate change.
-        let want_bps = self.h264_bitrate_bps();
+        // after the change.
+        let target_bitrate = self.h264_bitrate_bps();
+        let target_rate_fps = self.h264_rc_fps();
         // Stale means "no usable H.264 encoder at the current target": missing
         // entirely (first motion frame, post-stall reset), or built at a
-        // bitrate that drifted more than 10% from the current adaptive target.
+        // config that drifted from the current adaptive target.
         let bitrate_stale = match (
             self.encoders.as_ref().is_some_and(|e| e.h264.is_some()),
-            self.enc_bitrate_bps,
+            self.enc_built,
         ) {
-            (true, Some(built)) => {
-                let lo = built.min(want_bps);
-                let hi = built.max(want_bps);
-                hi - lo > built / 10
+            (true, Some((built_bitrate, built_rate_fps))) => {
+                let lo = built_bitrate.min(target_bitrate);
+                let hi = built_bitrate.max(target_bitrate);
+                if hi - lo > built_bitrate / 10 {
+                    true
+                } else {
+                    // >25% rate-control fps drift.
+                    (built_rate_fps - target_rate_fps).abs() > built_rate_fps * 0.25
+                }
             }
             _ => true,
         };
         if bitrate_stale {
-            match make_h264_encoder(want_bps) {
+            match make_h264_encoder(target_bitrate, target_rate_fps) {
                 Ok(h264) => {
                     match self.encoders.as_mut() {
                         Some(encoders) => encoders.h264 = Some(h264),
@@ -1223,7 +1274,7 @@ impl EgfxUpdates {
                             });
                         }
                     }
-                    self.enc_bitrate_bps = Some(want_bps);
+                    self.enc_built = Some((target_bitrate, target_rate_fps));
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "EGFX: OpenH264 init failed — ClearCodec only");
@@ -1351,16 +1402,22 @@ impl EgfxUpdates {
     }
 }
 
-fn make_h264_encoder(bitrate_bps: u32) -> anyhow::Result<OpenH264> {
+fn make_h264_encoder(bitrate_bps: u32, rc_fps: f32) -> anyhow::Result<OpenH264> {
     let api = openh264::OpenH264API::from_source();
     let config = EncoderConfig::new()
         .bitrate(BitRate::from_bps(bitrate_bps))
-        .max_frame_rate(FrameRate::from_hz(30.0))
-        .usage_type(UsageType::ScreenContentRealTime)
-        // KRdp/RustDesk drive the encoder by target bitrate (the resolution
-        // anchor scaled by measured goodput — see `update_adaptive_quality`);
-        // quality mode has no dial the adaptation could turn.
+        .max_frame_rate(FrameRate::from_hz(rc_fps))
+        // Camera-class coding tools (what KRdp's GStreamer x264/hw encoders
+        // and RustDesk effectively use). The screen-content encoder's
+        // exhaustive mode search measured 420+ ms per 2880x1800 frame on
+        // this machine — a hard ~2 fps ceiling — while camera mode with
+        // size-limited slices encodes the same frame in ~32 ms. Static UI
+        // never goes through H.264 anyway: ClearCodec repaints it lossless.
+        .usage_type(UsageType::CameraVideoRealTime)
         .rate_control_mode(RateControlMode::Bitrate)
+        // Size-limited slices are what unlock OpenH264's multi-threaded
+        // slice encoder; a single slice caps it at one thread.
+        .max_slice_len(ENCODER_SLICE_BYTES)
         .skip_frames(false)
         // Signal the colorspace in the SPS VUI: the planes are full-range
         // BT.709 (MS-RDPEGFX §3.3.8.3.1), and without this flag a
@@ -1371,7 +1428,8 @@ fn make_h264_encoder(bitrate_bps: u32) -> anyhow::Result<OpenH264> {
 }
 
 /// Convert a BGRX grab into macroblock-padded I420 planes, **full-range
-/// BT.709**.
+/// BT.709**, split across worker threads (single-threaded the conversion
+/// costs ~20 ms at 2880x1800 — comparable to the encode itself).
 ///
 /// MS-RDPEGFX §3.3.8.3.1 normatively mandates full-range luma (0..255, no
 /// 16..235 studio swing) with the BT.709 matrix — the same conversion
@@ -1384,12 +1442,61 @@ fn make_h264_encoder(bitrate_bps: u32) -> anyhow::Result<OpenH264> {
 /// The padding region is black (Y=0, Cb=Cr=128) — the destination rectangle
 /// crops it away.
 fn bgrx_to_yuv420(src: &[u8], w: usize, h: usize, pw: usize, ph: usize) -> openh264::formats::YUVBuffer {
-    let stride = w * 4;
     let mut yuv = vec![0u8; 3 * (pw * ph) / 2];
     let (y_len, u_len) = (pw * ph, pw * ph / 4);
     let (y_plane, rest) = yuv.split_at_mut(y_len);
     let (u_plane, v_plane) = rest.split_at_mut(u_len);
 
+    let chroma_rows = ph / 2;
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 8)
+        .min(chroma_rows);
+    let rows_per_worker = chroma_rows.div_ceil(workers);
+    let chunk_count = chroma_rows.div_ceil(rows_per_worker);
+    let starts: Vec<usize> = (0..chunk_count).map(|c| c * rows_per_worker).collect();
+    let ys = split_row_chunks(y_plane, rows_per_worker, 2 * pw, chunk_count);
+    let us = split_row_chunks(u_plane, rows_per_worker, pw / 2, chunk_count);
+    let vs = split_row_chunks(v_plane, rows_per_worker, pw / 2, chunk_count);
+
+    std::thread::scope(|scope| {
+        for (((j0, y), u), v) in starts.into_iter().zip(ys).zip(us).zip(vs) {
+            let j1 = (j0 + rows_per_worker).min(chroma_rows);
+            scope.spawn(move || convert_rows(src, w, h, pw, y, u, v, j0, j1));
+        }
+    });
+    openh264::formats::YUVBuffer::from_vec(yuv, pw, ph)
+}
+
+/// Split `slice` into at most `count` consecutive chunks of
+/// `rows_per_chunk * row_len` bytes (the tail chunk may be shorter).
+fn split_row_chunks(slice: &mut [u8], rows_per_chunk: usize, row_len: usize, count: usize) -> Vec<&mut [u8]> {
+    let mut chunks = Vec::with_capacity(count);
+    let mut rest = slice;
+    for _ in 0..count {
+        let take = (rows_per_chunk * row_len).min(rest.len());
+        let (head, tail) = rest.split_at_mut(take);
+        chunks.push(head);
+        rest = tail;
+    }
+    chunks
+}
+
+/// Convert chroma-row range `[j0, j1)` (source rows `2*j0 .. 2*j1`) into the
+/// provided Y/U/V slices — full-range BT.709, padding stays black.
+fn convert_rows(
+    src: &[u8],
+    w: usize,
+    h: usize,
+    pw: usize,
+    y_plane: &mut [u8],
+    u_plane: &mut [u8],
+    v_plane: &mut [u8],
+    j0: usize,
+    j1: usize,
+) {
+    let stride = w * 4;
     // Pixel accessor: real (R, G, B) inside the frame, black in the padding.
     let px = |x: usize, y: usize| -> (i32, i32, i32) {
         if x < w && y < h {
@@ -1400,7 +1507,8 @@ fn bgrx_to_yuv420(src: &[u8], w: usize, h: usize, pw: usize, ph: usize) -> openh
         }
     };
 
-    for j in 0..ph / 2 {
+    for j in j0..j1 {
+        let j_local = j - j0;
         for i in 0..pw / 2 {
             let p00 = px(i * 2, j * 2);
             let p01 = px(i * 2, j * 2 + 1);
@@ -1413,18 +1521,16 @@ fn bgrx_to_yuv420(src: &[u8], w: usize, h: usize, pw: usize, ph: usize) -> openh
             let b = (p00.2 + p01.2 + p10.2 + p11.2) / 4;
             let cb = ((-29 * r - 99 * g + 128 * b) >> 8) + 128;
             let cr = ((128 * r - 116 * g - 12 * b) >> 8) + 128;
-            u_plane[j * (pw / 2) + i] = cb.clamp(0, 255) as u8;
-            v_plane[j * (pw / 2) + i] = cr.clamp(0, 255) as u8;
+            u_plane[j_local * (pw / 2) + i] = cb.clamp(0, 255) as u8;
+            v_plane[j_local * (pw / 2) + i] = cr.clamp(0, 255) as u8;
 
             // Luma per pixel (full-range BT.709: 54/183/18, sum 255).
-            for (p, (dx, dy)) in [(p00, (0, 0)), (p01, (0, 1)), (p10, (1, 0)), (p11, (1, 1))] {
+            for (p, (dx, dy)) in [(p00, (0usize, 0usize)), (p01, (0, 1)), (p10, (1, 0)), (p11, (1, 1))] {
                 let y_val = (54 * p.0 + 183 * p.1 + 18 * p.2) >> 8;
-                y_plane[(j * 2 + dy) * pw + (i * 2 + dx)] = y_val.clamp(0, 255) as u8;
+                y_plane[(j_local * 2 + dy) * pw + (i * 2 + dx)] = y_val.clamp(0, 255) as u8;
             }
         }
     }
-
-    openh264::formats::YUVBuffer::from_vec(yuv, pw, ph)
 }
 
 /// Crop a rectangle out of a BGRX grab into tightly-packed BGRA (ClearCodec
@@ -1439,4 +1545,67 @@ fn crop_bgra(data: &[u8], width: u16, x: u16, y: u16, w: u16, h: u16) -> Vec<u8>
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bgrx_to_yuv420;
+
+    /// The row-parallel YUV conversion must produce byte-identical planes to
+    /// a straightforward sequential reference (same BT.709 full-range math),
+    /// including the black 16-px padding, at a size that is not a multiple of
+    /// the macroblock grid and splits unevenly across worker threads.
+    #[test]
+    fn parallel_yuv_matches_sequential_reference() {
+        let (w, h) = (100usize, 73usize);
+        let mut src = vec![0u8; w * h * 4];
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        for px in src.chunks_exact_mut(4) {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            px[0] = (seed >> 24) as u8;
+            px[1] = (seed >> 32) as u8;
+            px[2] = (seed >> 40) as u8;
+            px[3] = 0xFF;
+        }
+
+        let pw = w.div_ceil(16) * 16;
+        let ph = h.div_ceil(16) * 16;
+        let got = bgrx_to_yuv420(&src, w, h, pw, ph);
+
+        // Sequential reference, same math as convert_rows (see its docs).
+        let stride = w * 4;
+        let px = |x: usize, y: usize| -> (i32, i32, i32) {
+            if x < w && y < h {
+                let off = y * stride + x * 4;
+                (i32::from(src[off + 2]), i32::from(src[off + 1]), i32::from(src[off]))
+            } else {
+                (0, 0, 0)
+            }
+        };
+        let mut exp_y = vec![0u8; pw * ph];
+        let mut exp_u = vec![128u8; pw * ph / 4];
+        let mut exp_v = vec![128u8; pw * ph / 4];
+        for j in 0..ph / 2 {
+            for i in 0..pw / 2 {
+                let p00 = px(i * 2, j * 2);
+                let p01 = px(i * 2, j * 2 + 1);
+                let p10 = px(i * 2 + 1, j * 2);
+                let p11 = px(i * 2 + 1, j * 2 + 1);
+                let r = (p00.0 + p01.0 + p10.0 + p11.0) / 4;
+                let g = (p00.1 + p01.1 + p10.1 + p11.1) / 4;
+                let b = (p00.2 + p01.2 + p10.2 + p11.2) / 4;
+                exp_u[j * (pw / 2) + i] = (((-29 * r - 99 * g + 128 * b) >> 8) + 128).clamp(0, 255) as u8;
+                exp_v[j * (pw / 2) + i] = (((128 * r - 116 * g - 12 * b) >> 8) + 128).clamp(0, 255) as u8;
+                for (p, (dx, dy)) in [(p00, (0usize, 0usize)), (p01, (0, 1)), (p10, (1, 0)), (p11, (1, 1))] {
+                    let val = (54 * p.0 + 183 * p.1 + 18 * p.2) >> 8;
+                    exp_y[(j * 2 + dy) * pw + (i * 2 + dx)] = val.clamp(0, 255) as u8;
+                }
+            }
+        }
+
+        use openh264::formats::YUVSource as _;
+        assert_eq!(got.y(), exp_y.as_slice(), "Y planes differ");
+        assert_eq!(got.u(), exp_u.as_slice(), "U planes differ");
+        assert_eq!(got.v(), exp_v.as_slice(), "V planes differ");
+    }
 }
