@@ -2400,6 +2400,10 @@ impl RdpServer {
                                 ServerEvent::SetAutoReconnectCookie(cookie) => {
                                     self.set_auto_reconnect_cookie(cookie);
                                 }
+                                // Routine at the 70 ms probe cadence while no
+                                // client is connected; logging it at debug
+                                // would flood the log 14 lines/s.
+                                ServerEvent::AutoDetectRttRequest => {}
                                 ev => {
                                     debug!("Unexpected event {:?}", ev);
                                 }
