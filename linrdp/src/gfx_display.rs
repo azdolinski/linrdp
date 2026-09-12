@@ -69,6 +69,14 @@ const FRAME_PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
 /// its whole EGFX pipeline and cannot consume frames until it settles.
 const CAPS_SETTLE: Duration = Duration::from_millis(250);
 
+/// How long to wait for a graphics-capable client to open its EGFX channel
+/// before concluding the client cannot do EGFX at all and starting legacy
+/// bitmap updates. Graphics clients negotiate well inside this window;
+/// sending bitmap updates earlier mixes update streams during mstsc's
+/// pipeline negotiation and costs the first session of every process
+/// lifetime its composition (the "first connection is black" bug).
+const LEGACY_GRACE: Duration = Duration::from_millis(1500);
+
 /// H.264 target bitrate. Rate control runs in quality mode, so this is a
 /// ceiling that keeps pathological frames (noise, fast scroll) bounded.
 const H264_BITRATE_BPS: u32 = 12_000_000;
@@ -238,6 +246,7 @@ impl RdpServerDisplay for EgfxDisplay {
             motion_until: Instant::now(),
             caps_reset_until: Instant::now(),
             egfx_latched: false,
+            legacy_grace_until: Instant::now() + LEGACY_GRACE,
             settle_until,
             last_attach_attempt: Instant::now() - Duration::from_secs(1),
             hb_polls: 0,
@@ -304,6 +313,10 @@ struct EgfxUpdates {
     /// Once a session has used EGFX, never fall back to legacy bitmap
     /// updates (a client decoder reset briefly clears `ready`).
     egfx_latched: bool,
+    /// Legacy bitmap updates are allowed only after this much session time
+    /// with no graphics channel ever opened — see the comment at the
+    /// handle check in `next_update`.
+    legacy_grace_until: Instant,
     /// Throttle for (re)attaching a missing source.
     last_attach_attempt: Instant,
     /// Heartbeat counters: make a stalled loop (no damage, wedged grab,
@@ -407,8 +420,21 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
                 }
             }
 
+            // First-session hole: a graphics-capable client opens its EGFX
+            // channel a few hundred milliseconds into the session, and the
+            // process-global GfxSession still holds NO handle until then (on
+            // every later session the previous handle is already present).
+            // Emitting legacy bitmap updates into that window mixes update
+            // streams while mstsc negotiates the graphics pipeline — it stops
+            // composing (black screen) although every EGFX frame decodes
+            // fine. Hold everything for a short grace; if no channel ever
+            // opens, the client genuinely cannot do EGFX and legacy starts.
+            let legacy_allowed = self.session.handle().is_none()
+                && Instant::now() >= self.legacy_grace_until;
+
             let Some(handle) = self.session.handle() else {
-                // No EGFX connection — legacy bitmap path.
+                // Grace passed and still no graphics channel: legacy path.
+                debug_assert!(legacy_allowed);
                 if let Some(update) = grab.legacy_display_update() {
                     return Ok(Some(update));
                 }
@@ -436,9 +462,12 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
                     return Ok(Some(update));
                 }
                 continue;
-            } else if let Some(update) = grab.legacy_display_update() {
-                return Ok(Some(update));
             } else {
+                // The graphics channel exists but caps have not landed yet:
+                // this client IS graphics-capable, so never send legacy
+                // bitmap updates — hold until negotiation completes (the
+                // same stream-mixing hazard as above, in the first session's
+                // pre-ready window).
                 if let Some(update) = self.pending_cursor.take() {
                     return Ok(Some(update));
                 }
