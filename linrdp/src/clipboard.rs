@@ -476,6 +476,15 @@ pub(crate) struct X11CliprdrBackend {
 
     /// In-flight Windows → Linux file download, if any.
     download: Option<Download>,
+
+    /// Image format-list announcements arriving before this instant are the
+    /// client re-advertising its EXISTING clipboard right at session start —
+    /// fetching them eagerly transfers multi-megabyte screenshots through
+    /// the young session's control channel exactly while the client is
+    /// trying to finish connecting, which mstsc manifests as a black screen.
+    /// Hold those fetches a few seconds; the data syncs once the session is
+    /// up (a genuine new copy mid-session is fetched immediately).
+    hold_image_fetch_until: Option<std::time::Instant>,
 }
 
 impl X11CliprdrBackend {
@@ -492,6 +501,7 @@ impl X11CliprdrBackend {
             files_advertised: Arc::new(Mutex::new(false)),
             echo_guard: Arc::new(Mutex::new(None)),
             download: None,
+            hold_image_fetch_until: None,
         }
     }
 
@@ -603,6 +613,7 @@ impl CliprdrBackend for X11CliprdrBackend {
     fn on_ready(&mut self) {
         tracing::info!("clipboard: channel ready (X11 ↔ RDP sync: text + files + images)");
         self.clean_stale_paste_dirs();
+        self.hold_image_fetch_until = Some(std::time::Instant::now() + Duration::from_secs(4));
 
         // Poll the X11 clipboard for local copies (Linux → Windows). A poller
         // is used instead of X11 selection events because arboard owns no
@@ -777,6 +788,31 @@ impl CliprdrBackend for X11CliprdrBackend {
             return;
         }
 
+        // Eager fetch unless the session just came up: a startup format list
+        // re-announces whatever (possibly huge) image already sits in the
+        // client clipboard, and hauling it mid-connect is the black-screen
+        // trigger — defer to when the session has settled.
+        let eager_fetch = !matches!(self.hold_image_fetch_until, Some(until) if std::time::Instant::now() < until);
+        let initiate_image_fetch = |backend: &Self, kind: IncomingKind, format: ClipboardFormatId| {
+            if eager_fetch {
+                backend.send_msg(ClipboardMessage::SendInitiatePaste(format));
+                return;
+            }
+            tracing::info!("clipboard: deferring image fetch until the session settles");
+            let proxy = Arc::clone(&backend.proxy);
+            std::thread::Builder::new()
+                .name("linrdp-cliprdr-defer".into())
+                .spawn(move || {
+                    std::thread::sleep(Duration::from_secs(4));
+                    let guard = proxy.lock().expect("poisoned");
+                    if let Some(proxy) = guard.as_ref() {
+                        proxy.send_clipboard_message(ClipboardMessage::SendInitiatePaste(format));
+                    }
+                    let _ = kind; // bookkeeping already recorded by the caller
+                })
+                .ok();
+        };
+
         let png = named("PNG");
         let dib = [CF_DIB, CF_DIBV5].into_iter().find(|id| formats.iter().any(|f| f.id == *id));
         match (png, dib) {
@@ -788,7 +824,7 @@ impl CliprdrBackend for X11CliprdrBackend {
                 });
                 self.incoming = Some(IncomingKind::Png);
                 self.incoming_gen = self.copy_generation;
-                self.send_msg(ClipboardMessage::SendInitiatePaste(png.id));
+                initiate_image_fetch(self, IncomingKind::Png, png.id);
             }
             (None, Some(dib)) => {
                 tracing::info!(format = ?dib, "clipboard: client copied image (DIB) — fetching");
@@ -798,7 +834,7 @@ impl CliprdrBackend for X11CliprdrBackend {
                 });
                 self.incoming = Some(IncomingKind::Dib);
                 self.incoming_gen = self.copy_generation;
-                self.send_msg(ClipboardMessage::SendInitiatePaste(dib));
+                initiate_image_fetch(self, IncomingKind::Dib, dib);
             }
             (None, None) => {
                 self.incoming = None;
