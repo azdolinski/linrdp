@@ -138,6 +138,9 @@ async fn main() -> anyhow::Result<()> {
     // negotiated pointerCacheSize for the cursor-shape LRU.
     let autodetect_rtt = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
     let autodetect_baseline = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
+    // Measured goodput (kbit/s) from the client's Bandwidth Measure Results —
+    // drives the adaptive H.264 bitrate in the EGFX display loop.
+    let autodetect_bw = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
     let pointer_cache = Arc::new(std::sync::atomic::AtomicU16::new(0));
 
     // Capture/input backends. X11 is the default; `--wayland` (cargo
@@ -206,6 +209,7 @@ async fn main() -> anyhow::Result<()> {
             Arc::clone(&display_suppressed),
             Arc::clone(&autodetect_rtt),
             Arc::clone(&autodetect_baseline),
+            Arc::clone(&autodetect_bw),
             Arc::clone(&pointer_cache),
         ))
         .with_gfx_factory(Some(Box::new(gfx::LinrdpGfxFactory::new(Arc::clone(
@@ -228,6 +232,7 @@ async fn main() -> anyhow::Result<()> {
         .with_credential_resolver(sam_resolver)
         .with_autodetect_rtt_handle(autodetect_rtt)
         .with_autodetect_baseline_rtt_handle(autodetect_baseline)
+        .with_autodetect_bandwidth_handle(autodetect_bw)
         .with_pointer_cache_handle(pointer_cache)
         .with_dynamic_channel_attacher(|dvc| {
             // Write client mic audio into the PulseAudio pipe-source FIFO so

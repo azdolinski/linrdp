@@ -77,9 +77,45 @@ const CAPS_SETTLE: Duration = Duration::from_millis(250);
 /// lifetime its composition (the "first connection is black" bug).
 const LEGACY_GRACE: Duration = Duration::from_millis(1500);
 
-/// H.264 target bitrate. Rate control runs in quality mode, so this is a
-/// ceiling that keeps pathological frames (noise, fast scroll) bounded.
-const H264_BITRATE_BPS: u32 = 12_000_000;
+/// H.264 encoder ceiling. The adaptive target below stays at or under the
+/// resolution anchor (7.5 Mbit/s at 4K); this only bounds pathological frames.
+/// (Kept as an absolute last-resort clamp for the rate controller.)
+const H264_BITRATE_CEILING_BPS: u32 = 12_000_000;
+
+/// Re-evaluate the adaptive encoder quality at most this often (KRdp:
+/// `QualityUpdateInterval`). Each evaluation loads two atomics and at most
+/// rebuilds the encoder, so the throttle also bounds encoder churn.
+const QUALITY_UPDATE_INTERVAL: Duration = Duration::from_millis(1500);
+
+/// Adaptive-quality bounds and step sizes (KRdp: MinAdaptiveQuality,
+/// QualityStepUp, QualityStepDown). Quality moves down faster than up, so a
+/// degrading link sheds bitrate quickly and re-gains it cautiously.
+const MIN_ADAPTIVE_QUALITY: i32 = 10;
+const QUALITY_STEP_UP: i32 = 5;
+const QUALITY_STEP_DOWN: i32 = 10;
+
+/// "Quality 100" H.264 bitrate targets by resolution — KRdp's
+/// `FullQualityBitrateAnchors` (RustDesk's `base_bitrate`): kilobits per
+/// second for a given pixel count, linearly scaled between the nearest
+/// anchors. The adaptive encoder target is this anchor scaled by the
+/// measured-goodput quality ratio, so a fast LAN converges to the anchor and
+/// a slow link steps down instead of filling client queues.
+const BITRATE_ANCHORS: [(f64, f64); 4] = [
+    (921_600.0, 1_500.0),   // 1280x720
+    (2_073_600.0, 3_110.0), // 1920x1080
+    (3_686_400.0, 4_500.0), // 2560x1440
+    (8_294_400.0, 7_500.0), // 3840x2160
+];
+
+/// Full-quality bitrate anchor (kbit/s) for a screen of `pixels` pixels.
+fn full_quality_kbit(pixels: f64) -> f64 {
+    let (anchor_px, anchor_kbit) = BITRATE_ANCHORS
+        .iter()
+        .copied()
+        .min_by(|a, b| (a.0 - pixels).abs().total_cmp(&(b.0 - pixels).abs()))
+        .expect("anchor table is non-empty");
+    anchor_kbit * (pixels / anchor_px)
+}
 
 /// ClearCodec rectangles above this pixel count go through H.264 instead —
 /// encoding a huge lossless rect costs more than it is worth.
@@ -191,6 +227,10 @@ pub(crate) struct EgfxDisplay {
     /// the server's probe loop — feeds the in-flight window sizing.
     rtt: Arc<AtomicU32>,
     rtt_baseline: Arc<AtomicU32>,
+    /// Latest auto-detect bandwidth (kbit/s; `u32::MAX` = not yet measured),
+    /// shared with the server's Bandwidth Measure loop — feeds the adaptive
+    /// encoder quality.
+    bw_kbps: Arc<AtomicU32>,
     /// Client's negotiated `pointerCacheSize` — bounds the cursor LRU.
     pointer_cache: Arc<AtomicU16>,
 }
@@ -202,6 +242,7 @@ impl EgfxDisplay {
         suppressed: Arc<AtomicBool>,
         rtt: Arc<AtomicU32>,
         rtt_baseline: Arc<AtomicU32>,
+        bw_kbps: Arc<AtomicU32>,
         pointer_cache: Arc<AtomicU16>,
     ) -> Self {
         Self {
@@ -210,6 +251,7 @@ impl EgfxDisplay {
             suppressed,
             rtt,
             rtt_baseline,
+            bw_kbps,
             pointer_cache,
         }
     }
@@ -261,6 +303,7 @@ impl RdpServerDisplay for EgfxDisplay {
             stat_last: Instant::now(),
             rtt: Arc::clone(&self.rtt),
             rtt_baseline: Arc::clone(&self.rtt_baseline),
+            bw_kbps: Arc::clone(&self.bw_kbps),
             pointer_cache: Arc::clone(&self.pointer_cache),
             cursor_cache: HashMap::new(),
             cursor_next_index: 0,
@@ -273,6 +316,10 @@ impl RdpServerDisplay for EgfxDisplay {
             rtt_ewma: None,
             window_applied: None,
             window_last_check: Instant::now(),
+            quality: 100,
+            // First evaluation can run as soon as the first measurement lands.
+            last_quality_update: Instant::now() - QUALITY_UPDATE_INTERVAL,
+            enc_bitrate_bps: None,
         }))
     }
 }
@@ -337,9 +384,20 @@ struct EgfxUpdates {
     /// and the session-minimum RTT, shared with the server's probe loop.
     rtt: Arc<AtomicU32>,
     rtt_baseline: Arc<AtomicU32>,
+    /// Latest auto-detect bandwidth in kbit/s (`u32::MAX` = not yet measured),
+    /// shared with the server's Bandwidth Measure loop.
+    bw_kbps: Arc<AtomicU32>,
     /// Client's negotiated `pointerCacheSize` — bounds the cursor LRU. Zero
     /// means the client cannot receive New Pointer updates at all.
     pointer_cache: Arc<AtomicU16>,
+    /// Adaptive encoder quality, 10..=100 (KRdp semantics): the H.264 target
+    /// bitrate is the resolution anchor scaled by this. Starts at 100 so the
+    /// first frames go out at full anchor bitrate before any measurement.
+    quality: u8,
+    last_quality_update: Instant,
+    /// Bitrate the running H.264 encoder was built with; `None` until the
+    /// first motion frame creates one. Drives rebuild-on-change hysteresis.
+    enc_bitrate_bps: Option<u32>,
     /// Cursor shape cache: shape hash → cache slot. Bounded by the client's
     /// negotiated pointer cache size; LRU eviction frees a slot on overflow.
     cursor_cache: HashMap<u64, CursorCacheEntry>,
@@ -497,6 +555,10 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
             // enough produced frames to fill one round trip, so high-RTT
             // links keep flowing instead of collapsing to stop-and-wait.
             self.update_in_flight_window(&handle);
+
+            // Steer the H.264 encoder from the measured goodput (KRdp's
+            // updateAdaptiveQuality): internally throttled to its own interval.
+            self.update_adaptive_quality();
 
             // A processed tick that did not produce a returnable display
             // update is the natural moment to hand a stashed cursor update
@@ -920,6 +982,82 @@ impl EgfxUpdates {
         self.session.drain_and_send(handle);
     }
 
+    /// Adaptive encoder quality (KRdp's `updateAdaptiveQuality`): map the
+    /// measured goodput — the client's Bandwidth Measure Results, refreshed
+    /// every ~2 s — onto a target quality 10..=100 relative to a full-quality
+    /// bitrate anchor for the current resolution, then step toward it. A fast
+    /// link converges to the anchor; a slow link sheds bitrate instead of
+    /// filling client queues. Queueing congestion (latest RTT well above the
+    /// session minimum) forces quality down and blocks step-ups.
+    fn update_adaptive_quality(&mut self) {
+        if self.last_quality_update.elapsed() < QUALITY_UPDATE_INTERVAL {
+            return;
+        }
+        let goodput_kbit = self.bw_kbps.load(Ordering::Relaxed);
+        if goodput_kbit == 0 || goodput_kbit == u32::MAX {
+            return; // no measurement yet — keep the bootstrap full-quality target
+        }
+        self.last_quality_update = Instant::now();
+
+        let Some(surface) = self.surface else { return };
+        let pixels = f64::from(surface.width) * f64::from(surface.height);
+        if pixels <= 0.0 {
+            return;
+        }
+        let full_kbit = full_quality_kbit(pixels);
+
+        let mut target = ((f64::from(goodput_kbit) / full_kbit) * 100.0)
+            .round()
+            .clamp(f64::from(MIN_ADAPTIVE_QUALITY), 100.0) as i32;
+
+        let avg_rtt = self.rtt.load(Ordering::Relaxed);
+        let min_rtt = self.rtt_baseline.load(Ordering::Relaxed);
+        let congested = min_rtt != u32::MAX
+            && avg_rtt != u32::MAX
+            && f64::from(avg_rtt) > f64::from(min_rtt) * 1.5;
+        if congested {
+            // Congested: cap the target below the current quality so the next
+            // step is guaranteed to shed load (KRdp clamps the same way).
+            target = target
+                .min(i32::from(self.quality) - QUALITY_STEP_DOWN)
+                .max(MIN_ADAPTIVE_QUALITY);
+        }
+
+        let mut next = i32::from(self.quality);
+        if target < next {
+            next = target.max(next - QUALITY_STEP_DOWN);
+        } else if target > next && !congested {
+            next = target.min(next + QUALITY_STEP_UP);
+        }
+
+        let Ok(next) = u8::try_from(next) else { return };
+        if next == self.quality {
+            return;
+        }
+        tracing::info!(
+            quality = next,
+            target,
+            goodput_kbit,
+            congested,
+            "adaptive H.264 quality"
+        );
+        self.quality = next;
+    }
+
+    /// Current adaptive H.264 target bitrate: the full-quality anchor for the
+    /// surface size scaled by the adaptive quality. Falls back to the 1080p
+    /// anchor before the first surface exists (the caller returns early then).
+    fn h264_bitrate_bps(&self) -> u32 {
+        let pixels = self
+            .surface
+            .map(|s| f64::from(s.width) * f64::from(s.height))
+            .unwrap_or(f64::from(1920) * f64::from(1080));
+        let kbit = full_quality_kbit(pixels) * f64::from(self.quality) / 100.0;
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "bitrate clamped below")]
+        let bps = (kbit * 1000.0).clamp(250_000.0, f64::from(H264_BITRATE_CEILING_BPS)) as u32;
+        bps
+    }
+
     /// Lossless ClearCodec rectangle for small damage (or the full surface,
     /// used for first paint / recovery).
     async fn send_clear(
@@ -997,13 +1135,34 @@ impl EgfxUpdates {
             return;
         }
 
-        // Lazy encoder creation (only once motion is actually needed).
-        if self.encoders.as_ref().is_some_and(|e| e.h264.is_none()) {
-            match make_h264_encoder() {
+        // Adaptive bitrate: (re)build the encoder whenever the target moved by
+        // more than 10% from what the running one was built with. Quality
+        // steps are throttled to QUALITY_UPDATE_INTERVAL, so this settles
+        // quickly; the openh264 wrapper has no runtime bitrate option, and a
+        // fresh encoder conveniently opens with an IDR, re-syncing the client
+        // after the rate change.
+        let want_bps = self.h264_bitrate_bps();
+        let bitrate_stale = match self.enc_bitrate_bps {
+            None => true,
+            Some(built) => {
+                let lo = built.min(want_bps);
+                let hi = built.max(want_bps);
+                hi - lo > built / 10
+            }
+        };
+        if bitrate_stale {
+            match make_h264_encoder(want_bps) {
                 Ok(h264) => {
-                    if let Some(enc) = self.encoders.as_mut() {
-                        enc.h264 = Some(h264);
+                    match self.encoders.as_mut() {
+                        Some(encoders) => encoders.h264 = Some(h264),
+                        None => {
+                            self.encoders = Some(Encoders {
+                                h264: Some(h264),
+                                clear: ClearCodecEncoder::new(),
+                            });
+                        }
                     }
+                    self.enc_bitrate_bps = Some(want_bps);
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "EGFX: OpenH264 init failed — ClearCodec only");
@@ -1131,13 +1290,16 @@ impl EgfxUpdates {
     }
 }
 
-fn make_h264_encoder() -> anyhow::Result<OpenH264> {
+fn make_h264_encoder(bitrate_bps: u32) -> anyhow::Result<OpenH264> {
     let api = openh264::OpenH264API::from_source();
     let config = EncoderConfig::new()
-        .bitrate(BitRate::from_bps(H264_BITRATE_BPS))
+        .bitrate(BitRate::from_bps(bitrate_bps))
         .max_frame_rate(FrameRate::from_hz(30.0))
         .usage_type(UsageType::ScreenContentRealTime)
-        .rate_control_mode(RateControlMode::Quality)
+        // KRdp/RustDesk drive the encoder by target bitrate (the resolution
+        // anchor scaled by measured goodput — see `update_adaptive_quality`);
+        // quality mode has no dial the adaptation could turn.
+        .rate_control_mode(RateControlMode::Bitrate)
         .skip_frames(false)
         // Signal the colorspace in the SPS VUI: the planes are full-range
         // BT.709 (MS-RDPEGFX §3.3.8.3.1), and without this flag a
