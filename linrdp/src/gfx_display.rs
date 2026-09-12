@@ -38,9 +38,10 @@ use crate::gfx::GfxSession;
 
 type GfxHandle = Arc<Mutex<GraphicsPipelineServer>>;
 
-/// Damage covering more than this fraction of the screen counts as motion
-/// and goes through H.264 instead of lossless ClearCodec.
-const MOTION_DENOM: usize = 4;
+/// Damage covering at least this fraction of the screen counts as motion and
+/// goes through H.264 instead of lossless ClearCodec.
+const MOTION_NUM: u64 = 1;
+const MOTION_DEN: u64 = 8;
 
 /// Minimum spacing between H.264 encodes (~30 fps); the encoder is by far
 /// the most expensive step, and more than 30 fps of 4:2:0 video is wasted on
@@ -116,10 +117,6 @@ fn full_quality_kbit(pixels: f64) -> f64 {
         .expect("anchor table is non-empty");
     anchor_kbit * (pixels / anchor_px)
 }
-
-/// ClearCodec rectangles above this pixel count go through H.264 instead —
-/// encoding a huge lossless rect costs more than it is worth.
-const CLEAR_MAX_PIXELS: usize = 2_500_000;
 
 /// After the last motion frame, keep the display in "motion mode" this
 /// long: while active, small lossless ClearCodec updates are suppressed so
@@ -958,13 +955,17 @@ impl EgfxUpdates {
         }
 
         let (dx, dy, dw, dh) = damage;
-        // Motion signal = fraction of tiles that actually changed, NOT the
-        // bounding box: a blinking cursor in one corner and a clock in the
-        // other span the whole screen as a bbox but are ~0.1% of the tiles —
-        // bbox-based detection kept such screens in soft H.264 mode forever.
+        // Motion signal = fraction of the screen that actually changed, NOT
+        // the bounding box and NOT an absolute pixel count: a blinking cursor
+        // in one corner and a clock in the other span the whole screen as a
+        // bbox but are ~0.1% of the tiles (bbox-based detection kept such
+        // screens in soft H.264 mode forever), and a fixed pixel cutoff made
+        // the threshold resolution-dependent — a mid-size video window on a
+        // 4K desktop stayed on the lossless ClearCodec path (slow to encode,
+        // huge on the wire for video noise) while the same window on 1080p
+        // correctly used H.264.
         let motion = !settling
-            && (u64::from(changed_tiles) * MOTION_DENOM as u64 > u64::from(total_tiles)
-                || u64::from(changed_tiles) * (64 * 64) > CLEAR_MAX_PIXELS as u64);
+            && u64::from(changed_tiles) * MOTION_DEN > u64::from(total_tiles) * MOTION_NUM;
 
         if motion && !self.avc_disabled {
             if self.last_h264.elapsed() < H264_MIN_INTERVAL {
