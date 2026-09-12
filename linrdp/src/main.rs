@@ -297,13 +297,19 @@ async fn main() -> anyhow::Result<()> {
     server.enable_autodetect();
     server.enable_heartbeat(ironrdp_server::heartbeat::HeartbeatConfig::default());
 
-    // Continuous auto-detect (1.3.9): periodic RTT probes keep the bandwidth
-    // estimate fresh. The library emits probes on demand — drive it with a
-    // timer.
+    // Continuous auto-detect (1.3.9): periodic RTT probes keep the RTT and
+    // bandwidth estimates fresh, and the bandwidth window they pace doubles as
+    // the goodput signal the adaptive H.264 encoder consumes. KRdp probes at
+    // this same 70 ms cadence; the bandwidth Start/Stop state machine ticks
+    // here too (one Start roughly every 2 s, window open ~500 ms), so a slow
+    // event loop just widens the spacing instead of flooding the client.
     {
         let events = server.event_sender().clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(70));
+            // A stalled loop must not burst-replay missed probes; the next one
+            // fires 70 ms after the wake-up instead.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             interval.tick().await; // first tick fires immediately; skip it
             loop {
                 interval.tick().await;

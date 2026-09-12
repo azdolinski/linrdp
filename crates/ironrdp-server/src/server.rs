@@ -4168,9 +4168,9 @@ impl RdpServer {
                             );
                         }
                         AutoDetectOutcome::Bandwidth(None) => {
-                            // The manager just cleared its own figure rather than keep
-                            // reporting a stale one (see `handle_response`'s doc comment);
-                            // mirror that here so the exposed handle does not disagree.
+                            // Unusable results keep the previous figure (see
+                            // `handle_response`), so `None` here means no usable
+                            // figure was ever measured; mirror that in the handle.
                             self.autodetect_bandwidth.store(u32::MAX, Ordering::Relaxed);
                             trace!(
                                 seq = pdu.response.sequence_number(),

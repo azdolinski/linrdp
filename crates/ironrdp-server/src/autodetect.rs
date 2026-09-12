@@ -21,8 +21,9 @@ pub(crate) const RTT_PROBE_MAX_AGE_MS: u64 = 30_000;
 
 /// Run a bandwidth measurement once every this many RTT ticks. Bandwidth
 /// changes far more slowly than RTT, so it is sampled less often than the
-/// per-tick RTT probe.
-const BW_MEASURE_INTERVAL_TICKS: u32 = 8;
+/// per-tick RTT probe. At the KRdp-style 70 ms RTT cadence this fires about
+/// every 2 s (KRdp: `bandwidthMeasureInterval`).
+const BW_MEASURE_INTERVAL_TICKS: u32 = 28;
 
 /// Number of RTT ticks a bandwidth window stays open between Start and Stop.
 ///
@@ -31,8 +32,11 @@ const BW_MEASURE_INTERVAL_TICKS: u32 = 8;
 /// Sequence, "the PDUs sent from server to client (between start and stop
 /// messages) replace the payload messages". So the window has to stay open
 /// long enough for ordinary traffic to fill it, rather than closing
-/// immediately the way a synthetic payload would allow.
-const BW_WINDOW_TICKS: u32 = 4;
+/// immediately the way a synthetic payload would allow. At the 70 ms RTT
+/// cadence this keeps the window open about 500 ms (KRdp:
+/// `bandwidthMeasureDuration`) — short enough that the figure reflects what
+/// the server is sending *now*, which is what an adaptive encoder needs.
+const BW_WINDOW_TICKS: u32 = 7;
 
 /// Minimum spacing between Network Characteristics Result PDUs.
 ///
@@ -101,9 +105,9 @@ pub enum AutoDetectOutcome {
     /// An RTT Measure Response matched a pending probe; carries the measured RTT
     /// in milliseconds.
     Rtt(u32),
-    /// A Bandwidth Measure Results matched the pending transaction. `None` means
-    /// the measurement completed without a usable figure, and any previously
-    /// stored bandwidth was cleared rather than left in place.
+    /// A Bandwidth Measure Results matched the pending transaction. Carries the
+    /// stored bandwidth after the result: `None` only when no usable figure has
+    /// ever been measured (an unusable result keeps the previous one).
     Bandwidth(Option<u32>),
     /// The response did not match any pending probe or transaction.
     Unmatched,
@@ -208,15 +212,11 @@ impl AutoDetectManager {
     ///
     /// Finally, returns `None` unless a client response has updated either
     /// figure since the last result. RTT samples do not age out of the
-    /// window, and a completed bandwidth measurement is never invalidated by
-    /// a later failed one on its own, so a client that stops answering would
-    /// otherwise leave the last values being advertised forever. `snapshot()`
+    /// window, and an unusable bandwidth measurement keeps the previous
+    /// figure, so a client that stops answering would otherwise leave the
+    /// last values being advertised forever. `snapshot()`
     /// still reports them, where staleness is the embedder's to judge, but
-    /// they are not put on the wire as a current claim; a bandwidth
-    /// measurement that completes without a usable figure clears
-    /// `bandwidth_kbps` rather than leaving the previous one in place, so a
-    /// run of failures withholds the result entirely instead of reporting an
-    /// increasingly stale number.
+    /// they are not put on the wire as a current claim.
     ///
     /// `baseRTT` is the lowest RTT seen over the whole session, not the lowest in
     /// the current window, so it never rises. `averageRTT` is the window average
@@ -257,10 +257,10 @@ impl AutoDetectManager {
     /// For an RTT Measure Response, records the sample and returns
     /// [`AutoDetectOutcome::Rtt`] with the measured RTT in milliseconds. For a
     /// Bandwidth Measure Results, records the computed bandwidth internally and
-    /// returns [`AutoDetectOutcome::Bandwidth`]; its payload is `None` when the
-    /// measurement completed without a usable figure, in which case any
-    /// previously stored bandwidth was just cleared (see the note on
-    /// [`build_netchar_result()`](Self::build_netchar_result)). Returns
+    /// returns [`AutoDetectOutcome::Bandwidth`] carrying the stored figure; its
+    /// payload is `None` only when no usable figure has ever been measured —
+    /// a result without a usable figure keeps the previous one (see the note in
+    /// the implementation). Returns
     /// [`AutoDetectOutcome::Unmatched`] for an unexpected or unmatched response.
     ///
     /// `now_ms` is the receipt time on the same clock passed to
@@ -295,12 +295,16 @@ impl AutoDetectManager {
                     return AutoDetectOutcome::Unmatched;
                 }
                 self.pending_bw = None;
-                // A transaction that completes without a usable figure clears the
-                // previous one rather than leaving it in place, so a run of failures
-                // withholds the result (see `build_netchar_result`) instead of
-                // reporting an increasingly stale bandwidth.
-                self.bandwidth_kbps = response.computed_bandwidth_kbps();
-                if self.bandwidth_kbps.is_some() {
+                // A measurement that completes without a usable figure (an idle
+                // screen means the client counted no bytes in the window) keeps
+                // the previous figure rather than clearing it, exactly like
+                // KRdp's `onBandwidthMeasureResults`: at a ~2 s cadence an
+                // unusable result is routine, not a failure signal, and wiping
+                // the estimate would starve the adaptive encoder between
+                // active windows. Only a genuinely fresh figure re-arms
+                // reporting (see `build_netchar_result`).
+                if let Some(bandwidth) = response.computed_bandwidth_kbps() {
+                    self.bandwidth_kbps = Some(bandwidth);
                     self.bandwidth_is_fresh = true;
                 }
                 AutoDetectOutcome::Bandwidth(self.bandwidth_kbps)
