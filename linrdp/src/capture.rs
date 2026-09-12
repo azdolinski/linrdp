@@ -124,7 +124,13 @@ impl X11Display {
 
     /// A fresh damage-tracking poller over this display's root window.
     pub(crate) fn grabber(&self) -> ScreenGrabber {
-        ScreenGrabber::new(Arc::clone(&self.conn), self.root, self.width, self.height)
+        ScreenGrabber::new(
+            Arc::clone(&self.conn),
+            self.root,
+            self.width,
+            self.height,
+            self.display_name.clone(),
+        )
     }
 }
 
@@ -238,6 +244,16 @@ impl Grab {
     }
 }
 
+/// Consecutive failed grabs after which the X server connection is presumed
+/// dead and a reconnect is attempted (~0.5 s at the 17 ms poll interval).
+/// The X server (Xvfb) is a separate systemd unit that can crash and be
+/// restarted at any moment; without a reconnect every later session would
+/// grab from the stale connection forever and paint nothing but black.
+const GRAB_FAILURES_BEFORE_RECONNECT: u32 = 30;
+
+/// While the X server stays unreachable, retry the reconnect this often.
+const GRAB_RECONNECT_RETRY_EVERY: u32 = 60;
+
 /// Reusable screen poller: grabs the X11 root and computes tile-level damage
 /// against the previous grab. Shared by the legacy bitmap path (`Updates`)
 /// and the EGFX display backend.
@@ -247,16 +263,48 @@ pub(crate) struct ScreenGrabber {
     width: u16,
     height: u16,
     prev_frame: Option<Vec<u8>>,
+    display_name: String,
+    consecutive_failures: u32,
 }
 
 impl ScreenGrabber {
-    pub(crate) fn new(conn: Arc<x11rb::rust_connection::RustConnection>, root: u32, width: u16, height: u16) -> Self {
+    pub(crate) fn new(
+        conn: Arc<x11rb::rust_connection::RustConnection>,
+        root: u32,
+        width: u16,
+        height: u16,
+        display_name: String,
+    ) -> Self {
         Self {
             conn,
             root,
             width,
             height,
             prev_frame: None,
+            display_name,
+            consecutive_failures: 0,
+        }
+    }
+
+    /// Establish a fresh connection to the X display, adopting the new root
+    /// window and geometry. Dropping `prev_frame` makes the next successful
+    /// grab report full-screen damage, which unconditionally repaints every
+    /// connected client.
+    fn reconnect(&mut self) -> bool {
+        let connected = x11rb::rust_connection::RustConnection::connect(Some(self.display_name.as_str()));
+        match connected {
+            Ok((conn, screen_num)) => {
+                let Some(screen) = conn.setup().roots.get(screen_num) else {
+                    return false;
+                };
+                self.root = screen.root;
+                self.width = screen.width_in_pixels;
+                self.height = screen.height_in_pixels;
+                self.conn = Arc::new(conn);
+                self.prev_frame = None;
+                true
+            }
+            Err(_) => false,
         }
     }
 
@@ -290,6 +338,35 @@ impl ScreenGrabber {
     /// Grab the current screen contents and diff them against the previous
     /// grab. Returns `None` on a transient X11 failure (retry next tick).
     pub(crate) fn poll(&mut self) -> Option<Grab> {
+        let grab = self.poll_inner();
+        if grab.is_some() {
+            self.consecutive_failures = 0;
+            return grab;
+        }
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let failures = self.consecutive_failures;
+        let due = failures == GRAB_FAILURES_BEFORE_RECONNECT
+            || (failures > GRAB_FAILURES_BEFORE_RECONNECT
+                && (failures - GRAB_FAILURES_BEFORE_RECONNECT) % GRAB_RECONNECT_RETRY_EVERY == 0);
+        if due {
+            if self.reconnect() {
+                tracing::warn!(
+                    display = %self.display_name,
+                    failures,
+                    "X server connection was dead — reconnected (next grab repaints in full)"
+                );
+            } else {
+                tracing::warn!(
+                    display = %self.display_name,
+                    failures,
+                    "X server unreachable — screen cannot be captured; retrying"
+                );
+            }
+        }
+        grab
+    }
+
+    fn poll_inner(&mut self) -> Option<Grab> {
         let (data, width, height) = tokio::task::block_in_place(|| self.grab())?;
         let stride = usize::from(width) * 4;
         if data.len() != stride * usize::from(height) {

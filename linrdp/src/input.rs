@@ -40,6 +40,9 @@ pub(crate) struct X11InputHandler {
     /// TS_SYNC_FLAGS event (2.2.8.1.1.3.1.1.5) can toggle the locks toward
     /// the requested state. Starts all-off, matching a fresh Xvfb.
     locks: SynchronizeFlags,
+    /// Rate limit for reconnect attempts while the X server is down, so a
+    /// client streaming mouse moves cannot turn into a log/reconnect storm.
+    last_reconnect_attempt: Option<std::time::Instant>,
 }
 
 impl X11InputHandler {
@@ -53,7 +56,39 @@ impl X11InputHandler {
             root,
             unicode_keycode: None,
             locks: SynchronizeFlags::empty(),
+            last_reconnect_attempt: None,
         })
+    }
+
+    /// The desktop X server (Xvfb) is a separate systemd unit that can crash
+    /// and come back at any moment — requests against the stale socket all
+    /// fail, which the user experiences as a frozen picture that ignores
+    /// every click and keystroke. Re-establish the connection on demand; the
+    /// caller retries the event once when this succeeds. Rate-limited to one
+    /// attempt per second while the X server stays unreachable.
+    fn reconnect(&mut self) -> bool {
+        if let Some(last) = self.last_reconnect_attempt {
+            if last.elapsed() < std::time::Duration::from_secs(1) {
+                return false;
+            }
+        }
+        self.last_reconnect_attempt = Some(std::time::Instant::now());
+        let display_name = std::env::var("DISPLAY").unwrap_or_else(|_| ":99".to_owned());
+        match x11rb::rust_connection::RustConnection::connect(Some(display_name.as_str())) {
+            Ok((conn, screen_num)) => {
+                let Some(screen) = conn.setup().roots.get(screen_num) else {
+                    return false;
+                };
+                self.root = screen.root;
+                self.conn = Arc::new(conn);
+                // Fresh server = fresh keyboard mapping: the scratch keycode
+                // must be rediscovered before the next TS_UNICODE event.
+                self.unicode_keycode = None;
+                tracing::warn!("X server connection for input was dead — reconnected");
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// Find a keycode with no keysyms bound anywhere (NoSymbol in every
@@ -129,31 +164,45 @@ impl X11InputHandler {
         }
     }
 
-    fn fake_key(&self, keycode: u8, pressed: bool) {
+    fn fake_key(&mut self, keycode: u8, pressed: bool) {
         let ty = if pressed { FAKE_KEY_PRESS } else { FAKE_KEY_RELEASE };
-        if let Err(e) = self.conn.xtest_fake_input(ty, keycode, 0, self.root, 0, 0, XTEST_DEVICE_ID) {
+        let err = match self.conn.xtest_fake_input(ty, keycode, 0, self.root, 0, 0, XTEST_DEVICE_ID) {
+            Ok(_) => None,
+            Err(e) => Some(e),
+        };
+        if let Some(e) = err {
             tracing::warn!(error = %e, keycode, "XTEST key event failed");
+            if self.reconnect() {
+                let _ = self.conn.xtest_fake_input(ty, keycode, 0, self.root, 0, 0, XTEST_DEVICE_ID);
+            }
         }
     }
 
-    fn fake_button(&self, button: u8, pressed: bool) {
+    fn fake_button(&mut self, button: u8, pressed: bool) {
         let ty = if pressed { FAKE_BUTTON_PRESS } else { FAKE_BUTTON_RELEASE };
-        if let Err(e) = self.conn.xtest_fake_input(ty, button, 0, self.root, 0, 0, XTEST_DEVICE_ID) {
+        let err = match self.conn.xtest_fake_input(ty, button, 0, self.root, 0, 0, XTEST_DEVICE_ID) {
+            Ok(_) => None,
+            Err(e) => Some(e),
+        };
+        if let Some(e) = err {
             tracing::warn!(error = %e, button, "XTEST button event failed");
+            if self.reconnect() {
+                let _ = self.conn.xtest_fake_input(ty, button, 0, self.root, 0, 0, XTEST_DEVICE_ID);
+            }
         }
     }
 
-    fn fake_motion(&self, x: u16, y: u16) {
-        if let Err(e) = self.conn.xtest_fake_input(
-            FAKE_MOTION,
-            0,
-            0,
-            self.root,
-            i16::try_from(x).unwrap_or(i16::MAX),
-            i16::try_from(y).unwrap_or(i16::MAX),
-            XTEST_DEVICE_ID,
-        ) {
+    fn fake_motion(&mut self, x: u16, y: u16) {
+        let (mx, my) = (i16::try_from(x).unwrap_or(i16::MAX), i16::try_from(y).unwrap_or(i16::MAX));
+        let err = match self.conn.xtest_fake_input(FAKE_MOTION, 0, 0, self.root, mx, my, XTEST_DEVICE_ID) {
+            Ok(_) => None,
+            Err(e) => Some(e),
+        };
+        if let Some(e) = err {
             tracing::warn!(error = %e, "XTEST motion failed");
+            if self.reconnect() {
+                let _ = self.conn.xtest_fake_input(FAKE_MOTION, 0, 0, self.root, mx, my, XTEST_DEVICE_ID);
+            }
         }
     }
 }
