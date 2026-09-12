@@ -307,13 +307,9 @@ fn dib_to_bmp(dib: &[u8]) -> Option<Vec<u8>> {
     } else {
         0
     };
-    // BI_BITFIELDS with a 40-byte header carries its color masks after the
-    // header (3 DWORDs; 32-bpp images often carry a 4th alpha mask).
-    let masks = if compression == 3 && header_size == 40 {
-        if bpp == 32 { 16 } else { 12 }
-    } else {
-        0
-    };
+    // BI_BITFIELDS with a 40-byte header carries its 3 color-mask DWORDs
+    // after the header (MS-RDPECLIP / GDI convention).
+    let masks = if compression == 3 && header_size == 40 { 12 } else { 0 };
 
     let offset = 14usize
         .checked_add(header_size)?
@@ -333,8 +329,112 @@ fn dib_to_bmp(dib: &[u8]) -> Option<Vec<u8>> {
     Some(bmp)
 }
 
-/// Decode CF_UNICODETEXT payload with lone surrogates replaced instead of
-/// failing the whole paste.
+/// Decode a CF_DIB / CF_DIBV5 payload into 8-bit RGB pixels (row-major,
+/// top-down). Alpha is forced opaque: Windows clipboard bitmaps usually carry
+/// zeroed/undefined alpha, and honoring it would paste a transparent image.
+fn decode_dib(dib: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    const MAX_DIM: i32 = 16384;
+
+    if dib.len() < 40 {
+        return None;
+    }
+    let read_u32 = |offset: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(dib.get(offset..offset + 4)?.try_into().ok()?))
+    };
+    let read_u16 = |offset: usize| -> Option<u16> {
+        Some(u16::from_le_bytes(dib.get(offset..offset + 2)?.try_into().ok()?))
+    };
+
+    let header_size = read_u32(0)? as usize;
+    if !(40..=124).contains(&header_size) || dib.len() < header_size {
+        return None;
+    }
+    let width = read_u32(4)? as i32;
+    let height_raw = read_u32(8)? as i32;
+    let top_down = height_raw < 0;
+    let height = height_raw.unsigned_abs() as i32;
+    if !(1..=MAX_DIM).contains(&width) || !(1..=MAX_DIM).contains(&height) {
+        return None;
+    }
+    let bpp = u32::from(read_u16(14)?);
+    let compression = read_u32(16)?;
+    if !matches!((compression, bpp), (0, 24) | (0, 32) | (3, 32)) {
+        return None;
+    }
+
+    let clr_used = read_u32(32)? as usize;
+    let palette = if clr_used > 0 { clr_used } else if bpp <= 8 { 1usize << bpp } else { 0 };
+    let masks_len = if compression == 3 && header_size == 40 { 12 } else { 0 };
+    let pixels_off = header_size.checked_add(palette.checked_mul(4)?)?.checked_add(masks_len)?;
+
+    // Color masks: BI_RGB has the fixed BGRX layout; BI_BITFIELDS carries the
+    // masks either right after a 40-byte header or inside V4/V5 headers at
+    // offset 40 — the same offset in both cases.
+    let (r_mask, g_mask, b_mask) = if compression == 3 {
+        (read_u32(40)?, read_u32(44)?, read_u32(48)?)
+    } else {
+        (0x00FF_0000, 0x0000_FF00, 0x0000_00FF)
+    };
+    if r_mask == 0 || g_mask == 0 || b_mask == 0 {
+        return None;
+    }
+
+    let bytes_per_px = (bpp / 8) as usize;
+    let row_bytes = (bpp as usize * width as usize).div_ceil(32) * 4;
+    let needed = pixels_off.checked_add(row_bytes.checked_mul(height as usize)?)?;
+    if dib.len() < needed {
+        return None;
+    }
+
+    let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
+    for row in 0..height as usize {
+        let src_row = if top_down {
+            row
+        } else {
+            height as usize - 1 - row
+        };
+        let row_start = pixels_off + src_row * row_bytes;
+        for x in 0..width as usize {
+            let px = &dib[row_start + x * bytes_per_px..][..bytes_per_px];
+            let raw = match bpp {
+                24 => u32::from(px[0]) | u32::from(px[1]) << 8 | u32::from(px[2]) << 16,
+                _ => u32::from_le_bytes([px[0], px[1], px[2], px[3]]),
+            };
+            rgb.push(scale_channel(raw, r_mask));
+            rgb.push(scale_channel(raw, g_mask));
+            rgb.push(scale_channel(raw, b_mask));
+        }
+    }
+    Some((width as u32, height as u32, rgb))
+}
+
+/// Extract an 8-bit channel value from a pixel word through its mask.
+fn scale_channel(raw: u32, mask: u32) -> u8 {
+    let shift = mask.trailing_zeros();
+    let bits = mask.count_ones().min(32);
+    if bits == 0 {
+        return 0;
+    }
+    let value = (raw & mask) >> shift;
+    let max = (1u64 << bits) - 1;
+    if bits >= 8 {
+        u8::try_from((u64::from(value) * 255 / max).min(255)).unwrap_or(255)
+    } else {
+        u8::try_from((u64::from(value) * 255 + max / 2) / max).unwrap_or(255)
+    }
+}
+
+/// Encode RGB8 pixels as a PNG file.
+fn rgb_to_png(width: u32, height: u32, rgb: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, width, height);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().ok()?;
+    writer.write_image_data(rgb).ok()?;
+    writer.finish().ok()?;
+    Some(out)
+}
 fn decode_utf16_lossy(data: &[u8]) -> String {
     let units: Vec<u16> = data
         .chunks_exact(2)
@@ -450,11 +550,14 @@ impl X11CliprdrBackend {
         }
         let uris: Vec<String> = download.done.iter().map(|path| path_to_uri(path)).collect();
         let uri_list = uris.join("\r\n").into_bytes();
-        let gnome_copied = format!("copy\n{}", uris.join("\n")).into_bytes();
+        let gnome_copied = format!("copy\n{}", uris.join("\n"));
+        // Prime the echo guard with the exact payload we are about to serve,
+        // so the poller does not advertise the client's own files back to it.
+        *self.echo_guard.lock().expect("poisoned") = Some(gnome_copied.clone());
         x11_selection::take_ownership(
             self.display.clone(),
             vec![
-                ("x-special/gnome-copied-files".to_owned(), gnome_copied),
+                ("x-special/gnome-copied-files".to_owned(), gnome_copied.into_bytes()),
                 ("text/uri-list".to_owned(), uri_list),
             ],
         );
@@ -532,24 +635,46 @@ impl CliprdrBackend for X11CliprdrBackend {
                         tracing::debug!("clipboard: stale poller exiting");
                         break;
                     }
-                    let Ok(mut board) = arboard::Clipboard::new() else { continue };
-                    let Ok(text) = board.get_text() else { continue };
+
+                    // File managers put copied files under dedicated targets
+                    // that arboard's text API cannot see — query them first.
+                    let uri_text = x11_selection::read_selection_target(&display, "x-special/gnome-copied-files")
+                        .or_else(|| x11_selection::read_selection_target(&display, "text/uri-list"))
+                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+
+                    let board_text = arboard::Clipboard::new()
+                        .ok()
+                        .and_then(|mut board| board.get_text().ok())
+                        .filter(|text| !text.is_empty());
 
                     let guard = echo_guard.lock().expect("poisoned").take();
-                    if guard.as_deref() == Some(text.as_str()) {
-                        // Text we ourselves published from client data.
-                        last_text = Some(text);
-                        continue;
-                    }
-
-                    if text.contains("file://") {
-                        if last_files.as_deref() == Some(text.as_str()) {
+                    if let Some(text) = uri_text.as_ref() {
+                        if guard.as_deref() == Some(text.as_str()) {
+                            // File list we ourselves published from client data.
+                            last_files = Some(text.clone());
                             continue;
                         }
-                        last_files = Some(text.clone());
-                        last_text = Some(text.clone());
+                    }
+                    if let Some(text) = board_text.as_ref() {
+                        if guard.as_deref() == Some(text.as_str()) {
+                            // Text we ourselves published from client data.
+                            last_text = Some(text.clone());
+                            continue;
+                        }
+                    }
 
-                        let paths = parse_uri_list(&text);
+                    let file_source = uri_text
+                        .filter(|text| text.contains("file://"))
+                        .or_else(|| board_text.clone().filter(|text| text.contains("file://")));
+
+                    if let Some(files_text) = file_source {
+                        if last_files.as_deref() == Some(files_text.as_str()) {
+                            continue;
+                        }
+                        last_files = Some(files_text.clone());
+                        last_text = Some(files_text.clone());
+
+                        let paths = parse_uri_list(&files_text);
                         let mut descriptors = Vec::new();
                         let mut offered: HashMap<i32, OfferedFile> = HashMap::new();
                         for (i, path) in paths.iter().enumerate() {
@@ -583,7 +708,10 @@ impl CliprdrBackend for X11CliprdrBackend {
                         if let Some(p) = proxy.lock().expect("poisoned").as_ref() {
                             p.send_clipboard_message(ClipboardMessage::SendInitiateFileCopy(descriptors));
                         }
-                    } else if !text.is_empty() && last_text.as_deref() != Some(text.as_str()) {
+                    } else if let Some(text) = board_text {
+                        if last_text.as_deref() == Some(text.as_str()) {
+                            continue;
+                        }
                         last_text = Some(text.clone());
                         last_files = None;
                         *files_advertised.lock().expect("poisoned") = false;
@@ -743,13 +871,23 @@ impl CliprdrBackend for X11CliprdrBackend {
             }
             IncomingKind::Dib => {
                 if let Some(data) = data {
-                    match dib_to_bmp(data) {
-                        Some(bmp) => {
-                            if let Some(fetch) = self.image_fetch.as_mut() {
-                                fetch.targets.push(("image/bmp".to_owned(), bmp));
+                    if let Some(fetch) = self.image_fetch.as_mut() {
+                        // PNG is what most Linux apps request on paste; mstsc
+                        // often offers only CF_DIB (no "PNG" format), so
+                        // transcode the DIB ourselves.
+                        if let Some((width, height, rgb)) = decode_dib(data) {
+                            if let Some(png) = rgb_to_png(width, height, &rgb) {
+                                tracing::debug!(width, height, "clipboard: DIB transcoded to PNG");
+                                fetch.targets.push(("image/png".to_owned(), png));
                             }
                         }
-                        None => tracing::warn!("clipboard: client sent malformed CF_DIB data"),
+                        match dib_to_bmp(data) {
+                            Some(bmp) => {
+                                fetch.targets.push(("image/bmp".to_owned(), bmp.clone()));
+                                fetch.targets.push(("image/x-bmp".to_owned(), bmp));
+                            }
+                            None => tracing::warn!("clipboard: client sent malformed CF_DIB data"),
+                        }
                     }
                 }
                 self.finish_image_fetch();
@@ -1074,6 +1212,11 @@ mod tests {
 
         assert!(backend.image_fetch.is_none(), "image fetch must complete");
         assert_eq!(proxy.0.lock().expect("poisoned").len(), 2, "no further messages");
+
+        // The published selection owner runs on $DISPLAY in the background;
+        // let it take over before the lock releases and the next X11 test
+        // claims the same selection.
+        std::thread::sleep(Duration::from_millis(500));
     }
 
     #[test]
@@ -1107,6 +1250,9 @@ mod tests {
             Some("cześć"),
             "UTF-16LE must be decoded and the echo guard primed"
         );
+
+        // Same as above: the spawned owner must settle inside the lock.
+        std::thread::sleep(Duration::from_millis(500));
     }
 
     #[test]
@@ -1125,6 +1271,60 @@ mod tests {
             "response from an older copy generation must not be published"
         );
         assert_eq!(proxy.0.lock().expect("poisoned").len(), 2);
+    }
+
+    #[test]
+    fn file_download_streams_to_disk() {
+        let _guard = crate::x11_selection::X11_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut backend, proxy) = backend_with_proxy();
+
+        let files = vec![
+            FileDescriptor::new("small.bin").with_file_size(10),
+            FileDescriptor::new("sized-by-query.bin"),
+        ];
+        backend.on_remote_file_list(&files, None);
+
+        // 1st request: RANGE for the first file (size known from descriptor).
+        let first = *proxy.0.lock().expect("poisoned").first().expect("range request");
+        assert_eq!(first.0, "freq");
+        backend.on_file_contents_response(FileContentsResponse::new_data_response(first.1, vec![7u8; 10]));
+
+        // 2nd request: SIZE query for the second file.
+        let second = *proxy.0.lock().expect("poisoned").get(1).expect("size query");
+        assert_eq!(second.0, "freq");
+        backend.on_file_contents_response(FileContentsResponse::new_data_response(
+            second.1,
+            1234u64.to_le_bytes().to_vec(),
+        ));
+
+        // 3rd request: RANGE for the now-sized second file.
+        let third = *proxy.0.lock().expect("poisoned").get(2).expect("range request");
+        assert_eq!(third.0, "freq");
+        backend.on_file_contents_response(FileContentsResponse::new_data_response(third.1, vec![9u8; 1234]));
+
+        assert!(backend.download.is_none(), "download must finish");
+        assert!(
+            backend.echo_guard.lock().expect("poisoned").is_some(),
+            "uri-list must be published (echo guard primed)"
+        );
+
+        // Both files must exist with the served contents; clean up after.
+        let mut found = 0;
+        let entries = std::fs::read_dir(std::env::temp_dir()).expect("temp dir");
+        for entry in entries.flatten() {
+            if !entry.file_name().to_string_lossy().starts_with("linrdp-paste-") {
+                continue;
+            }
+            let small = entry.path().join("small.bin");
+            let sized = entry.path().join("sized-by-query.bin");
+            if small.exists() && sized.exists() {
+                assert_eq!(std::fs::read(&small).unwrap(), vec![7u8; 10]);
+                assert_eq!(std::fs::read(&sized).unwrap().len(), 1234);
+                let _ = std::fs::remove_dir_all(entry.path());
+                found += 1;
+            }
+        }
+        assert_eq!(found, 1, "exactly one paste dir with both files");
     }
 
     #[test]
@@ -1165,16 +1365,16 @@ mod tests {
 
     #[test]
     fn dib_to_bmp_counts_bitfield_masks_and_palette() {
-        // 32 bpp BI_BITFIELDS with a 40-byte header: 4 mask DWORDs follow it,
+        // 32 bpp BI_BITFIELDS with a 40-byte header: 3 mask DWORDs follow it,
         // then 2×2 px × 4 B of pixels.
-        let mut dib = vec![0u8; 40 + 16 + 16];
+        let mut dib = vec![0u8; 40 + 12 + 16];
         dib[0..4].copy_from_slice(&40u32.to_le_bytes());
         dib[14..16].copy_from_slice(&32u16.to_le_bytes());
         dib[16..20].copy_from_slice(&3u32.to_le_bytes()); // BI_BITFIELDS
 
         let bmp = dib_to_bmp(&dib).expect("valid DIB");
         let offset = u32::from_le_bytes(bmp[10..14].try_into().unwrap()) as usize;
-        assert_eq!(offset, 14 + 40 + 16);
+        assert_eq!(offset, 14 + 40 + 12);
     }
 
     #[test]
@@ -1184,6 +1384,76 @@ mod tests {
         let mut truncated = vec![0u8; 40];
         truncated[0..4].copy_from_slice(&200u32.to_le_bytes()); // header > payload
         assert!(dib_to_bmp(&truncated).is_none());
+    }
+
+    /// 2×2 px 24 bpp BI_RGB DIB with four distinct, known colors.
+    fn dib_2x2_bgr() -> Vec<u8> {
+        let mut dib = vec![0u8; 40 + 2 * 8]; // rows padded to 8 bytes
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&2i32.to_le_bytes());
+        dib[8..12].copy_from_slice(&2i32.to_le_bytes()); // positive height = bottom-up
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+        dib[14..16].copy_from_slice(&24u16.to_le_bytes());
+        dib[16..20].copy_from_slice(&0u32.to_le_bytes());
+        // Bottom-up: first stored row is the BOTTOM (red,green), second is the
+        // TOP (blue,white). BGR byte order, rows padded from 6 to 8 bytes.
+        dib[40..46].copy_from_slice(&[0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00]); // red, green
+        dib[48..54].copy_from_slice(&[0xFF, 0x00, 0x00, 0xFF, 0xFF, 0xFF]); // blue, white
+        dib
+    }
+
+    #[test]
+    fn decode_dib_flips_rows_and_orders_rgb() {
+        let (width, height, rgb) = decode_dib(&dib_2x2_bgr()).expect("decodable DIB");
+        assert_eq!((width, height), (2, 2));
+        // Top-down RGB order: blue, white, red, green.
+        assert_eq!(
+            rgb,
+            vec![
+                0x00, 0x00, 0xFF, // blue
+                0xFF, 0xFF, 0xFF, // white
+                0xFF, 0x00, 0x00, // red
+                0x00, 0xFF, 0x00, // green
+            ]
+        );
+    }
+
+    #[test]
+    fn decode_dib_handles_topdown_bitfields() {
+        // 1×2 px, 32 bpp BI_BITFIELDS, negative height (top-down),
+        // non-standard masks (BGRW-ish shifted by 4 bits).
+        let mut dib = vec![0u8; 40 + 12 + 8];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&1i32.to_le_bytes());
+        dib[8..12].copy_from_slice(&(-2i32).to_le_bytes());
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+        dib[16..20].copy_from_slice(&3u32.to_le_bytes()); // BI_BITFIELDS
+        dib[40..44].copy_from_slice(&0x00FF_0000u32.to_le_bytes());
+        dib[44..48].copy_from_slice(&0x0000_FF00u32.to_le_bytes());
+        dib[48..52].copy_from_slice(&0x0000_00FFu32.to_le_bytes());
+        // First pixel full-range, second mid-range (mask value 0x7F → ~127).
+        dib[52..56].copy_from_slice(&0x00FF_FF7Fu32.to_le_bytes());
+        dib[56..60].copy_from_slice(&0x0000_7F00u32.to_le_bytes());
+
+        let (width, height, rgb) = decode_dib(&dib).expect("decodable DIB");
+        assert_eq!((width, height), (1, 2));
+        assert_eq!(rgb, vec![0xFF, 0xFF, 0x7F, 0x00, 0x7F, 0x00]);
+    }
+
+    #[test]
+    fn dib_to_png_round_trips() {
+        let (width, height, rgb) = decode_dib(&dib_2x2_bgr()).expect("decodable DIB");
+        let png_bytes = rgb_to_png(width, height, &rgb).expect("encodable PNG");
+        assert!(png_bytes.starts_with(&[0x89, b'P', b'N', b'G']));
+
+        let decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
+        let mut reader = decoder.read_info().expect("PNG info");
+        assert_eq!((reader.info().width, reader.info().height), (2, 2));
+        let mut buf = vec![0u8; reader.output_buffer_size().expect("PNG size known")];
+        let info = reader.next_frame(&mut buf).expect("PNG pixels");
+        assert_eq!(info.color_type, png::ColorType::Rgb);
+        assert_eq!(&buf[..rgb.len()], &rgb[..]);
     }
 
     #[test]

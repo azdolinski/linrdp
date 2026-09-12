@@ -62,6 +62,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// black-screen session once a new client connects and gets no frames).
 const FRAME_PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// After a client caps re-advertise (mstsc decoder reset), hold frames this
+/// long before the full repaint: the client is tearing down and rebuilding
+/// its whole EGFX pipeline and cannot consume frames until it settles.
+const CAPS_SETTLE: Duration = Duration::from_millis(250);
+
 /// H.264 target bitrate. Rate control runs in quality mode, so this is a
 /// ceiling that keeps pathological frames (noise, fast scroll) bounded.
 const H264_BITRATE_BPS: u32 = 12_000_000;
@@ -138,6 +143,8 @@ impl RdpServerDisplay for EgfxDisplay {
             pending_full: true,
             in_motion: false,
             motion_until: Instant::now(),
+            caps_reset_until: Instant::now(),
+            egfx_latched: false,
             last_grabber_connect: Instant::now() - Duration::from_secs(1),
             hb_polls: 0,
             hb_damaged: 0,
@@ -175,6 +182,12 @@ struct EgfxUpdates {
     /// between exact and 4:2:0-lossy colors — the user-visible pulse).
     in_motion: bool,
     motion_until: Instant,
+    /// While set, the client just re-advertised caps (pipeline reset) and
+    /// frames are held until it settles.
+    caps_reset_until: Instant,
+    /// Once a session has used EGFX, never fall back to legacy bitmap
+    /// updates (a client decoder reset briefly clears `ready`).
+    egfx_latched: bool,
     /// Throttle for (re)connecting the X grabber when none is present.
     last_grabber_connect: Instant,
     /// Heartbeat counters: make a stalled loop (no damage, wedged grab,
@@ -220,10 +233,20 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
                 let server = Self::lock_handle(&handle);
                 self.session.ready() && server.is_ready()
             };
-            if !egfx_active {
-                if let Some(update) = grab.legacy_display_update() {
-                    return Ok(Some(update));
-                }
+            if egfx_active {
+                // This session is on the graphics pipeline. Latch it: when
+                // the client re-opens the graphics channel (decoder reset),
+                // the factory briefly clears `ready` and swaps the handle —
+                // falling back to legacy bitmap updates in that window mixes
+                // two update streams in one session, which mstsc rejects
+                // outright (protocol error). The EGFX path rides out the
+                // swap via the generation check instead.
+                self.egfx_latched = true;
+            } else if self.egfx_latched {
+                continue;
+            } else if let Some(update) = grab.legacy_display_update() {
+                return Ok(Some(update));
+            } else {
                 continue;
             }
 
@@ -378,6 +401,11 @@ impl EgfxUpdates {
                 }
                 self.ensure_surface(handle, grab.width, grab.height);
                 self.pending_full = true;
+                self.caps_reset_until = Instant::now() + CAPS_SETTLE;
+                // Frames pushed during the client's reset are what trip
+                // mstsc into "protocol error 0xD06" and an RST (observed: a
+                // ~1.1 MB ClearCodec frame right after re-advertised caps).
+                return;
             }
         }
 
@@ -385,6 +413,12 @@ impl EgfxUpdates {
         // frame entirely; the full-frame send that follows covers this grab.
         if handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).should_backpressure() {
             self.pending_full = true;
+            return;
+        }
+
+        // Client just reset its graphics pipeline (caps re-advertise):
+        // hold frames until its decoder rebuild settles.
+        if Instant::now() < self.caps_reset_until {
             return;
         }
 

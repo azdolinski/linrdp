@@ -2245,6 +2245,7 @@ dependencies = [
  "openh264",
  "opus2",
  "pico-args",
+ "png",
  "rcgen",
  "sha-crypt",
  "tokio",
