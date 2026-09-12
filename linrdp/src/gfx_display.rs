@@ -16,7 +16,8 @@
 //! to yielding legacy bitmap updates, which the server encodes with
 //! RemoteFX/NSCodec as before.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,13 +26,14 @@ use ironrdp_egfx::server::GraphicsPipelineServer;
 use ironrdp_graphics::clearcodec::ClearCodecEncoder;
 use ironrdp_pdu::geometry::ExclusiveRectangle;
 use ironrdp_server::{
-    DesktopSize, DisplayUpdate, RdpServerDisplay, RdpServerDisplayUpdates, ServerResult,
+    DesktopSize, DisplayUpdate, LargePointer, RdpServerDisplay, RdpServerDisplayUpdates,
+    RGBAPointer, ServerResult,
 };
 use openh264::encoder::{
     BitRate, Encoder as OpenH264, EncoderConfig, FrameRate, RateControlMode, UsageType, VuiConfig,
 };
 
-use crate::capture::{Grab, ScreenGrabber, X11Display, POLL_INTERVAL};
+use crate::capture::{CursorImage, Grab, ScreenGrabber, X11Display, POLL_INTERVAL, RESIZE_SETTLE};
 use crate::gfx::GfxSession;
 
 type GfxHandle = Arc<Mutex<GraphicsPipelineServer>>;
@@ -83,6 +85,45 @@ const CLEAR_MAX_PIXELS: usize = 2_500_000;
 /// mirroring how Windows RDP presents video regions.
 const MOTION_LINGER: Duration = Duration::from_millis(250);
 
+/// Cursor shape poll interval (XFixes GetCursorImage). Shape changes are
+/// rare; position is not tracked at all (clients draw their own pointer).
+const CURSOR_POLL_INTERVAL: Duration = Duration::from_millis(128);
+
+/// How often the in-flight window is recomputed from the latest RTT and
+/// producer rate. Both inputs move slower than frame rate; re-locking the
+/// pipeline mutex on every frame is wasted work.
+const WINDOW_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// In-flight window floor — also the bootstrap value before any RTT
+/// measurement lands (matches the EGFX server's own default).
+const MIN_IN_FLIGHT: u32 = 3;
+
+/// The window spans this many round trips of produced frames
+/// (bandwidth-delay product gain).
+const IN_FLIGHT_GAIN: f64 = 1.0;
+
+/// Never buffer more than this many seconds of video, however large the
+/// bandwidth-delay product is (upper bound: ceil(fps × budget)).
+const LATENCY_BUDGET_SEC: f64 = 1.0;
+
+/// Floor for the producer-rate estimate feeding window sizing — below this
+/// the estimate degenerates toward stop-and-wait.
+const MIN_PRODUCER_FPS: f64 = 5.0;
+
+/// Ceiling for the producer-rate estimate (the capture loop polls at ~60 Hz).
+const MAX_PRODUCER_FPS: f64 = 60.0;
+
+/// EWMA smoothing factors, mirroring KRdp's VideoStream: the producer rate
+/// is smoothed at 0.25, the (already windowed) RTT a second time at 0.125 so
+/// transient spikes do not immediately inflate the submission window.
+const PRODUCER_FPS_ALPHA: f64 = 0.25;
+const RTT_ALPHA: f64 = 0.125;
+
+/// RTT samples outside this range are ignored as implausible (probe noise,
+/// u32::MAX sentinel) rather than corrupting the window size.
+const MIN_VALID_RTT_MS: f64 = 5.0;
+const MAX_VALID_RTT_MS: f64 = 60_000.0;
+
 /// CPU-heavy encoders, moved in and out of `spawn_blocking` per frame.
 struct Encoders {
     h264: Option<OpenH264>,
@@ -104,14 +145,30 @@ pub(crate) struct EgfxDisplay {
     x11: X11Display,
     session: Arc<GfxSession>,
     suppressed: Arc<AtomicBool>,
+    /// Latest auto-detect RTT (ms) and session-minimum RTT (ms), shared with
+    /// the server's probe loop — feeds the in-flight window sizing.
+    rtt: Arc<AtomicU32>,
+    rtt_baseline: Arc<AtomicU32>,
+    /// Client's negotiated `pointerCacheSize` — bounds the cursor LRU.
+    pointer_cache: Arc<AtomicU16>,
 }
 
 impl EgfxDisplay {
-    pub(crate) fn new(x11: X11Display, session: Arc<GfxSession>, suppressed: Arc<AtomicBool>) -> Self {
+    pub(crate) fn new(
+        x11: X11Display,
+        session: Arc<GfxSession>,
+        suppressed: Arc<AtomicBool>,
+        rtt: Arc<AtomicU32>,
+        rtt_baseline: Arc<AtomicU32>,
+        pointer_cache: Arc<AtomicU16>,
+    ) -> Self {
         Self {
             x11,
             session,
             suppressed,
+            rtt,
+            rtt_baseline,
+            pointer_cache,
         }
     }
 }
@@ -145,6 +202,7 @@ impl RdpServerDisplay for EgfxDisplay {
             motion_until: Instant::now(),
             caps_reset_until: Instant::now(),
             egfx_latched: false,
+            settle_until: self.x11.settle_until(),
             last_grabber_connect: Instant::now() - Duration::from_secs(1),
             hb_polls: 0,
             hb_damaged: 0,
@@ -156,6 +214,20 @@ impl RdpServerDisplay for EgfxDisplay {
             stat_clear: 0,
             stat_bytes: 0,
             stat_last: Instant::now(),
+            rtt: Arc::clone(&self.rtt),
+            rtt_baseline: Arc::clone(&self.rtt_baseline),
+            pointer_cache: Arc::clone(&self.pointer_cache),
+            cursor_cache: HashMap::new(),
+            cursor_next_index: 0,
+            cursor_last_hash: None,
+            cursor_last_poll: Instant::now(),
+            pending_cursor: None,
+            producer_frames: 0,
+            producer_mark: None,
+            producer_fps: MIN_PRODUCER_FPS,
+            rtt_ewma: None,
+            window_applied: None,
+            window_last_check: Instant::now(),
         }))
     }
 }
@@ -185,6 +257,11 @@ struct EgfxUpdates {
     /// While set, the client just re-advertised caps (pipeline reset) and
     /// frames are held until it settles.
     caps_reset_until: Instant,
+    /// While set, the X screen was just resized and the desktop (WM
+    /// re-layout, wallpaper) is still churning — frames are held until it
+    /// settles, then one full lossless repaint goes out. Resolution-
+    /// independent: taken from the display after request_initial_size.
+    settle_until: Instant,
     /// Once a session has used EGFX, never fall back to legacy bitmap
     /// updates (a client decoder reset briefly clears `ready`).
     egfx_latched: bool,
@@ -204,6 +281,47 @@ struct EgfxUpdates {
     stat_clear: u64,
     stat_bytes: u64,
     stat_last: Instant,
+    /// Latest auto-detect RTT (ms, `u32::MAX` sentinel = not yet measured)
+    /// and the session-minimum RTT, shared with the server's probe loop.
+    rtt: Arc<AtomicU32>,
+    rtt_baseline: Arc<AtomicU32>,
+    /// Client's negotiated `pointerCacheSize` — bounds the cursor LRU. Zero
+    /// means the client cannot receive New Pointer updates at all.
+    pointer_cache: Arc<AtomicU16>,
+    /// Cursor shape cache: shape hash → cache slot. Bounded by the client's
+    /// negotiated pointer cache size; LRU eviction frees a slot on overflow.
+    cursor_cache: HashMap<u64, CursorCacheEntry>,
+    cursor_next_index: u16,
+    /// Hash of the cursor shape currently shown to the client (skip
+    /// re-sending the same sprite every poll).
+    cursor_last_hash: Option<u64>,
+    cursor_last_poll: Instant,
+    /// A cursor update waiting to be yielded to the server encoder. Cursor
+    /// changes are independent of screen damage and must not swallow a
+    /// damaged grab, so they are stashed and returned on a tick without
+    /// pending frame work.
+    pending_cursor: Option<DisplayUpdate>,
+    /// Frames delivered into the EGFX pipeline — the producer-rate signal
+    /// for in-flight window sizing. Measured upstream of the window so the
+    /// estimate cannot feed back into itself.
+    producer_frames: u64,
+    /// `(when, producer_frames)` at the last rate evaluation.
+    producer_mark: Option<(Instant, u64)>,
+    /// EWMA of the frame production rate (fps), clamped to
+    /// [`MIN_PRODUCER_FPS`, [`MAX_PRODUCER_FPS`]].
+    producer_fps: f64,
+    /// Second-stage EWMA of the windowed RTT (the auto-detect handle already
+    /// smooths per-sample); `None` until the first valid sample.
+    rtt_ewma: Option<f64>,
+    /// Last window value actually applied to the pipeline server.
+    window_applied: Option<u32>,
+    window_last_check: Instant,
+}
+
+/// One cached cursor shape (MS-RDPBCGR pointer cache slot).
+struct CursorCacheEntry {
+    cache_index: u16,
+    last_used: Instant,
 }
 
 #[async_trait::async_trait]
@@ -217,13 +335,45 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
                 continue;
             }
 
-            let Some(grab) = self.grabbed().await else {
+            let cursor_due = self.cursor_last_poll.elapsed() >= CURSOR_POLL_INTERVAL;
+            if cursor_due {
+                self.cursor_last_poll = Instant::now();
+            }
+
+            // Producer backpressure (KRdp pauses its encoder; our poll loop
+            // IS the producer): while the EGFX pipeline reports the client
+            // behind, skip the expensive part — the full-screen GetImage and
+            // diff — not just the send. The damage tracker keeps its old
+            // baseline, so the pixels arrive with the next full repaint.
+            if let Some(handle) = self.session.handle() {
+                if self.session.ready()
+                    && Self::lock_handle(&handle).should_backpressure()
+                {
+                    self.pending_full = true;
+                    continue;
+                }
+            }
+
+            let Some((grab, cursor)) = self.grabbed(cursor_due).await else {
+                // No grab this tick — a stashed cursor update can go out now.
+                if let Some(update) = self.pending_cursor.take() {
+                    return Ok(Some(update));
+                }
                 continue;
             };
+
+            if let Some(cursor) = cursor {
+                if let Some(update) = self.cursor_update(cursor) {
+                    self.pending_cursor = Some(update);
+                }
+            }
 
             let Some(handle) = self.session.handle() else {
                 // No EGFX connection — legacy bitmap path.
                 if let Some(update) = grab.legacy_display_update() {
+                    return Ok(Some(update));
+                }
+                if let Some(update) = self.pending_cursor.take() {
                     return Ok(Some(update));
                 }
                 continue;
@@ -243,10 +393,16 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
                 // swap via the generation check instead.
                 self.egfx_latched = true;
             } else if self.egfx_latched {
+                if let Some(update) = self.pending_cursor.take() {
+                    return Ok(Some(update));
+                }
                 continue;
             } else if let Some(update) = grab.legacy_display_update() {
                 return Ok(Some(update));
             } else {
+                if let Some(update) = self.pending_cursor.take() {
+                    return Ok(Some(update));
+                }
                 continue;
             }
 
@@ -256,10 +412,10 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
             // later client would connect to a dead loop (black screen).
             // Dropping the future abandons whatever blocked; codec state is
             // rebuilt next frame.
-            if tokio::time::timeout(FRAME_PROCESS_TIMEOUT, self.egfx_frame(&handle, grab))
+            let frame_done = tokio::time::timeout(FRAME_PROCESS_TIMEOUT, self.egfx_frame(&handle, grab))
                 .await
-                .is_err()
-            {
+                .is_ok();
+            if !frame_done {
                 tracing::error!(
                     process_timeout = ?FRAME_PROCESS_TIMEOUT,
                     "EGFX frame processing stalled — resetting encoders and motion state"
@@ -268,14 +424,27 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
                 self.in_motion = false;
                 self.pending_full = true;
             }
+
+            // Size the in-flight window from the bandwidth-delay product:
+            // enough produced frames to fill one round trip, so high-RTT
+            // links keep flowing instead of collapsing to stop-and-wait.
+            self.update_in_flight_window(&handle);
+
+            // A processed tick that did not produce a returnable display
+            // update is the natural moment to hand a stashed cursor update
+            // to the encoder.
+            if let Some(update) = self.pending_cursor.take() {
+                return Ok(Some(update));
+            }
         }
     }
 }
 
 impl EgfxUpdates {
-    /// Grab one frame with a hard timeout, (re)connecting to the X server as
-    /// needed. `None` means "nothing this tick" — the caller retries.
-    async fn grabbed(&mut self) -> Option<Grab> {
+    /// Grab one frame (plus the cursor sprite when `cursor_due`) with a hard
+    /// timeout, (re)connecting to the X server as needed. `None` means
+    /// "nothing this tick" — the caller retries.
+    async fn grabbed(&mut self, cursor_due: bool) -> Option<(Grab, Option<CursorImage>)> {
         let Some(mut grabber) = self.grabber.take() else {
             self.maybe_reconnect_grabber().await;
             return None;
@@ -284,17 +453,17 @@ impl EgfxUpdates {
         let joined = tokio::time::timeout(
             GRAB_TIMEOUT,
             tokio::task::spawn_blocking(move || {
-                let grab = grabber.poll();
-                (grabber, grab)
+                let (grab, cursor) = grabber.poll_and_cursor(cursor_due);
+                (grabber, grab, cursor)
             }),
         )
         .await;
         match joined {
-            Ok(Ok((grabber, grab))) => {
+            Ok(Ok((grabber, grab, cursor))) => {
                 self.grabber = Some(grabber);
                 self.hb_damaged += u64::from(grab.as_ref().is_some_and(|g| g.damage.is_some()));
                 self.heartbeat(true);
-                grab
+                grab.map(|g| (g, cursor))
             }
             Ok(Err(join_err)) => {
                 // The poll panicked: the grabber was lost with the task, the
@@ -349,13 +518,161 @@ impl EgfxUpdates {
 
     /// Lock the pipeline server, surviving a poisoned mutex: a panic on
     /// another thread must not take the display loop down with it.
-    /// Lock the pipeline server, surviving a poisoned mutex: a panic on
-    /// another thread must not take the display loop down with it.
     fn lock_handle<'a>(handle: &'a GfxHandle) -> std::sync::MutexGuard<'a, GraphicsPipelineServer> {
         handle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    /// Recompute the EGFX in-flight window from the bandwidth-delay product,
+    /// KRdp-style: the window holds one round trip of produced frames, so a
+    /// high-RTT link keeps frames flowing instead of collapsing to
+    /// stop-and-wait. The producer rate is measured upstream of the window
+    /// (delivered frame count), the RTT is smoothed a second time here and
+    /// floored at the session-minimum so the window never drops below the
+    /// path's true BDP, and a latency budget caps it so a fat-but-laggy link
+    /// cannot buffer seconds of video.
+    fn update_in_flight_window(&mut self, handle: &GfxHandle) {
+        if self.window_last_check.elapsed() < WINDOW_UPDATE_INTERVAL {
+            return;
+        }
+        self.window_last_check = Instant::now();
+
+        // Producer-rate EWMA over delivered frames.
+        let now = Instant::now();
+        let total = self.producer_frames;
+        match self.producer_mark {
+            None => self.producer_mark = Some((now, total)),
+            Some((mark, mark_total)) => {
+                let elapsed = now.duration_since(mark).as_secs_f64();
+                if elapsed > 0.0 && total > mark_total {
+                    let fps = (total - mark_total) as f64 / elapsed;
+                    self.producer_fps = self.producer_fps * (1.0 - PRODUCER_FPS_ALPHA) + fps * PRODUCER_FPS_ALPHA;
+                }
+                // Idle: hold the last active rate rather than shrink toward
+                // zero — the window must be usable the instant motion resumes.
+                self.producer_mark = Some((now, total));
+            }
+        }
+        let fps = self.producer_fps.clamp(MIN_PRODUCER_FPS, MAX_PRODUCER_FPS);
+
+        let rtt_raw = self.rtt.load(Ordering::Relaxed);
+        if rtt_raw == u32::MAX {
+            return; // no measurement yet — keep the bootstrap window
+        }
+        let rtt_ms = f64::from(rtt_raw);
+        if !(MIN_VALID_RTT_MS..=MAX_VALID_RTT_MS).contains(&rtt_ms) {
+            return; // implausible sample (probe noise), keep the last window
+        }
+
+        // Second-stage smoothing + session-minimum floor (base RTT): the
+        // floor is what makes high-RTT throughput survive — a window below
+        // one BDP collapses to one frame per round trip.
+        let smoothed = match self.rtt_ewma {
+            None => rtt_ms,
+            Some(prev) => prev * (1.0 - RTT_ALPHA) + rtt_ms * RTT_ALPHA,
+        };
+        self.rtt_ewma = Some(smoothed);
+        let baseline_raw = self.rtt_baseline.load(Ordering::Relaxed);
+        let baseline = if baseline_raw == u32::MAX {
+            rtt_ms
+        } else {
+            f64::from(baseline_raw)
+        };
+        let effective_rtt_ms = smoothed.max(baseline);
+
+        let bdp = (fps * effective_rtt_ms / 1000.0 * IN_FLIGHT_GAIN).ceil();
+        let cap = (fps * LATENCY_BUDGET_SEC).ceil().max(f64::from(MIN_IN_FLIGHT));
+        let window = bdp.clamp(f64::from(MIN_IN_FLIGHT), cap);
+        // Precision guard: u32 cast is safe, values are bounded by the cap.
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped small range")]
+        let window = window as u32;
+
+        if self.window_applied != Some(window) {
+            Self::lock_handle(handle).set_max_frames_in_flight(window);
+            tracing::debug!(
+                window,
+                fps,
+                rtt_ms = effective_rtt_ms,
+                in_flight = self.session.handle().map(|h| Self::lock_handle(&h).frames_in_flight()),
+                "EGFX in-flight window resized (BDP)"
+            );
+            self.window_applied = Some(window);
+        }
+    }
+
+    /// Turn a captured cursor sprite into a pointer `DisplayUpdate`,
+    /// managing the client-side pointer cache (LRU over the negotiated
+    /// `pointerCacheSize`). `None` = nothing to send (unchanged shape).
+    fn cursor_update(&mut self, cursor: CursorImage) -> Option<DisplayUpdate> {
+        let cache_size = self.pointer_cache.load(Ordering::Relaxed);
+        if cache_size == 0 {
+            // Client cannot receive New Pointer updates; the encoder would
+            // drop them anyway. Report once per shape change for the log.
+            tracing::debug!("cursor shape changed but client has no pointer cache — skipping");
+            self.cursor_last_hash = None;
+            return None;
+        }
+
+        let hash = cursor.shape_hash();
+        if self.cursor_last_hash == Some(hash) {
+            return None; // same sprite as on the client
+        }
+        self.cursor_last_hash = Some(hash);
+
+        // Cache hit: one cheap CachedPointer PDU.
+        if let Some(entry) = self.cursor_cache.get_mut(&hash) {
+            entry.last_used = Instant::now();
+            return Some(DisplayUpdate::CachedPointer(entry.cache_index));
+        }
+
+        // RDP cannot transport sprites above 384x384 — fall back to the
+        // system default cursor for those (KRdp does the same).
+        if cursor.width > 384 || cursor.height > 384 {
+            return Some(DisplayUpdate::DefaultPointer);
+        }
+
+        // Evict the least recently used slot when the cache is full.
+        let cache_index = if u32::from(self.cursor_next_index) < u32::from(cache_size) {
+            let idx = self.cursor_next_index;
+            self.cursor_next_index += 1;
+            idx
+        } else {
+            match self.cursor_cache.iter().min_by_key(|(_, e)| e.last_used) {
+                Some((_, evicted)) => evicted.cache_index,
+                None => return None, // zero-size cache reported nonzero: bail
+            }
+        };
+
+        let update = if cursor.width <= 96 && cursor.height <= 96 {
+            DisplayUpdate::RGBAPointer(RGBAPointer {
+                cache_index,
+                hot_x: cursor.hot_x,
+                hot_y: cursor.hot_y,
+                width: cursor.width,
+                height: cursor.height,
+                data: cursor.xor,
+            })
+        } else {
+            DisplayUpdate::LargePointer(LargePointer {
+                cache_index,
+                hot_x: cursor.hot_x,
+                hot_y: cursor.hot_y,
+                width: cursor.width,
+                height: cursor.height,
+                data: cursor.xor,
+            })
+        };
+        self.cursor_cache.insert(
+            hash,
+            CursorCacheEntry {
+                cache_index,
+                last_used: Instant::now(),
+            },
+        );
+        Some(update)
+    }
+
     /// Process one grab through the graphics pipeline.
     async fn egfx_frame(&mut self, handle: &GfxHandle, grab: Grab) {
         // New connection or screen resize: re-create the surface.
@@ -419,6 +736,16 @@ impl EgfxUpdates {
         // Client just reset its graphics pipeline (caps re-advertise):
         // hold frames until its decoder rebuild settles.
         if Instant::now() < self.caps_reset_until {
+            return;
+        }
+
+        // The X screen was resized for this session: the desktop churns for
+        // a moment (WM re-layout, wallpaper) and video pushed mid-churn is
+        // decoded but never composed by mstsc — the frozen first session.
+        // Hold everything; the moment the settle passes, the pending_full
+        // below repaints the whole screen with clean, settled pixels.
+        if Instant::now() < self.settle_until {
+            self.pending_full = true;
             return;
         }
 
@@ -581,6 +908,7 @@ impl EgfxUpdates {
 
         if sent.is_some() {
             self.stat_clear += 1;
+            self.producer_frames += 1;
             if full {
                 // A delivered full-surface paint clears the debt; a delivered
                 // partial rect does not (older debt may still be outstanding).
@@ -662,6 +990,7 @@ impl EgfxUpdates {
 
         if sent.is_some() {
             self.stat_h264 += 1;
+            self.producer_frames += 1;
             self.last_h264 = Instant::now();
             self.pending_full = false;
         } else {

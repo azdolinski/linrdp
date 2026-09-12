@@ -1,5 +1,5 @@
 use core::net::SocketAddr;
-use core::sync::atomic::{AtomicBool, AtomicU32};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32};
 use std::sync::Arc;
 
 use ironrdp_pdu::codecs::rfx::Quant;
@@ -58,6 +58,7 @@ pub struct BuilderDone {
     autodetect_rtt: Option<Arc<AtomicU32>>,
     autodetect_baseline_rtt: Option<Arc<AtomicU32>>,
     autodetect_bandwidth: Option<Arc<AtomicU32>>,
+    pointer_cache: Option<Arc<AtomicU16>>,
     honor_client_desktop_size: Option<DesktopSize>,
     auto_reconnect_cookie: Option<ServerAutoReconnect>,
     preempt_existing_session: bool,
@@ -174,6 +175,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 autodetect_rtt: None,
                 autodetect_baseline_rtt: None,
                 autodetect_bandwidth: None,
+                pointer_cache: None,
                 honor_client_desktop_size: None,
                 preempt_existing_session: false,
                 auto_reconnect_cookie: None,
@@ -211,6 +213,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 autodetect_rtt: None,
                 autodetect_baseline_rtt: None,
                 autodetect_bandwidth: None,
+                pointer_cache: None,
                 honor_client_desktop_size: None,
                 preempt_existing_session: false,
                 auto_reconnect_cookie: None,
@@ -453,6 +456,16 @@ impl RdpServerBuilder<BuilderDone> {
         self
     }
 
+    /// Inject a shared pointer-cache-size handle (MS-RDPBCGR 2.2.7.1.5
+    /// `pointerCacheSize`, `0` until capability exchange). The server writes
+    /// the negotiated size to the same instance the display backend reads;
+    /// when not called, the server allocates its own (still readable via
+    /// [`RdpServer::pointer_cache_handle`]).
+    pub fn with_pointer_cache_handle(mut self, handle: Arc<AtomicU16>) -> Self {
+        self.state.pointer_cache = Some(handle);
+        self
+    }
+
     /// Provision the Server Auto-Reconnect Cookie (MS-RDPBCGR 2.2.4.2
     /// `ARC_SC_PRIVATE_PACKET`) handed to the client during logon.
     ///
@@ -541,6 +554,7 @@ impl RdpServerBuilder<BuilderDone> {
             self.state.autodetect_rtt,
             self.state.autodetect_baseline_rtt,
             self.state.autodetect_bandwidth,
+            self.state.pointer_cache,
         );
         server.set_credential_validator(self.state.credential_validator);
         server.set_auto_reconnect_cookie(self.state.auto_reconnect_cookie);

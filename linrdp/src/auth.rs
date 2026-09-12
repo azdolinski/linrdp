@@ -38,36 +38,70 @@ impl CredentialValidator for ShadowValidator {
         let password = credentials.password.clone();
 
         // Read + verify off the async path (file I/O + cost of the KDF).
-        let result = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+        // The Ok(...) payload says whether PAM should be consulted as a
+        // fallback: the shadow file is authoritative when it answers
+        // definitively, but an unreadable file, an unknown user (SSSD/LDAP
+        // accounts live outside /etc/shadow) or an unsupported hash scheme
+        // is exactly the case the system PAM stack handles for us.
+        let result = tokio::task::spawn_blocking(move || -> Result<bool, Option<String>> {
             let shadow = match Self::load_shadow() {
                 Ok(s) => s,
-                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    tracing::error!(
-                        "cannot read /etc/shadow — run linrdp as root (or add CAP_DAC_READ_SEARCH). \
-                         Without it user/password authentication cannot be verified."
-                    );
-                    return Ok(false);
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::PermissionDenied {
+                        tracing::error!(
+                            "cannot read /etc/shadow — run linrdp as root (or add CAP_DAC_READ_SEARCH)"
+                        );
+                    }
+                    return Err(Some(format!("read /etc/shadow: {e}")));
                 }
-                Err(e) => return Err(format!("read /etc/shadow: {e}")),
             };
             let Some(hash) = shadow.get(&username2) else {
-                return Ok(false); // unknown user — do not leak existence
+                return Err(None); // unknown here — maybe known to PAM
             };
             if hash.starts_with('!') || hash.starts_with('*') {
                 return Ok(false); // account locked / no password set
             }
+            if !hash.contains('$') {
+                // Pre-crypt or exotic entry pam_unix understands better.
+                return Err(Some(format!("unparseable shadow hash: {hash:.8}...")));
+            }
+            let scheme = hash.trim_start_matches('$').split('$').next().unwrap_or_default();
+            if !matches!(scheme, "1" | "5" | "6" | "y") {
+                return Err(Some(format!("unsupported hash scheme ${scheme}$")));
+            }
             Ok(verify_crypt(&password, hash))
         })
         .await
-        .map_err(CredentialValidationError::new)? // join error
-        .map_err(|e| CredentialValidationError::new(std::io::Error::other(e)))?; // backend error
+        .map_err(CredentialValidationError::new)?; // join error only
 
-        if result {
-            tracing::info!(%username, "authentication accepted");
-            Ok(CredentialDecision::Accept)
-        } else {
-            tracing::warn!(%username, "authentication rejected");
-            Ok(CredentialDecision::Reject)
+        match result {
+            Ok(true) => {
+                tracing::info!(%username, "authentication accepted");
+                Ok(CredentialDecision::Accept)
+            }
+            Ok(false) => {
+                tracing::warn!(%username, "authentication rejected");
+                Ok(CredentialDecision::Reject)
+            }
+            Err(reason) => {
+                // Shadow could not answer — fall back to the system PAM
+                // stack (KRdp's primary path, our safety net). A PAM outage
+                // is a backend error, not a rejection.
+                let reason = reason.as_deref().unwrap_or("user not in /etc/shadow");
+                tracing::info!(%username, %reason, "shadow lookup inconclusive - trying PAM");
+                let (user, pass) = (username.clone(), credentials.password.clone());
+                let pam = tokio::task::spawn_blocking(move || crate::pam::authenticate(&user, &pass))
+                    .await
+                    .map_err(CredentialValidationError::new)? // join error
+                    .map_err(|e| CredentialValidationError::new(std::io::Error::other(e)))?;
+                if pam {
+                    tracing::info!(%username, "authentication accepted via PAM");
+                    Ok(CredentialDecision::Accept)
+                } else {
+                    tracing::warn!(%username, "authentication rejected (shadow+PAM)");
+                    Ok(CredentialDecision::Reject)
+                }
+            }
         }
     }
 }

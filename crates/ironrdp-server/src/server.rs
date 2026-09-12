@@ -1,6 +1,6 @@
 use core::fmt;
 use core::net::{IpAddr, SocketAddr};
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
 #[cfg(feature = "usb")]
 use std::collections::HashMap;
@@ -766,6 +766,15 @@ pub struct RdpServer {
     /// alone does not fix.
     autodetect_bandwidth: Arc<AtomicU32>,
 
+    /// Client-advertised `pointerCacheSize` (MS-RDPBCGR 2.2.7.1.5), or `0`
+    /// until capability exchange (and for clients that do not advertise the
+    /// New Pointer Update at all). Display backends that manage a
+    /// `CachedPointer` slot LRU need this bound; the `UpdateEncoder` keeps
+    /// its own copy and drops pointer updates that exceed it, so a backend
+    /// reading a stale larger value only wastes slots, never breaks the
+    /// client. Exposed via [`Self::pointer_cache_handle`].
+    negotiated_pointer_cache: Arc<AtomicU16>,
+
     /// Frame Acknowledge accounting (MS-RDPBCGR 2.2.2.3), shared between the
     /// display loop (paces frame emission on the client's presentation rate)
     /// and the slow-path input handler (records incoming Frame Acknowledge
@@ -1433,6 +1442,7 @@ impl RdpServer {
         autodetect_rtt: Option<Arc<AtomicU32>>,
         autodetect_baseline_rtt: Option<Arc<AtomicU32>>,
         autodetect_bandwidth: Option<Arc<AtomicU32>>,
+        pointer_cache: Option<Arc<AtomicU16>>,
     ) -> Self {
         let (ev_sender, ev_receiver) = ServerEvent::create_channel();
         if let Some(cliprdr) = cliprdr_factory.as_mut() {
@@ -1500,6 +1510,11 @@ impl RdpServer {
             autodetect_bandwidth: {
                 let handle = autodetect_bandwidth.unwrap_or_else(|| Arc::new(AtomicU32::new(u32::MAX)));
                 handle.store(u32::MAX, Ordering::Relaxed);
+                handle
+            },
+            negotiated_pointer_cache: {
+                let handle = pointer_cache.unwrap_or_else(|| Arc::new(AtomicU16::new(0)));
+                handle.store(0, Ordering::Relaxed);
                 handle
             },
             frame_ack_state: Arc::default(),
@@ -1887,6 +1902,14 @@ impl RdpServer {
     /// have been received yet.
     pub fn rtt_snapshot(&self) -> Option<RttSnapshot> {
         self.autodetect.as_ref().and_then(|ad| ad.snapshot())
+    }
+
+    /// The client's advertised `pointerCacheSize` (MS-RDPBCGR 2.2.7.1.5),
+    /// or `0` before capability exchange / for clients without New Pointer
+    /// Update support. Display backends bound this to size a
+    /// `CachedPointer` LRU; changes only with a new client connection.
+    pub fn pointer_cache_handle(&self) -> Arc<AtomicU16> {
+        Arc::clone(&self.negotiated_pointer_cache)
     }
 
     /// Returns the shared EGFX server handle for proactive frame submission.
@@ -3823,6 +3846,8 @@ impl RdpServer {
                     // must not reference a cache slot via CachedPointer either, since nothing
                     // else in this crate populates that cache via the Color Pointer Update.
                     pointer_cache_size = p.pointer_cache_size;
+                    self.negotiated_pointer_cache
+                        .store(p.pointer_cache_size, Ordering::Relaxed);
                 }
                 CapabilitySet::LargePointer(lp) => {
                     // MS-RDPBCGR 2.2.7.2.7: LARGE_POINTER_FLAG_96x96 raises the Color/New

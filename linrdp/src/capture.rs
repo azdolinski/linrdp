@@ -2,12 +2,14 @@
 //! Polls the root window with GetImage and serves the frame when it changes.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use core::num::{NonZeroU16, NonZeroUsize};
 use core::time::Duration;
 
 use anyhow::Context as _;
 use x11rb::connection::Connection as _;
+use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xproto::ConnectionExt as _;
 
 use ironrdp_connector::DesktopSize;
@@ -22,11 +24,26 @@ pub(crate) struct X11Display {
     height: u16,
     display_name: String,
     xauthority: String,
+    /// Fixed desktop size (`--fixed-size`): the X screen is resized once at
+    /// startup and never per-connection again. Windows RDP works this way —
+    /// the server desktop has one size and clients scale locally — and it
+    /// avoids the post-resize window where a freshly re-layouting desktop
+    /// pushes heavy H.264 immediately after the first paint, which mstsc
+    /// decodes (frame acks flow) but never composes, freezing the picture
+    /// until the client reconnects (when X is already at the right size and
+    /// the session starts settled).
+    fixed_size: Option<(u16, u16)>,
+    /// Frames are held until this instant after any RandR resize: the
+    /// desktop (WM layout, wallpaper) churns for a second or two after a
+    /// size change, and video pushed during that window is what mstsc
+    /// decodes but never composes (the frozen-session failure). Works for
+    /// any client resolution — the settle follows every actual resize.
+    settle_until: Instant,
 }
 
 impl X11Display {
     /// Connect to `$DISPLAY` (or `:99`) and take the root window geometry.
-    pub(crate) fn connect() -> anyhow::Result<Self> {
+    pub(crate) fn connect(fixed_size: Option<(u16, u16)>) -> anyhow::Result<Self> {
         let display_name = std::env::var("DISPLAY").unwrap_or_else(|_| ":99".to_owned());
         let (conn, screen_num) = x11rb::rust_connection::RustConnection::connect(Some(display_name.as_str()))
             .with_context(|| format!("connect to X display {display_name}"))?;
@@ -34,14 +51,33 @@ impl X11Display {
         let (width, height) = (screen.width_in_pixels, screen.height_in_pixels);
         let root = screen.root;
         tracing::info!(display = %display_name, width, height, "X11 capture ready");
-        Ok(Self {
+        let mut display = Self {
             conn: Arc::new(conn),
             root,
             width,
             height,
             display_name,
             xauthority: std::env::var("XAUTHORITY").unwrap_or_default(),
-        })
+            fixed_size,
+            settle_until: Instant::now(),
+        };
+        // Apply the fixed size once, before any client can connect: the
+        // desktop must be settled (layout done, no churn) by the time a
+        // session's first frames go out.
+        if let Some((w, h)) = fixed_size {
+            if w != width || h != height {
+                display.resize_screen(w, h)?;
+                tracing::info!(w, h, "X screen pre-resized to the fixed desktop size");
+            }
+        }
+        Ok(display)
+    }
+
+    /// Record that the X screen just changed size: the desktop will churn
+    /// (WM re-layout, wallpaper) for a short while, and the display loop
+    /// must hold frames until it settles (see `settle_until`).
+    fn note_resize(&mut self) {
+        self.settle_until = Instant::now() + RESIZE_SETTLE;
     }
 
     /// Current root-window geometry.
@@ -118,8 +154,15 @@ impl X11Display {
         }
         self.width = w;
         self.height = h;
+        self.note_resize();
         tracing::info!(width = w, height = h, "X screen resized via xrandr");
         Ok(())
+    }
+
+    /// Frames are held while the desktop settles after a resize; callers
+    /// hold off encoding until this instant passes, then repaint in full.
+    pub(crate) fn settle_until(&self) -> Instant {
+        self.settle_until
     }
 
     /// A fresh damage-tracking poller over this display's root window.
@@ -154,6 +197,14 @@ impl RdpServerDisplay for X11Display {
     /// screen so the RDP framebuffer matches what the client can show.
     async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
         tracing::info!(?client_size, "request_initial_size called");
+        if let Some((w, h)) = self.fixed_size {
+            // Fixed desktop: never touch the X screen per-connection. The
+            // client scales the fixed framebuffer locally, exactly like a
+            // Windows RDP session to a monitor of a different resolution.
+            tracing::info!(w, h, client_w = client_size.width, client_h = client_size.height,
+                           "fixed desktop size — client scales locally");
+            return DesktopSize { width: w, height: h };
+        }
         // MS-RDPBCGR: the server adopts the negotiated session size. Resize
         // the X screen to the client's exact size (RandR) so the remote
         // desktop fills the client window edge-to-edge.
@@ -179,6 +230,10 @@ impl RdpServerDisplay for X11Display {
     /// requested monitor geometry so the desktop fills the client window.
     fn request_layout(&mut self, layout: ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout) {
         tracing::info!(?layout, "client requested layout change");
+        if self.fixed_size.is_some() {
+            tracing::debug!("fixed desktop size — ignoring client layout change");
+            return;
+        }
         let Some(monitor) = layout.monitors().first() else {
             return;
         };
@@ -227,6 +282,37 @@ pub(crate) struct Grab {
     pub(crate) total_tiles: u32,
 }
 
+/// Cursor sprite captured via XFixes `GetCursorImage`, already in the RDP
+/// 32-bpp xor-mask layout: `R,G,B,x` bytes per pixel, bottom-up rows.
+pub(crate) struct CursorImage {
+    pub(crate) width: u16,
+    pub(crate) height: u16,
+    pub(crate) hot_x: u16,
+    pub(crate) hot_y: u16,
+    pub(crate) xor: Vec<u8>,
+}
+
+impl CursorImage {
+    /// Cheap identity of the shape (size + hotspot + pixels) for cache
+    /// lookups — recomputed per call, callers memoize the result.
+    pub(crate) fn shape_hash(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a
+        let mut mix = |h: &mut u64, b: u8| {
+            *h ^= u64::from(b);
+            *h = h.wrapping_mul(0x1000_0000_01b3);
+        };
+        for b in &self.xor {
+            mix(&mut h, *b);
+        }
+        for v in [self.width, self.height, self.hot_x, self.hot_y] {
+            for b in v.to_le_bytes() {
+                mix(&mut h, b);
+            }
+        }
+        h
+    }
+}
+
 impl Grab {
     /// Crop the damage rectangle into a legacy-path `DisplayUpdate`.
     pub(crate) fn legacy_display_update(&self) -> Option<DisplayUpdate> {
@@ -270,6 +356,9 @@ pub(crate) struct ScreenGrabber {
     prev_frame: Option<Vec<u8>>,
     display_name: String,
     consecutive_failures: u32,
+    /// Whether XFixes QueryVersion has been exchanged on this connection
+    /// (reset by reconnect — a fresh connection must renegotiate).
+    xfixes_negotiated: bool,
 }
 
 impl ScreenGrabber {
@@ -288,6 +377,7 @@ impl ScreenGrabber {
             prev_frame: None,
             display_name,
             consecutive_failures: 0,
+            xfixes_negotiated: false,
         }
     }
 
@@ -326,6 +416,7 @@ impl ScreenGrabber {
                 self.height = screen.height_in_pixels;
                 self.conn = Arc::new(conn);
                 self.prev_frame = None;
+                self.xfixes_negotiated = false;
                 true
             }
             Err(_) => false,
@@ -388,6 +479,68 @@ impl ScreenGrabber {
             }
         }
         grab
+    }
+
+    /// One screen grab plus, when `cursor_due`, a fresh cursor image.
+    ///
+    /// The cursor is not part of the root-window pixels `GetImage` returns
+    /// (X draws it as an overlay), so without this the remote user never sees
+    /// the real session cursor shape — only their client's default arrow.
+    /// XFixes `GetCursorImage` returns the current sprite as ARGB, which the
+    /// display backend ships to the client as RDP pointer updates.
+    pub(crate) fn poll_and_cursor(&mut self, cursor_due: bool) -> (Option<Grab>, Option<CursorImage>) {
+        let cursor = if cursor_due { self.cursor_image() } else { None };
+        (self.poll(), cursor)
+    }
+
+    /// Current cursor sprite via XFixes, converted to the RDP xor-mask byte
+    /// order (R,G,B,x per pixel) in bottom-up rows.
+    fn cursor_image(&mut self) -> Option<CursorImage> {
+        if !self.xfixes_negotiated {
+            // GetCursorImage needs the XFixes extension announced first.
+            self.conn.xfixes_query_version(4, 0).ok()?.reply().ok()?;
+            self.xfixes_negotiated = true;
+        }
+        let cur = self.conn.xfixes_get_cursor_image().ok()?.reply().ok()?;
+        let width = u16::try_from(cur.width).ok()?;
+        let height = u16::try_from(cur.height).ok()?;
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let hot_x = u16::try_from(cur.xhot).ok()?;
+        let hot_y = u16::try_from(cur.yhot).ok()?;
+
+        // XFixes pixels are native-endian CARD32 ARGB (a<<24|r<<16|g<<8|b);
+        // the RDP 32-bpp xor mask wants 0x00BBGGRR u32s (bytes R,G,B,x) in
+        // bottom-up rows — reorder channels and flip vertically in one pass.
+        let src = cur.cursor_image;
+        let src_len = usize::from(width) * usize::from(height);
+        if src.len() < src_len {
+            return None;
+        }
+        let stride = usize::from(width) * 4;
+        let mut xor = vec![0u8; src_len * 4];
+        for row in 0..usize::from(height) {
+            let src_row = &src[row * usize::from(width)..(row + 1) * usize::from(width)];
+            // Destination row is the vertically mirrored one.
+            let dst_row = usize::from(height) - 1 - row;
+            let dst = &mut xor[dst_row * stride..(dst_row + 1) * stride];
+            for (s, d) in src_row.iter().zip(dst.chunks_exact_mut(4)) {
+                let argb = *s;
+                d[0] = ((argb >> 16) & 0xFF) as u8; // R
+                d[1] = ((argb >> 8) & 0xFF) as u8; // G
+                d[2] = (argb & 0xFF) as u8; // B
+                d[3] = 0xFF; // ignored byte; keep opaque for good measure
+            }
+        }
+
+        Some(CursorImage {
+            width,
+            height,
+            hot_x: hot_x.min(width.saturating_sub(1)),
+            hot_y: hot_y.min(height.saturating_sub(1)),
+            xor,
+        })
     }
 
     fn poll_inner(&mut self) -> Option<Grab> {
@@ -470,6 +623,12 @@ const TILE: u16 = 64;
 /// bitmap update — the encoder wraps it in a single Frame Marker group
 /// (MS-RDPBCGR 2.2.9.2.3) so the client presents it atomically.
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(16);
+
+/// How long the display loop holds frames after a RandR resize: the desktop
+/// (WM re-layout, wallpaper redraw) churns in this window and video pushed
+/// mid-churn is decoded but never composed by mstsc — the frozen-session
+/// failure. Resolution-independent: it follows every actual resize.
+pub(crate) const RESIZE_SETTLE: Duration = Duration::from_millis(1500);
 
 struct Updates {
     grabber: ScreenGrabber,

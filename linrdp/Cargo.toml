@@ -15,7 +15,7 @@ async-trait = "0.1"
 sha-crypt = "0.5"
 yescrypt = { version = "0.1", features = ["password-hash"] }
 md5 = "0.7"
-x11rb = { version = "0.13", features = ["xtest", "randr"] }
+x11rb = { version = "0.13", features = ["xtest", "randr", "xfixes"] }
 ironrdp-rdpsnd = { path = "../crates/ironrdp-rdpsnd" }
 ironrdp-displaycontrol = { path = "../crates/ironrdp-displaycontrol" }
 ironrdp-rdpeai = { path = "../crates/ironrdp-rdpeai" }
@@ -39,6 +39,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 pico-args = "0.5"
 rcgen = "0.13"
+# Session lifecycle (logind lock/unlock, greeter switch) over the system bus.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+
+[features]
+# Wayland capture path: xdg-desktop-portal + PipeWire + libei (see src/wayland).
+# Off by default until it has been exercised on a real Wayland session.
+wayland = []
+
 
 [lints]
 workspace = true

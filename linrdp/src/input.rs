@@ -2,6 +2,7 @@
 //! into the X11 server via XTEST (x11rb, pure Rust — no external binaries),
 //! so the remote desktop reacts exactly like a local console session.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Context as _;
@@ -77,6 +78,11 @@ pub(crate) struct X11InputHandler {
     /// TS_SYNC_FLAGS event (2.2.8.1.1.3.1.1.5) can toggle the locks toward
     /// the requested state. Starts all-off, matching a fresh Xvfb.
     locks: SynchronizeFlags,
+    /// X keycodes the client currently holds down, so a client
+    /// SynchronizeEvent (which resynchronizes keyboard state) can release
+    /// them — a lost key-release must not leave a key stuck down forever
+    /// (the repeating-key symptom KRdp guards against the same way).
+    pressed_keys: HashSet<u8>,
     /// Rate limit for reconnect attempts while the X server is down, so a
     /// client streaming mouse moves cannot turn into a log/reconnect storm.
     last_reconnect_attempt: Option<std::time::Instant>,
@@ -93,6 +99,7 @@ impl X11InputHandler {
             root,
             unicode_keycode: None,
             locks: SynchronizeFlags::empty(),
+            pressed_keys: HashSet::new(),
             last_reconnect_attempt: None,
         })
     }
@@ -184,9 +191,22 @@ impl X11InputHandler {
         self.fake_key(keycode, false);
     }
 
-    /// TS_SYNC_FLAGS (2.2.8.1.1.3.1.1.5): bring the X server lock states in
-    /// line with the client's by toggling the corresponding lock keys.
+    /// TS_SYNC_FLAGS (2.2.8.1.1.3.1.1.5): the client is resynchronizing its
+    /// keyboard state. Release every key we still believe is held — a lost
+    /// key-release (network hiccup, client crash mid-press) must not leave a
+    /// key stuck down on the X server — then bring the lock states in line
+    /// with the client's by toggling the corresponding lock keys.
     fn synchronize(&mut self, want: SynchronizeFlags) {
+        if !self.pressed_keys.is_empty() {
+            tracing::debug!(
+                count = self.pressed_keys.len(),
+                "keyboard synchronize: releasing held key(s)"
+            );
+        }
+        for keycode in std::mem::take(&mut self.pressed_keys) {
+            self.fake_key(keycode, false);
+        }
+
         let toggles = [
             (want.contains(SynchronizeFlags::CAPS_LOCK), self.locks.contains(SynchronizeFlags::CAPS_LOCK), KEYCODE_CAPS_LOCK, SynchronizeFlags::CAPS_LOCK),
             (want.contains(SynchronizeFlags::NUM_LOCK), self.locks.contains(SynchronizeFlags::NUM_LOCK), KEYCODE_NUM_LOCK, SynchronizeFlags::NUM_LOCK),
@@ -250,11 +270,13 @@ impl RdpServerInputHandler for X11InputHandler {
         match event {
             KeyboardEvent::Pressed { code, extended } => {
                 if let Some(kc) = keycode_for(code, extended) {
+                    self.pressed_keys.insert(kc);
                     self.fake_key(kc, true);
                 }
             }
             KeyboardEvent::Released { code, extended } => {
                 if let Some(kc) = keycode_for(code, extended) {
+                    self.pressed_keys.remove(&kc);
                     self.fake_key(kc, false);
                 }
             }

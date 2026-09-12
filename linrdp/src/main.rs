@@ -13,12 +13,16 @@ mod gfx;
 mod gfx_display;
 mod input;
 mod mic;
+mod pam;
 mod sam;
 mod sound;
 mod sound_real;
 mod tls;
 mod udp;
 mod usb;
+mod session_ctl;
+#[cfg(feature = "wayland")]
+mod wayland;
 mod x11_selection;
 
 use core::net::SocketAddr;
@@ -33,10 +37,13 @@ use crate::input::X11InputHandler;
 
 const HELP: &str = "\
 USAGE:
-  linrdp [--bind-addr <ADDR>] [--usb] [--log-file <PATH>]
+  linrdp [--bind-addr <ADDR>] [--usb] [--log-file <PATH>] [--fixed-size <WxH>]
 
 Serves a real Linux desktop over RDP (auth: system accounts from /etc/shadow).
 Default bind: 0.0.0.0:3389. --usb enables USB device redirection (MS-RDPEUSB).
+--fixed-size pins the desktop (e.g. 2880x1800): X is resized once at startup
+and clients scale locally — recommended with mstsc, which composes EGFX
+poorly right after a mid-session RandR resize.
 
 Logging: written to /var/log/linrdp/linrdp.log when that directory can be
 created (falling back to the terminal), or to the file given with --log-file.
@@ -72,6 +79,25 @@ async fn main() -> anyhow::Result<()> {
 
     let log_file: Option<String> = args.opt_value_from_str("--log-file")?;
 
+    // Session lifecycle (KRdp SessionController pattern): lock the logind
+    // session when the last client disconnects / unlock on reconnect, and
+    // optionally flip the seat to the greeter when a client takes over.
+    let lock_session = args.contains("--lock-session");
+    let switch_to_greeter = args.contains("--switch-to-greeter");
+
+    let fixed_size: Option<(u16, u16)> = match args.opt_value_from_str::<_, String>("--fixed-size")? {
+        Some(spec) => {
+            let Some((w, h)) = spec.split_once(['x', 'X']) else {
+                anyhow::bail!("--fixed-size expects <WIDTHxHEIGHT>, e.g. 2880x1800");
+            };
+            Some((
+                w.trim().parse().context("--fixed-size width")?,
+                h.trim().parse().context("--fixed-size height")?,
+            ))
+        }
+        None => None,
+    };
+
     setup_logging(log_file.as_deref());
 
     tracing::info!(%bind_addr, "LinRDP starting — auth: /etc/shadow accounts");
@@ -105,14 +131,26 @@ async fn main() -> anyhow::Result<()> {
     let gfx_session = Arc::new(gfx::GfxSession::new());
     let display_suppressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Shared auto-detect handles (MS-RDPBCGR 2.2.14): the server's probe
+    // loop writes the measured RTT / session-minimum RTT here, and the EGFX
+    // display loop reads them to size its in-flight window from the
+    // bandwidth-delay product. The pointer-cache handle carries the client's
+    // negotiated pointerCacheSize for the cursor-shape LRU.
+    let autodetect_rtt = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
+    let autodetect_baseline = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
+    let pointer_cache = Arc::new(std::sync::atomic::AtomicU16::new(0));
+
     let mut server = RdpServer::builder()
         .with_addr(bind_addr)
         .with_hybrid(acceptor, identity.pub_key.clone())
         .with_input_handler(X11InputHandler::connect().expect("X11 unavailable for input"))
         .with_display_handler(gfx_display::EgfxDisplay::new(
-            X11Display::connect().expect("X11 display unavailable"),
+            X11Display::connect(fixed_size).expect("X11 display unavailable"),
             Arc::clone(&gfx_session),
             Arc::clone(&display_suppressed),
+            Arc::clone(&autodetect_rtt),
+            Arc::clone(&autodetect_baseline),
+            Arc::clone(&pointer_cache),
         ))
         .with_gfx_factory(Some(Box::new(gfx::LinrdpGfxFactory::new(Arc::clone(
             &gfx_session,
@@ -132,6 +170,9 @@ async fn main() -> anyhow::Result<()> {
         }))
         .with_ainput(false)
         .with_credential_resolver(sam_resolver)
+        .with_autodetect_rtt_handle(autodetect_rtt)
+        .with_autodetect_baseline_rtt_handle(autodetect_baseline)
+        .with_pointer_cache_handle(pointer_cache)
         .with_dynamic_channel_attacher(|dvc| {
             // Write client mic audio into the PulseAudio pipe-source FIFO so
             // Linux applications see it as a microphone (USB-sound-card model).
@@ -187,6 +228,10 @@ async fn main() -> anyhow::Result<()> {
         .with_cliprdr_factory(Some(cliprdr))
         .with_sound_factory(Some(Box::new(sound_real::SystemSoundFactory::default())))
         .with_credential_validator(Some(validator))
+        .with_connection_handler(Some(Box::new(session_ctl::SessionController::new(
+            lock_session,
+            switch_to_greeter,
+        ))))
         .build();
 
     // Protocol-level network auto-detect (MS-RDPBCGR 2.2.14) and server
