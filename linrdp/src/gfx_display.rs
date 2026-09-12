@@ -189,8 +189,7 @@ struct SurfaceState {
 /// `poll_and_cursor` runs inside `spawn_blocking`; a source Box that is lost
 /// with an abandoned blocking task is simply rebuilt by the factory
 /// (`try_attach` / [`DisplaySourceFactory::updates_source`]).
-pub(crate) trait FrameSource: Send + 'static {
-    /// Poll for a frame (plus the cursor sprite when `cursor_due`).
+pub(crate) trait FrameSource: Send + 'static {    /// Poll for a frame (plus the cursor sprite when `cursor_due`).
     /// `None` = nothing this tick — the caller retries.
     fn poll_and_cursor(&mut self, cursor_due: bool) -> Option<(Grab, Option<CursorImage>)>;
     /// Best-effort (re)attach attempt when detached; throttled by the caller.
@@ -277,6 +276,7 @@ impl RdpServerDisplay for EgfxDisplay {
         Ok(Box::new(EgfxUpdates {
             factory: Arc::clone(&self.factory),
             source: Some(source),
+            pending_grab: None,
             session: Arc::clone(&self.session),
             suppressed: Arc::clone(&self.suppressed),
             encoders: None,
@@ -328,8 +328,13 @@ struct EgfxUpdates {
     factory: Arc<dyn DisplaySourceFactory>,
     /// The per-session frame source; `None` while a source lost with an
     /// abandoned blocking task is awaited (rebuilt from the factory,
-    /// throttled by `last_attach_attempt`).
+    /// throttled by `last_attach_attempt`) or while a prefetched grab runs
+    /// (the source travels inside that task, see [`PendingGrab`]).
     source: Option<Box<dyn FrameSource>>,
+    /// The in-flight prefetch grab, if any. At most one poll runs at a time;
+    /// it is started before the previous frame is processed so capture
+    /// overlaps encoding instead of serializing behind it.
+    pending_grab: Option<PendingGrab>,
     session: Arc<GfxSession>,
     suppressed: Arc<AtomicBool>,
     /// Taken out per frame for `spawn_blocking`; re-created if a blocking
@@ -434,6 +439,16 @@ struct CursorCacheEntry {
     last_used: Instant,
 }
 
+/// A grab poll in flight — the one-frame prefetch that pipelines capture
+/// against encoding: the next X11/PipeWire poll runs in a blocking task while
+/// the previous grab is being converted and encoded. The frame source lives
+/// inside the task until the poll completes, so `EgfxUpdates::source` is
+/// `None` for the duration (`try_consume_grab` puts it back).
+struct PendingGrab {
+    handle: tokio::task::JoinHandle<(Box<dyn FrameSource>, Option<(Grab, Option<CursorImage>)>)>,
+    started: Instant,
+}
+
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for EgfxUpdates {
     async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
@@ -452,9 +467,10 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
 
             // Producer backpressure (KRdp pauses its encoder; our poll loop
             // IS the producer): while the EGFX pipeline reports the client
-            // behind, skip the expensive part — the full-screen GetImage and
-            // diff — not just the send. The damage tracker keeps its old
-            // baseline, so the pixels arrive with the next full repaint.
+            // behind, skip the expensive part — the YUV conversion and encode
+            // — not just the send. No new grab is started either; whatever
+            // landed already updated the damage baseline, so `pending_full`
+            // makes a later full repaint deliver those pixels.
             if let Some(handle) = self.session.handle() {
                 if self.session.ready()
                     && Self::lock_handle(&handle).should_backpressure()
@@ -464,8 +480,14 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
                 }
             }
 
-            let Some((grab, cursor)) = self.grabbed(cursor_due).await else {
-                // No grab this tick — a stashed cursor update can go out now.
+            // Start the next capture before consuming the previous grab: the
+            // poll (GetImage + tile diff) runs concurrently with the previous
+            // frame's YUV conversion + encode instead of serializing behind
+            // it. Per-frame cost drops from grab+encode to ~max(encode, grab).
+            self.maybe_start_grab(cursor_due);
+
+            let Some((grab, cursor)) = self.try_consume_grab().await else {
+                // Prefetch still running — a stashed cursor update can go out now.
                 if let Some(update) = self.pending_cursor.take() {
                     return Ok(Some(update));
                 }
@@ -571,53 +593,74 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
 }
 
 impl EgfxUpdates {
-    /// Grab one frame (plus the cursor sprite when `cursor_due`) with a hard
-    /// timeout. A source that wedges inside its poll is abandoned with the
-    /// blocking task and rebuilt from the factory next tick — a frozen X
-    /// server never errors, it just never replies, and a PipeWire stream can
-    /// stall the same way.
-    async fn grabbed(&mut self, cursor_due: bool) -> Option<(Grab, Option<CursorImage>)> {
-        if self
-            .source
-            .as_ref()
-            .is_some_and(|s| s.is_attached())
-        {
-            // Fast path: poll the live source.
-        } else {
-            self.maybe_attach_source();
-            return None;
+    /// Kick off the next capture poll unless one is already in flight.
+    ///
+    /// The poll runs in a blocking task and its result is picked up by
+    /// [`Self::try_consume_grab`] on a later tick — that split is what lets
+    /// the next GetImage + tile diff overlap the previous frame's conversion
+    /// and encode. A poll that exceeds [`GRAB_TIMEOUT`] is abandoned with the
+    /// task (the source inside it is lost; the factory rebuilds one, and the
+    /// dropped baseline forces a full repaint once frames flow again).
+    fn maybe_start_grab(&mut self, cursor_due: bool) {
+        match &mut self.pending_grab {
+            Some(pending) => {
+                if !pending.handle.is_finished() && pending.started.elapsed() > GRAB_TIMEOUT {
+                    tracing::warn!(timeout = ?GRAB_TIMEOUT, "frame source poll timed out — abandoning it");
+                    // A blocking task cannot be interrupted; dropping the
+                    // handle detaches it and the result is discarded.
+                    self.pending_grab = None;
+                }
+                // In flight (or just abandoned this tick — the source rebuild
+                // is throttled by `maybe_attach_source` below, next tick).
+                return;
+            }
+            None => {
+                if self
+                    .source
+                    .as_ref()
+                    .is_some_and(|s| s.is_attached())
+                {
+                    // Fast path: poll the live source.
+                } else {
+                    self.maybe_attach_source();
+                    return;
+                }
+            }
         }
         let mut source = self.source.take().expect("source checked above");
         self.hb_polls += 1;
-        let joined = tokio::time::timeout(
-            GRAB_TIMEOUT,
-            tokio::task::spawn_blocking(move || {
-                let polled = source.poll_and_cursor(cursor_due);
-                (source, polled)
-            }),
-        )
-        .await;
-        match joined {
-            Ok(Ok((source, polled))) => {
+        let handle = tokio::task::spawn_blocking(move || {
+            let polled = source.poll_and_cursor(cursor_due);
+            (source, polled)
+        });
+        self.pending_grab = Some(PendingGrab {
+            handle,
+            started: Instant::now(),
+        });
+    }
+
+    /// Consume the prefetched grab once its blocking poll has finished.
+    /// `None` = still running (or being rebuilt after a timeout) — retry next
+    /// tick; the frame source stays inside the task meanwhile.
+    async fn try_consume_grab(&mut self) -> Option<(Grab, Option<CursorImage>)> {
+        let pending = self.pending_grab.take()?;
+        if !pending.handle.is_finished() {
+            self.pending_grab = Some(pending);
+            return None;
+        }
+        match pending.handle.await {
+            Ok((source, polled)) => {
+                self.hb_damaged += u64::from(polled.as_ref().is_some_and(|(g, _)| g.damage.is_some()));
                 let name = source.name().to_owned();
                 self.source = Some(source);
-                self.hb_damaged += u64::from(polled.as_ref().is_some_and(|(g, _)| g.damage.is_some()));
                 self.heartbeat(&name);
                 polled
             }
-            Ok(Err(join_err)) => {
+            Err(join_err) => {
                 // The poll panicked: the source was lost with the task, the
                 // factory rebuilds one next tick. (A panic in an async task
                 // would otherwise kill the display loop silently.)
                 tracing::warn!(error = %join_err, "frame source poll panicked — rebuilding source");
-                None
-            }
-            Err(_) => {
-                // Frozen source (dead X server, wedged PipeWire): the task
-                // and the source inside it are abandoned; a fresh one from
-                // the factory replaces it, and the dropped prev_frame forces
-                // a full repaint once frames flow again.
-                tracing::warn!(timeout = ?GRAB_TIMEOUT, "frame source poll timed out — abandoning it");
                 None
             }
         }
