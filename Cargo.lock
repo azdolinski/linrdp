@@ -2297,6 +2297,7 @@ dependencies = [
  "arboard",
  "async-trait",
  "byteorder",
+ "futures-util",
  "ironrdp-cliprdr",
  "ironrdp-cliprdr-native",
  "ironrdp-connector",

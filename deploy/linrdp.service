@@ -1,0 +1,24 @@
+# Example systemd unit: linrdp serving a headless Xvfb desktop.
+# Install to /etc/systemd/system/linrdp.service, copy linrdp to
+# /usr/local/bin/, then: systemctl enable --now linrdp
+#
+# The X server is a separate unit (linrdp-xvfb.service) so linrdp survives
+# X crashes and reconnects on its own.
+[Unit]
+Description=LinRDP - RDP server for Linux
+After=network-online.target linrdp-xvfb.service
+Wants=network-online.target
+Requires=linrdp-xvfb.service
+
+[Service]
+ExecStart=/usr/local/bin/linrdp --bind-addr 0.0.0.0:3389
+Environment=DISPLAY=:99
+Environment=XAUTHORITY=/run/linrdp/Xauthority
+Environment=LINRDP_LOG=info
+# /etc/shadow verification (and PAM fallback) need root.
+User=root
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

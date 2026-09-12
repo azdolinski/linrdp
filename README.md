@@ -38,6 +38,13 @@ Needs read access to `/etc/shadow` (root) and the X display to serve:
 sudo env DISPLAY=:99 XAUTHORITY=/home/user/.Xauthority \
   LINRDP_LOG=info ./target/release/linrdp
 # options: --bind-addr 0.0.0.0:3389   --usb   (USB redirection)
+#          --lock-session       lock the logind session when the last client
+#                                disconnects, unlock on reconnect
+#          --switch-to-greeter  flip the seat to the greeter when a client
+#                                takes over (linrdp owns the seat)
+#          --fixed-size WxH     pin the desktop size (clients scale locally)
+#          --wayland            xdg-desktop-portal capture + libei input
+#                                (binary built with --features wayland)
 ```
 
 On first start it generates a self-signed TLS certificate
@@ -57,6 +64,16 @@ microphone packets reach the server.
 
 ## Design
 
+- `deploy/` — example systemd units (`linrdp-xvfb.service` +
+  `linrdp.service`) for a headless Xvfb desktop with auto-restart
+- `linrdp/src/session_ctl.rs` — logind lock/unlock + greeter switch on
+  connect/disconnect (KRdp SessionController pattern, via zbus)
+- `linrdp/src/pam.rs` — PAM fallback authentication (dlopen libpam; used
+  when /etc/shadow cannot answer: unknown user, unsupported hash scheme,
+  LDAP/SSSD setups)
+- `linrdp/src/wayland/` — feature `wayland`: xdg-desktop-portal session
+  (zbus), PipeWire screencast frames, libei input — all dlopen'ed at
+  runtime, no build-time C dependencies
 - `crates/` — vendored IronRDP protocol crates (PDU, connector, acceptor,
   server skeleton, codecs, virtual channels)
 - `linrdp/src/main.rs` — binary: builder wiring (TLS + HYBRID-capable,

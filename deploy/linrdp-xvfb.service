@@ -1,0 +1,17 @@
+# Example systemd unit: the headless X server linrdp serves.
+# Install to /etc/systemd/system/linrdp-xvfb.service together with
+# linrdp.service. Screen size here is only the startup default; linrdp
+# resizes it per client (or pins it with --fixed-size WxH).
+[Unit]
+Description=LinRDP headless X server (Xvfb)
+Before=linrdp.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/mkdir -p /run/linrdp
+ExecStart=/usr/bin/Xvfb :99 -screen screen 1920x1080x24 -nolisten tcp -auth /run/linrdp/Xauthority
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

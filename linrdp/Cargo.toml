@@ -41,6 +41,8 @@ pico-args = "0.5"
 rcgen = "0.13"
 # Session lifecycle (logind lock/unlock, greeter switch) over the system bus.
 zbus = { version = "5", default-features = false, features = ["tokio"] }
+# MessageStream::next in the portal client.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [features]
 # Wayland capture path: xdg-desktop-portal + PipeWire + libei (see src/wayland).

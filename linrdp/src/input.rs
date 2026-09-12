@@ -35,7 +35,7 @@ const KEYCODE_SCROLL_LOCK: u8 = 78;
 /// scancodes. Extended (0xE0-prefixed) keys do NOT: the kernel assigned
 /// them dedicated numbers (KEY_LEFT=105 etc.), so they need this table.
 /// The old `+128` offset only fits the pre-evdev "kbd" driver layout.
-fn keycode_for(code: u8, extended: bool) -> Option<u8> {
+pub(crate) fn keycode_for(code: u8, extended: bool) -> Option<u8> {
     if !extended {
         return u8::try_from(u16::from(code) + 8).ok();
     }
@@ -338,8 +338,12 @@ impl RdpServerInputHandler for X11InputHandler {
                 // absolute mode is negotiated by default (RDP_CAPSET_POINTER).
             }
             MouseEvent::VerticalScroll { value } => {
-                // Positive value = wheel up (button 4), negative = down (5).
-                let steps = value.unsigned_abs().clamp(1, 10);
+                // `value` is wheel-rotation units — 120 per notch
+                // (MS-RDPBCGR 2.2.8.1.1.3.1.1.2, same convention KRdp feeds
+                // into PipeWire). mstsc sends ±120; anything smaller is a
+                // high-resolution device and still deserves one click.
+                // Positive = wheel up (button 4), negative = down (5).
+                let steps = (value.unsigned_abs() / 120).max(1);
                 let b = if value >= 0 { 4 } else { 5 };
                 for _ in 0..steps {
                     self.fake_button(b, true);
@@ -347,7 +351,7 @@ impl RdpServerInputHandler for X11InputHandler {
                 }
             }
             MouseEvent::HorizontalScroll { value } => {
-                let steps = value.unsigned_abs().clamp(1, 10);
+                let steps = (value.unsigned_abs() / 120).max(1);
                 let b = if value >= 0 { 7 } else { 6 };
                 for _ in 0..steps {
                     self.fake_button(b, true);

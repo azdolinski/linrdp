@@ -1,2 +1,5 @@
 /target
 vendor/IronRDP-upstream/target
+
+# Reference checkouts (third-party code kept for reading, not built here)
+tmp/

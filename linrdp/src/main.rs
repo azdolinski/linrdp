@@ -140,14 +140,68 @@ async fn main() -> anyhow::Result<()> {
     let autodetect_baseline = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
     let pointer_cache = Arc::new(std::sync::atomic::AtomicU16::new(0));
 
-    let mut server = RdpServer::builder()
-        .with_addr(bind_addr)
-        .with_hybrid(acceptor, identity.pub_key.clone())
-        .with_input_handler(X11InputHandler::connect().expect("X11 unavailable for input"))
-        .with_display_handler(gfx_display::EgfxDisplay::new(
+    // Capture/input backends. X11 is the default; `--wayland` (cargo
+    // feature "wayland") negotiates an xdg-desktop-portal session instead:
+    // PipeWire screencast for frames, libei over EIS for input.
+    #[cfg(feature = "wayland")]
+    let use_wayland = args.contains("--wayland");
+    #[cfg(not(feature = "wayland"))]
+    let use_wayland = {
+        if args.contains("--wayland") {
+            tracing::warn!("--wayland ignored: binary built without the \"wayland\" feature");
+        }
+        false
+    };
+
+    #[allow(clippy::redundant_clone)]
+    let (input_handler, display_factory): (
+        AnyInput,
+        Arc<dyn gfx_display::DisplaySourceFactory>,
+    ) = if use_wayland {
+        #[cfg(feature = "wayland")]
+        {
+            tracing::info!("negotiating xdg-desktop-portal session (Wayland)");
+            let restore_token = std::fs::read_to_string("/var/lib/linrdp/portal-restore-token").ok();
+            let handles = wayland::portal::PortalSession::connect(restore_token.as_deref())
+                .await
+                .expect("portal session failed");
+            let capture =
+                wayland::pipewire::PwCapture::start(handles.pipewire_fd, handles.stream.node_id, None)
+                    .expect("pipewire capture failed");
+            let input = match handles.eis_fd {
+                Some(fd) => wayland::ei::EiInputHandler::new(
+                    fd,
+                    (handles.stream.width, handles.stream.height),
+                )
+                .expect("libei setup failed"),
+                None => {
+                    anyhow::bail!("portal has no ConnectToEIS - Wayland input unavailable (update xdg-desktop-portal)");
+                }
+            };
+            (
+                AnyInput::Wayland(input),
+                Arc::new(wayland::pipewire::PwDisplayFactory::new(capture.shared())),
+            )
+        }
+        #[cfg(not(feature = "wayland"))]
+        {
+            unreachable!("--wayland without the wayland feature is rejected above")
+        }
+    } else {
+        (
+            AnyInput::X11(X11InputHandler::connect().expect("X11 unavailable for input")),
             Arc::new(capture::X11DisplayFactory::new(
                 X11Display::connect(fixed_size).expect("X11 display unavailable"),
             )),
+        )
+    };
+
+    let mut server = RdpServer::builder()
+        .with_addr(bind_addr)
+        .with_hybrid(acceptor, identity.pub_key.clone())
+        .with_input_handler(input_handler)
+        .with_display_handler(gfx_display::EgfxDisplay::new(
+            display_factory,
             Arc::clone(&gfx_session),
             Arc::clone(&display_suppressed),
             Arc::clone(&autodetect_rtt),
@@ -276,6 +330,32 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+
+/// Input backend selector for `--wayland`: `with_input_handler` is generic,
+/// so the variants are dispatched through one implementing type.
+enum AnyInput {
+    X11(X11InputHandler),
+    #[cfg(feature = "wayland")]
+    Wayland(wayland::ei::EiInputHandler),
+}
+
+impl ironrdp_server::RdpServerInputHandler for AnyInput {
+    fn keyboard(&mut self, event: ironrdp_server::KeyboardEvent) {
+        match self {
+            Self::X11(handler) => handler.keyboard(event),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(handler) => handler.keyboard(event),
+        }
+    }
+
+    fn mouse(&mut self, event: ironrdp_server::MouseEvent) {
+        match self {
+            Self::X11(handler) => handler.mouse(event),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(handler) => handler.mouse(event),
+        }
+    }
+}
 
 fn setup_logging(log_file: Option<&str>) {
     use tracing_subscriber::EnvFilter;
