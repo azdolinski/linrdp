@@ -304,7 +304,14 @@ impl AutoDetectManager {
                 // active windows. Only a genuinely fresh figure re-arms
                 // reporting (see `build_netchar_result`).
                 if let Some(bandwidth) = response.computed_bandwidth_kbps() {
-                    self.bandwidth_kbps = Some(bandwidth);
+                    // KRdp smooths the same figure with 0.5 weight: one 500 ms
+                    // window is bursty (frame pauses, ACK timing), and the raw
+                    // value drives the adaptive encoder — an unsmoothed figure
+                    // makes quality sawtooth and the encoder rebuild churn.
+                    self.bandwidth_kbps = Some(match self.bandwidth_kbps {
+                        Some(prev) => prev / 2 + bandwidth / 2,
+                        None => bandwidth,
+                    });
                     self.bandwidth_is_fresh = true;
                 }
                 AutoDetectOutcome::Bandwidth(self.bandwidth_kbps)

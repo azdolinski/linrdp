@@ -44,10 +44,13 @@ type GfxHandle = Arc<Mutex<GraphicsPipelineServer>>;
 const MOTION_NUM: u64 = 1;
 const MOTION_DEN: u64 = 8;
 
-/// Minimum spacing between H.264 encodes (~30 fps); the encoder is by far
-/// the most expensive step, and more than 30 fps of 4:2:0 video is wasted on
-/// an RDP link anyway.
-const H264_MIN_INTERVAL: Duration = Duration::from_millis(33);
+/// Minimum spacing between H.264 encodes. Purely a runaway guard: the
+/// multi-threaded camera-mode encoder encodes a frame in ~35 ms, so the poll
+/// pacing (~16 ms) is the real cap; this only stops a pathological loop from
+/// encoding faster than frames arrive. The old 33 ms value dated from the
+/// screen-content encoder and silently discarded two of every three grabs
+/// (each skip burned a full capture + damage pass).
+const H264_MIN_INTERVAL: Duration = Duration::from_millis(12);
 
 /// Hard ceiling for one X11 grab (screen read + tile diff). A frozen X
 /// server never errors — it just never replies — so silence past this means
@@ -336,6 +339,8 @@ impl RdpServerDisplay for EgfxDisplay {
             last_quality_update: Instant::now() - QUALITY_UPDATE_INTERVAL,
             enc_built: None,
             last_grab_start: Instant::now(),
+            grab_ms: 0.0,
+            process_ms: 0.0,
         }))
     }
 }
@@ -423,6 +428,10 @@ struct EgfxUpdates {
     /// When the last capture poll was started — paces grab starts to the
     /// poll interval in the event-driven loop.
     last_grab_start: Instant,
+    /// Smoothed capture-poll duration and frame-processing duration (YUV +
+    /// encode + send), for the heartbeat. EWMA, alpha 0.25.
+    grab_ms: f64,
+    process_ms: f64,
     /// Cursor shape cache: shape hash → cache slot. Bounded by the client's
     /// negotiated pointer cache size; LRU eviction frees a slot on overflow.
     cursor_cache: HashMap<u64, CursorCacheEntry>,
@@ -592,9 +601,12 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
             // later client would connect to a dead loop (black screen).
             // Dropping the future abandons whatever blocked; codec state is
             // rebuilt next frame.
+            let process_started = Instant::now();
             let frame_done = tokio::time::timeout(FRAME_PROCESS_TIMEOUT, self.egfx_frame(&handle, grab))
                 .await
                 .is_ok();
+            let process_ms = process_started.elapsed().as_secs_f64() * 1000.0;
+            self.process_ms = if self.process_ms == 0.0 { process_ms } else { self.process_ms * 0.75 + process_ms * 0.25 };
             if !frame_done {
                 tracing::error!(
                     process_timeout = ?FRAME_PROCESS_TIMEOUT,
@@ -1235,12 +1247,13 @@ impl EgfxUpdates {
         }
 
         // Adaptive encoder config: (re)build whenever the target bitrate
-        // drifted more than 10% or the rate-control frame-rate assumption
-        // more than 25% from what the running one was built with. Quality
-        // steps are throttled to QUALITY_UPDATE_INTERVAL, so this settles
-        // quickly; the openh264 wrapper has no runtime bitrate option, and a
-        // fresh encoder conveniently opens with an IDR, re-syncing the client
-        // after the change.
+        // drifted more than 25% or the rate-control frame-rate assumption more
+        // than 25% from what the running one was built with. Quality steps are
+        // throttled to QUALITY_UPDATE_INTERVAL; the wide hysteresis matters
+        // because every rebuild opens with an IDR (a ~0.5-1 MB burst at these
+        // bitrates) that itself spikes the measured goodput — a tight
+        // threshold made the encoder rebuild every step and the IDR bursts
+        // fed the quality oscillation right back.
         let target_bitrate = self.h264_bitrate_bps();
         let target_rate_fps = self.h264_rc_fps();
         // Stale means "no usable H.264 encoder at the current target": missing
@@ -1253,7 +1266,7 @@ impl EgfxUpdates {
             (true, Some((built_bitrate, built_rate_fps))) => {
                 let lo = built_bitrate.min(target_bitrate);
                 let hi = built_bitrate.max(target_bitrate);
-                if hi - lo > built_bitrate / 10 {
+                if hi - lo > built_bitrate / 4 {
                     true
                 } else {
                     // >25% rate-control fps drift.
@@ -1358,6 +1371,13 @@ impl EgfxUpdates {
         if self.hb_last.elapsed() < Duration::from_secs(5) {
             return;
         }
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "durations are non-negative milliseconds"
+        )]
+        let (grab_ms, process_ms) = (self.grab_ms as u64, self.process_ms as u64);
         tracing::info!(
             source,
             polls = self.hb_polls,
@@ -1365,6 +1385,8 @@ impl EgfxUpdates {
             suppressed = self.suppressed.load(Ordering::Relaxed),
             in_motion = self.in_motion,
             pending_full = self.pending_full,
+            grab_ms,
+            process_ms,
             "EGFX display heartbeat (5s window)"
         );
         self.hb_polls = 0;
