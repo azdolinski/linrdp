@@ -566,6 +566,7 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
                     "EGFX frame processing stalled — resetting encoders and motion state"
                 );
                 self.encoders = None;
+                self.enc_bitrate_bps = None;
                 self.in_motion = false;
                 self.pending_full = true;
             }
@@ -1050,9 +1051,13 @@ impl EgfxUpdates {
         }
         let full_kbit = full_quality_kbit(pixels);
 
-        let mut target = ((f64::from(goodput_kbit) / full_kbit) * 100.0)
+        let target = ((f64::from(goodput_kbit) / full_kbit) * 100.0)
             .round()
-            .clamp(f64::from(MIN_ADAPTIVE_QUALITY), 100.0) as i32;
+            .clamp(f64::from(MIN_ADAPTIVE_QUALITY), 100.0);
+        // Precision guard: the value is clamped into 10..=100 above, so the
+        // f64→i32 cast cannot truncate.
+        #[expect(clippy::as_conversions, clippy::cast_possible_truncation, reason = "clamped to 10..=100")]
+        let mut target = target as i32;
 
         let avg_rtt = self.rtt.load(Ordering::Relaxed);
         let min_rtt = self.rtt_baseline.load(Ordering::Relaxed);
@@ -1097,7 +1102,13 @@ impl EgfxUpdates {
             .map(|s| f64::from(s.width) * f64::from(s.height))
             .unwrap_or(f64::from(1920) * f64::from(1080));
         let kbit = full_quality_kbit(pixels) * f64::from(self.quality) / 100.0;
-        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "bitrate clamped below")]
+        // Precision guard: the kbit figure is clamped to a sane bitrate range.
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "clamped to 250 kbit/s..12 Mbit/s"
+        )]
         let bps = (kbit * 1000.0).clamp(250_000.0, f64::from(H264_BITRATE_CEILING_BPS)) as u32;
         bps
     }
@@ -1186,13 +1197,19 @@ impl EgfxUpdates {
         // fresh encoder conveniently opens with an IDR, re-syncing the client
         // after the rate change.
         let want_bps = self.h264_bitrate_bps();
-        let bitrate_stale = match self.enc_bitrate_bps {
-            None => true,
-            Some(built) => {
+        // Stale means "no usable H.264 encoder at the current target": missing
+        // entirely (first motion frame, post-stall reset), or built at a
+        // bitrate that drifted more than 10% from the current adaptive target.
+        let bitrate_stale = match (
+            self.encoders.as_ref().is_some_and(|e| e.h264.is_some()),
+            self.enc_bitrate_bps,
+        ) {
+            (true, Some(built)) => {
                 let lo = built.min(want_bps);
                 let hi = built.max(want_bps);
                 hi - lo > built / 10
             }
+            _ => true,
         };
         if bitrate_stale {
             match make_h264_encoder(want_bps) {

@@ -438,17 +438,18 @@ struct ShmCapture {
     conn: Arc<x11rb::rust_connection::RustConnection>,
     /// X resource id of the segment on `conn`.
     seg: u32,
-    /// SysV shared memory id. Not RMID'd after attach (see `create`), so the
-    /// segment can be re-attached on a fresh X connection after a reconnect.
-    #[allow(dead_code)]
+    /// SysV shared memory id. Deliberately NOT RMID'd after attach, so the
+    /// segment can be re-attached on a fresh X connection after a reconnect
+    /// (freed in `Drop` via RMID once both mappings are gone).
     shmid: i32,
     /// Our mapping of the segment, `size` bytes of ZPixmap data.
     addr: *mut u8,
     size: usize,
 }
 
-// The mapping is dereferenced only by the thread that owns the grabber
-// (ownership moves with ScreenGrabber into its blocking poll task).
+// SAFETY: the raw mapping is only ever dereferenced by `read`, on the thread
+// that owns the grabber; ownership moves with ScreenGrabber into its blocking
+// poll task, so no two threads can touch `addr` at the same time.
 unsafe impl Send for ShmCapture {}
 
 impl ShmCapture {
@@ -459,27 +460,35 @@ impl ShmCapture {
         // Extension present at all? (Missing MIT-SHM makes every request fail.)
         shm::query_version(conn).ok()?.reply().ok()?;
 
+        // SAFETY: plain SysV shmget with a private key; no invariants beyond
+        // the size, and failures are reported by the negative return value.
         let shmid = unsafe { libc::shmget(libc::IPC_PRIVATE, size, 0o600 | libc::IPC_CREAT) };
         if shmid < 0 {
             return None;
         }
-        let addr = unsafe { libc::shmat(shmid, std::ptr::null(), 0) };
-        if addr as isize == -1 {
-            unsafe { libc::shmctl(shmid, libc::IPC_RMID, std::ptr::null_mut()) };
+        // SAFETY: attaching the segment we just created; the only failure
+        // mode is MAP_FAILED.
+        let addr = unsafe { libc::shmat(shmid, core::ptr::null(), 0) };
+        if addr == libc::MAP_FAILED {
+            // SAFETY: marking the unusable segment for destruction; the id is
+            // valid (shmget succeeded above) and we never attached it.
+            unsafe { libc::shmctl(shmid, libc::IPC_RMID, core::ptr::null_mut()) };
             return None;
         }
 
-        let failure = |shmid: i32, addr: *mut u8| {
-            unsafe {
-                libc::shmdt(addr.cast());
-                libc::shmctl(shmid, libc::IPC_RMID, std::ptr::null_mut());
-            }
+        let failure = |shmid: i32, addr: *mut core::ffi::c_void| {
+            // SAFETY: `addr` is the mapping from shmat above, detached exactly
+            // once here.
+            unsafe { libc::shmdt(addr) };
+            // SAFETY: `shmid` is valid and, with both mappings now gone (we
+            // never let the server attach on these paths), destroyed by RMID.
+            unsafe { libc::shmctl(shmid, libc::IPC_RMID, core::ptr::null_mut()) };
         };
 
         let seg = match conn.generate_id() {
             Ok(seg) => seg,
             Err(_) => {
-                failure(shmid, addr.cast());
+                failure(shmid, addr);
                 return None;
             }
         };
@@ -489,13 +498,13 @@ impl ShmCapture {
             // while handling the request.
             Ok(cookie) => {
                 if cookie.check().is_err() {
-                    failure(shmid, addr.cast());
+                    failure(shmid, addr);
                     let _ = shm::detach(conn, seg);
                     return None;
                 }
             }
             Err(_) => {
-                failure(shmid, addr.cast());
+                failure(shmid, addr);
                 return None;
             }
         }
@@ -513,7 +522,7 @@ impl ShmCapture {
     fn read(&self) -> Vec<u8> {
         // SAFETY: the server wrote `size` bytes after our successful
         // ShmGetImage; we hold our own valid SysV mapping for the lifetime.
-        unsafe { std::slice::from_raw_parts(self.addr, self.size) }.to_vec()
+        unsafe { core::slice::from_raw_parts(self.addr, self.size) }.to_vec()
     }
 }
 
@@ -521,8 +530,11 @@ impl Drop for ShmCapture {
     fn drop(&mut self) {
         // SAFETY: `addr` came from shmat and is detached exactly once here.
         unsafe { libc::shmdt(self.addr.cast()) };
-        // Best effort: the server-side attachment also dies with the X
-        // connection, so the segment is fully freed either way.
+        // Mark the segment for destruction: with our mapping gone and the X
+        // server's attachment dying with the connection, the kernel frees it.
+        // Best effort — a dead connection releases its attachment anyway.
+        // SAFETY: `shmid` is our still-valid SysV id (never RMID'd before).
+        unsafe { libc::shmctl(self.shmid, libc::IPC_RMID, core::ptr::null_mut()) };
         let _ = shm::detach(&*self.conn, self.seg);
     }
 }
