@@ -44,7 +44,7 @@ impl GfxSession {
 
     /// The current connection's pipeline server, if attached.
     pub(crate) fn handle(&self) -> Option<GfxServerHandle> {
-        self.handle.lock().expect("GfxSession mutex poisoned").clone()
+        self.handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
     }
 
     pub(crate) fn ready(&self) -> bool {
@@ -54,7 +54,7 @@ impl GfxSession {
     /// Drain the pipeline server's output queue and ship it to the wire via
     /// the server event loop. Returns the drained byte count (for stats).
     pub(crate) fn drain_and_send(&self, handle: &GfxServerHandle) -> usize {
-        let mut server = handle.lock().expect("GfxServerHandle mutex poisoned");
+        let mut server = handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let drained = server.drain_output();
         let bytes = drained.iter().map(|m| m.size()).sum();
         let Some(channel_id) = server.channel_id() else {
@@ -65,7 +65,7 @@ impl GfxSession {
         let Ok(messages) = ironrdp_dvc::encode_dvc_messages(channel_id, drained, ChannelFlags::SHOW_PROTOCOL) else {
             return 0;
         };
-        let guard = self.sender.lock().expect("GfxSession mutex poisoned");
+        let guard = self.sender.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(sender) = guard.as_ref() {
             let _ = sender.send(ServerEvent::Egfx(EgfxServerMessage::SendMessages { messages }));
         }
@@ -106,7 +106,7 @@ impl LinrdpGfxFactory {
 
 impl ServerEventSender for LinrdpGfxFactory {
     fn set_sender(&mut self, sender: mpsc::UnboundedSender<ServerEvent>) {
-        *self.session.sender.lock().expect("GfxSession mutex poisoned") = Some(sender);
+        *self.session.sender.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sender);
     }
 }
 
@@ -125,7 +125,7 @@ impl GfxServerFactory for LinrdpGfxFactory {
         // New connection: reset the switch state. The display loop detects
         // the new handle by pointer identity and re-creates its surface.
         self.session.ready.store(false, Ordering::Relaxed);
-        *self.session.handle.lock().expect("GfxSession mutex poisoned") = Some(Arc::clone(&handle));
+        *self.session.handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&handle));
         Some((GfxDvcBridge::new(Arc::clone(&handle)), handle))
     }
 }

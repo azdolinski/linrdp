@@ -132,6 +132,11 @@ impl X11Display {
             self.display_name.clone(),
         )
     }
+
+    /// The X display this server captures (for reconnects).
+    pub(crate) fn display_name(&self) -> &str {
+        &self.display_name
+    }
 }
 
 #[async_trait::async_trait]
@@ -284,6 +289,25 @@ impl ScreenGrabber {
             display_name,
             consecutive_failures: 0,
         }
+    }
+
+    /// Connect a fresh grabber to `display_name` (blocking). Used at session
+    /// start and after an X server crash or freeze — the X server unit can
+    /// die and be restarted at any moment, and the startup connection must
+    /// never be assumed alive forever.
+    pub(crate) fn connect_new(display_name: &str) -> Option<Self> {
+        let (conn, screen_num) =
+            x11rb::rust_connection::RustConnection::connect(Some(display_name)).ok()?;
+        let setup = conn.setup();
+        let screen = setup.roots.get(screen_num)?;
+        let (root, width, height) = (screen.root, screen.width_in_pixels, screen.height_in_pixels);
+        Some(Self::new(
+            Arc::new(conn),
+            root,
+            width,
+            height,
+            display_name.to_owned(),
+        ))
     }
 
     /// Establish a fresh connection to the X display, adopting the new root

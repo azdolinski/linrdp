@@ -344,6 +344,11 @@ fn decode_utf16_lossy(data: &[u8]) -> String {
     String::from_utf16_lossy(&units)
 }
 
+/// Poller generation: each `on_ready` (channel re-initialization) spawns a
+/// fresh poller; older ones see the counter move and exit instead of leaking
+/// (and advertising in parallel) for the rest of the process lifetime.
+static POLLER_GENERATION: AtomicU32 = AtomicU32::new(0);
+
 #[derive(Debug)]
 pub(crate) struct X11CliprdrBackend {
     proxy: Arc<Mutex<Option<Box<dyn ClipboardMessageProxy>>>>,
@@ -506,6 +511,7 @@ impl CliprdrBackend for X11CliprdrBackend {
         let echo_guard = Arc::clone(&self.echo_guard);
         let display = self.display.clone();
         let xauthority = self.xauthority.clone();
+        let generation = POLLER_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
 
         let spawned = std::thread::Builder::new()
             .name("linrdp-cliprdr-poll".into())
@@ -522,6 +528,10 @@ impl CliprdrBackend for X11CliprdrBackend {
                 let mut last_files: Option<String> = None;
                 loop {
                     std::thread::sleep(Duration::from_millis(700));
+                    if POLLER_GENERATION.load(Ordering::Relaxed) != generation {
+                        tracing::debug!("clipboard: stale poller exiting");
+                        break;
+                    }
                     let Ok(mut board) = arboard::Clipboard::new() else { continue };
                     let Ok(text) = board.get_text() else { continue };
 
@@ -618,6 +628,17 @@ impl CliprdrBackend for X11CliprdrBackend {
                 .find(|f| f.name.as_ref().map(|n| n.value() == want).unwrap_or(false))
         };
 
+        // Log every format list verbatim: this is the primary diagnostic for
+        // "copy on Windows does nothing on the server".
+        let summary: Vec<String> = formats
+            .iter()
+            .map(|f| match &f.name {
+                Some(name) => format!("{}#{}", name.value(), f.id.0),
+                None => format!("#{}", f.id.0),
+            })
+            .collect();
+        tracing::info!(formats = ?summary, "clipboard: client format list");
+
         self.copy_generation = self.copy_generation.wrapping_add(1);
         self.image_fetch = None;
 
@@ -658,6 +679,8 @@ impl CliprdrBackend for X11CliprdrBackend {
                     self.incoming = Some(IncomingKind::Text);
                     self.incoming_gen = self.copy_generation;
                     self.send_msg(ClipboardMessage::SendInitiatePaste(CF_UNICODETEXT));
+                } else {
+                    tracing::debug!("clipboard: no supported format in client format list");
                 }
             }
         }

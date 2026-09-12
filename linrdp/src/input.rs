@@ -27,6 +27,43 @@ const KEYCODE_CAPS_LOCK: u8 = 66;
 const KEYCODE_NUM_LOCK: u8 = 77;
 const KEYCODE_SCROLL_LOCK: u8 = 78;
 
+/// Translate an RDP scancode (XT set 1, MS-RDPBCGR 2.2.8.1.1.3.1.1.1) to an
+/// X keycode on the evdev layout every modern X server uses (X keycode =
+/// Linux input keycode + 8). Non-extended scancodes keep the identity
+/// `scancode + 8` because the Linux main-block keycodes equal set 1
+/// scancodes. Extended (0xE0-prefixed) keys do NOT: the kernel assigned
+/// them dedicated numbers (KEY_LEFT=105 etc.), so they need this table.
+/// The old `+128` offset only fits the pre-evdev "kbd" driver layout.
+fn keycode_for(code: u8, extended: bool) -> Option<u8> {
+    if !extended {
+        return u8::try_from(u16::from(code) + 8).ok();
+    }
+    match code {
+        0x1C => Some(104), // KP_Enter
+        0x1D => Some(105), // Control_R
+        0x35 => Some(106), // KP_Divide
+        0x37 => Some(107), // PrintScreen
+        0x38 => Some(108), // AltGr (Alt_R)
+        0x47 => Some(110), // Home
+        0x48 => Some(111), // Up
+        0x49 => Some(112), // PageUp
+        0x4B => Some(113), // Left
+        0x4D => Some(114), // Right
+        0x4F => Some(115), // End
+        0x50 => Some(116), // Down
+        0x51 => Some(117), // PageDown
+        0x52 => Some(118), // Insert
+        0x53 => Some(119), // Delete
+        0x5B => Some(133), // Super_L
+        0x5C => Some(134), // Super_R
+        0x5D => Some(135), // Menu
+        // Unknown 0xE0-prefixed scancode: keep the legacy +128 offset as a
+        // last resort; on evdev layouts those keycodes are unassigned, so
+        // the event is simply a no-op rather than a wrong key.
+        _ => u8::try_from(u16::from(code) + 8 + 128).ok(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct X11InputHandler {
     conn: Arc<x11rb::rust_connection::RustConnection>,
@@ -212,17 +249,12 @@ impl RdpServerInputHandler for X11InputHandler {
         tracing::debug!(?event, "input: keyboard");
         match event {
             KeyboardEvent::Pressed { code, extended } => {
-                // RDP scancodes are XT scancodes; X11 keycodes are scancode + 8.
-                // Extended (right Ctrl/Alt etc.) prefix 0xE0 maps onto keycode
-                // offset 128 in classic X11 layouts; without it most keys work.
-                let base = u16::from(code) + 8 + u16::from(extended) * 128;
-                if let Ok(kc) = u8::try_from(base) {
+                if let Some(kc) = keycode_for(code, extended) {
                     self.fake_key(kc, true);
                 }
             }
             KeyboardEvent::Released { code, extended } => {
-                let base = u16::from(code) + 8 + u16::from(extended) * 128;
-                if let Ok(kc) = u8::try_from(base) {
+                if let Some(kc) = keycode_for(code, extended) {
                     self.fake_key(kc, false);
                 }
             }
@@ -277,5 +309,29 @@ impl RdpServerInputHandler for X11InputHandler {
             _ => {}
         }
         let _ = self.conn.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::keycode_for;
+
+    // Expected keycodes verified against the live Xvfb keymap (evdev
+    // layout, `xmodmap -pk`): Up=111, Left=113, Right=114, Down=116.
+    #[test]
+    fn extended_keys_map_to_evdev_keycodes() {
+        assert_eq!(keycode_for(0x48, true), Some(111)); // Up
+        assert_eq!(keycode_for(0x4B, true), Some(113)); // Left
+        assert_eq!(keycode_for(0x4D, true), Some(114)); // Right
+        assert_eq!(keycode_for(0x50, true), Some(116)); // Down
+        assert_eq!(keycode_for(0x1D, true), Some(105)); // Control_R
+        assert_eq!(keycode_for(0x38, true), Some(108)); // AltGr
+        assert_eq!(keycode_for(0x53, true), Some(119)); // Delete
+    }
+
+    #[test]
+    fn plain_keys_stay_scancode_plus_eight() {
+        assert_eq!(keycode_for(0x1E, false), Some(38)); // 'a'
+        assert_eq!(keycode_for(0x3A, false), Some(66)); // CapsLock
     }
 }

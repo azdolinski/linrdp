@@ -45,6 +45,23 @@ const MOTION_DENOM: usize = 4;
 /// an RDP link anyway.
 const H264_MIN_INTERVAL: Duration = Duration::from_millis(33);
 
+/// Hard ceiling for one X11 grab (screen read + tile diff). A frozen X
+/// server never errors — it just never replies — so silence past this means
+/// the connection is dead weight: the grab task is abandoned and a fresh
+/// connection replaces it.
+const GRAB_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Hard ceiling for connecting a replacement grabber, same rationale as
+/// [`GRAB_TIMEOUT`].
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Hard ceiling for processing one grab (encode + queue + drain). Whatever
+/// wedges inside — encoder deadlock, a lock held across a stuck writer — the
+/// loop resets its codec state and keeps running instead of freezing the
+/// display forever (seen as a "static screenshot" session, followed by a
+/// black-screen session once a new client connects and gets no frames).
+const FRAME_PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// H.264 target bitrate. Rate control runs in quality mode, so this is a
 /// ceiling that keeps pathological frames (noise, fast scroll) bounded.
 const H264_BITRATE_BPS: u32 = 12_000_000;
@@ -110,7 +127,8 @@ impl RdpServerDisplay for EgfxDisplay {
 
     async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
         Ok(Box::new(EgfxUpdates {
-            grabber: self.x11.grabber(),
+            grabber: Some(self.x11.grabber()),
+            display_name: self.x11.display_name().to_owned(),
             session: Arc::clone(&self.session),
             suppressed: Arc::clone(&self.suppressed),
             encoders: None,
@@ -120,6 +138,7 @@ impl RdpServerDisplay for EgfxDisplay {
             pending_full: true,
             in_motion: false,
             motion_until: Instant::now(),
+            last_grabber_connect: Instant::now() - Duration::from_secs(1),
             hb_polls: 0,
             hb_damaged: 0,
             hb_last: Instant::now(),
@@ -135,7 +154,8 @@ impl RdpServerDisplay for EgfxDisplay {
 }
 
 struct EgfxUpdates {
-    grabber: ScreenGrabber,
+    grabber: Option<ScreenGrabber>,
+    display_name: String,
     session: Arc<GfxSession>,
     suppressed: Arc<AtomicBool>,
     /// Taken out per frame for `spawn_blocking`; re-created if a blocking
@@ -155,6 +175,8 @@ struct EgfxUpdates {
     /// between exact and 4:2:0-lossy colors — the user-visible pulse).
     in_motion: bool,
     motion_until: Instant,
+    /// Throttle for (re)connecting the X grabber when none is present.
+    last_grabber_connect: Instant,
     /// Heartbeat counters: make a stalled loop (no damage, wedged grab,
     /// stuck suppress) visible in the logs instead of silent.
     hb_polls: u64,
@@ -182,14 +204,9 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
                 continue;
             }
 
-            let Some(grab) = self.grabber.poll() else {
-                self.hb_polls += 1;
-                self.heartbeat(false);
+            let Some(grab) = self.grabbed().await else {
                 continue;
             };
-            self.hb_polls += 1;
-            self.hb_damaged += u64::from(grab.damage.is_some());
-            self.heartbeat(true);
 
             let Some(handle) = self.session.handle() else {
                 // No EGFX connection — legacy bitmap path.
@@ -200,7 +217,7 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
             };
 
             let egfx_active = {
-                let server = handle.lock().expect("GfxServerHandle mutex poisoned");
+                let server = Self::lock_handle(&handle);
                 self.session.ready() && server.is_ready()
             };
             if !egfx_active {
@@ -210,13 +227,112 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
                 continue;
             }
 
-            self.egfx_frame(&handle, grab).await;
-            // EGFX mode never yields a legacy update; keep polling.
+            // Bounded processing: a wedged encoder or a lock held across a
+            // stuck writer must not freeze the whole display pipeline — the
+            // session would show one last static frame forever, and every
+            // later client would connect to a dead loop (black screen).
+            // Dropping the future abandons whatever blocked; codec state is
+            // rebuilt next frame.
+            if tokio::time::timeout(FRAME_PROCESS_TIMEOUT, self.egfx_frame(&handle, grab))
+                .await
+                .is_err()
+            {
+                tracing::error!(
+                    process_timeout = ?FRAME_PROCESS_TIMEOUT,
+                    "EGFX frame processing stalled — resetting encoders and motion state"
+                );
+                self.encoders = None;
+                self.in_motion = false;
+                self.pending_full = true;
+            }
         }
     }
 }
 
 impl EgfxUpdates {
+    /// Grab one frame with a hard timeout, (re)connecting to the X server as
+    /// needed. `None` means "nothing this tick" — the caller retries.
+    async fn grabbed(&mut self) -> Option<Grab> {
+        let Some(mut grabber) = self.grabber.take() else {
+            self.maybe_reconnect_grabber().await;
+            return None;
+        };
+        self.hb_polls += 1;
+        let joined = tokio::time::timeout(
+            GRAB_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                let grab = grabber.poll();
+                (grabber, grab)
+            }),
+        )
+        .await;
+        match joined {
+            Ok(Ok((grabber, grab))) => {
+                self.grabber = Some(grabber);
+                self.hb_damaged += u64::from(grab.as_ref().is_some_and(|g| g.damage.is_some()));
+                self.heartbeat(true);
+                grab
+            }
+            Ok(Err(join_err)) => {
+                // The poll panicked: the grabber was lost with the task, the
+                // loop rebuilds one next tick. (A panic in an async task
+                // would otherwise kill the display loop silently.)
+                tracing::warn!(error = %join_err, "X grab task panicked — rebuilding grabber");
+                None
+            }
+            Err(_) => {
+                // Frozen X server: the socket is alive but replies never
+                // come. The task (and the grabber inside it) is abandoned;
+                // a fresh connection replaces it, and the dropped
+                // prev_frame forces a full repaint once X responds again.
+                tracing::warn!(
+                    display = %self.display_name,
+                    timeout = ?GRAB_TIMEOUT,
+                    "X grab timed out — X server frozen? abandoning its connection"
+                );
+                None
+            }
+        }
+    }
+
+    /// Throttled reconnect for a missing/abandoned grabber.
+    async fn maybe_reconnect_grabber(&mut self) {
+        if self.last_grabber_connect.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.last_grabber_connect = Instant::now();
+        let display_name = self.display_name.clone();
+        let joined = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            tokio::task::spawn_blocking(move || ScreenGrabber::connect_new(&display_name)),
+        )
+        .await;
+        match joined {
+            Ok(Ok(Some(grabber))) => {
+                tracing::info!(display = %self.display_name, "X grabber (re)connected");
+                self.grabber = Some(grabber);
+            }
+            Ok(Ok(None)) => {
+                tracing::warn!(display = %self.display_name, "X connect failed — screen unavailable, retrying");
+            }
+            Ok(Err(join_err)) => {
+                tracing::warn!(error = %join_err, "X connect task panicked — retrying");
+            }
+            Err(_) => {
+                tracing::warn!(display = %self.display_name, "X connect timed out — X server frozen? retrying");
+            }
+        }
+    }
+
+    /// Lock the pipeline server, surviving a poisoned mutex: a panic on
+    /// another thread must not take the display loop down with it.
+    /// Lock the pipeline server, surviving a poisoned mutex: a panic on
+    /// another thread must not take the display loop down with it.
+    fn lock_handle<'a>(handle: &'a GfxHandle) -> std::sync::MutexGuard<'a, GraphicsPipelineServer> {
+        handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
     /// Process one grab through the graphics pipeline.
     async fn egfx_frame(&mut self, handle: &GfxHandle, grab: Grab) {
         // New connection or screen resize: re-create the surface.
@@ -245,7 +361,7 @@ impl EgfxUpdates {
         if let Some(surface) = self.surface {
             let alive = handle
                 .lock()
-                .expect("GfxServerHandle mutex poisoned")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get_surface(surface.id)
                 .is_some();
             if !alive {
@@ -267,7 +383,7 @@ impl EgfxUpdates {
 
         // Backpressure (MS-RDPEGFX 2.2.4.3): the client is behind — skip the
         // frame entirely; the full-frame send that follows covers this grab.
-        if handle.lock().expect("GfxServerHandle mutex poisoned").should_backpressure() {
+        if handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).should_backpressure() {
             self.pending_full = true;
             return;
         }
@@ -347,7 +463,7 @@ impl EgfxUpdates {
     fn ensure_surface(&mut self, handle: &GfxHandle, width: u16, height: u16) {
         let pad_width = width.div_ceil(16) * 16; // H.264 macroblock alignment
         let pad_height = height.div_ceil(16) * 16;
-        let mut server = handle.lock().expect("GfxServerHandle mutex poisoned");
+        let mut server = handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if self.surface.is_some() {
             // Mid-session resize: full EGFX reset sequence.
@@ -425,7 +541,7 @@ impl EgfxUpdates {
             right: x + w,
             bottom: y + h,
         };
-        let mut server = handle.lock().expect("GfxServerHandle mutex poisoned");
+        let mut server = handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let sent = server.send_clearcodec_frame(surface.id, dest, stream, ts);
         drop(server);
 
@@ -506,7 +622,7 @@ impl EgfxUpdates {
             quantization_parameter: 21, // low QP = high quality
             quality: 90,
         };
-        let mut server = handle.lock().expect("GfxServerHandle mutex poisoned");
+        let mut server = handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let sent = server.send_avc420_frame(surface.id, &bitstream, &[region], ts);
         drop(server);
 
@@ -567,7 +683,7 @@ impl EgfxUpdates {
             let in_flight = self
                 .generation
                 .as_ref()
-                .map(|g| g.lock().expect("GfxServerHandle mutex poisoned").frames_in_flight())
+                .map(|g| g.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).frames_in_flight())
                 .unwrap_or(0);
             tracing::info!(
                 frames = self.stat_frames,
