@@ -2313,6 +2313,7 @@ dependencies = [
  "ironrdp-rdpsnd",
  "ironrdp-server",
  "ironrdp-svc",
+ "libc",
  "libpulse-binding",
  "md5",
  "openh264",

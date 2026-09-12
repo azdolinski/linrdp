@@ -15,7 +15,9 @@ async-trait = "0.1"
 sha-crypt = "0.5"
 yescrypt = { version = "0.1", features = ["password-hash"] }
 md5 = "0.7"
-x11rb = { version = "0.13", features = ["xtest", "randr", "xfixes"] }
+x11rb = { version = "0.13", features = ["xtest", "randr", "xfixes", "shm"] }
+# SysV shared memory allocation for MIT-SHM screen grabs (shmget/shmat).
+libc = "0.2"
 ironrdp-rdpsnd = { path = "../crates/ironrdp-rdpsnd" }
 ironrdp-displaycontrol = { path = "../crates/ironrdp-displaycontrol" }
 ironrdp-rdpeai = { path = "../crates/ironrdp-rdpeai" }

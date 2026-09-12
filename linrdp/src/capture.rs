@@ -1,5 +1,11 @@
 //! Real X11 screen capture via x11rb (pure Rust, no external binaries).
 //! Polls the root window with GetImage and serves the frame when it changes.
+//!
+//! Grabs prefer the MIT-SHM extension: the X server writes the frame straight
+//! into a SysV shared-memory segment we mapped, skipping the full-frame
+//! socket round trip of a core-protocol `GetImage` reply — the dominant
+//! per-grab cost at high resolutions. Everything falls back to the core
+//! protocol when MIT-SHM is unavailable (remote X, restricted SysV limits).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -9,8 +15,9 @@ use core::time::Duration;
 
 use anyhow::Context as _;
 use x11rb::connection::Connection as _;
+use x11rb::protocol::shm;
 use x11rb::protocol::xfixes::ConnectionExt as _;
-use x11rb::protocol::xproto::ConnectionExt as _;
+use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat};
 
 use ironrdp_connector::DesktopSize;
 use ironrdp_server::{
@@ -418,6 +425,108 @@ const GRAB_FAILURES_BEFORE_RECONNECT: u32 = 30;
 /// While the X server stays unreachable, retry the reconnect this often.
 const GRAB_RECONNECT_RETRY_EVERY: u32 = 60;
 
+/// Consecutive MIT-SHM grab failures tolerated before falling back to
+/// core-protocol GetImage permanently. A stray failure is usually a transient
+/// geometry race (BadMatch on resize); a systematically broken SHM setup
+/// (missing extension, non-local display, tight `shmmax`) shows up as a run.
+const SHM_MAX_FAILURES: u32 = 5;
+
+/// A MIT-SHM segment attached to the grabber's X connection: the server
+/// writes `ShmGetImage` results straight into this memory instead of
+/// streaming the whole frame back over the socket.
+struct ShmCapture {
+    conn: Arc<x11rb::rust_connection::RustConnection>,
+    /// X resource id of the segment on `conn`.
+    seg: u32,
+    /// SysV shared memory id. Not RMID'd after attach (see `create`), so the
+    /// segment can be re-attached on a fresh X connection after a reconnect.
+    #[allow(dead_code)]
+    shmid: i32,
+    /// Our mapping of the segment, `size` bytes of ZPixmap data.
+    addr: *mut u8,
+    size: usize,
+}
+
+// The mapping is dereferenced only by the thread that owns the grabber
+// (ownership moves with ScreenGrabber into its blocking poll task).
+unsafe impl Send for ShmCapture {}
+
+impl ShmCapture {
+    /// Allocate a SysV segment for one `width`×`height` 32-bpp frame and
+    /// attach it to the X server. `None` = MIT-SHM unusable right now.
+    fn create(conn: &Arc<x11rb::rust_connection::RustConnection>, width: u16, height: u16) -> Option<Self> {
+        let size = usize::from(width) * usize::from(height) * 4;
+        // Extension present at all? (Missing MIT-SHM makes every request fail.)
+        shm::query_version(conn).ok()?.reply().ok()?;
+
+        let shmid = unsafe { libc::shmget(libc::IPC_PRIVATE, size, 0o600 | libc::IPC_CREAT) };
+        if shmid < 0 {
+            return None;
+        }
+        let addr = unsafe { libc::shmat(shmid, std::ptr::null(), 0) };
+        if addr as isize == -1 {
+            unsafe { libc::shmctl(shmid, libc::IPC_RMID, std::ptr::null_mut()) };
+            return None;
+        }
+
+        let failure = |shmid: i32, addr: *mut u8| {
+            unsafe {
+                libc::shmdt(addr.cast());
+                libc::shmctl(shmid, libc::IPC_RMID, std::ptr::null_mut());
+            }
+        };
+
+        let seg = match conn.generate_id() {
+            Ok(seg) => seg,
+            Err(_) => {
+                failure(shmid, addr.cast());
+                return None;
+            }
+        };
+        match shm::attach(conn, seg, u32::try_from(shmid).ok()?, false) {
+            // check() waits for the server to process the attach — required
+            // before RMID below, because the X server performs its own shmat
+            // while handling the request.
+            Ok(cookie) => {
+                if cookie.check().is_err() {
+                    failure(shmid, addr.cast());
+                    let _ = shm::detach(conn, seg);
+                    return None;
+                }
+            }
+            Err(_) => {
+                failure(shmid, addr.cast());
+                return None;
+            }
+        }
+
+        Some(Self {
+            conn: Arc::clone(conn),
+            seg,
+            shmid,
+            addr: addr.cast(),
+            size,
+        })
+    }
+
+    /// Copy the last-written frame out of the segment.
+    fn read(&self) -> Vec<u8> {
+        // SAFETY: the server wrote `size` bytes after our successful
+        // ShmGetImage; we hold our own valid SysV mapping for the lifetime.
+        unsafe { std::slice::from_raw_parts(self.addr, self.size) }.to_vec()
+    }
+}
+
+impl Drop for ShmCapture {
+    fn drop(&mut self) {
+        // SAFETY: `addr` came from shmat and is detached exactly once here.
+        unsafe { libc::shmdt(self.addr.cast()) };
+        // Best effort: the server-side attachment also dies with the X
+        // connection, so the segment is fully freed either way.
+        let _ = shm::detach(&*self.conn, self.seg);
+    }
+}
+
 /// Reusable screen poller: grabs the X11 root and computes tile-level damage
 /// against the previous grab. Shared by the legacy bitmap path (`Updates`)
 /// and the EGFX display backend.
@@ -432,6 +541,14 @@ pub(crate) struct ScreenGrabber {
     /// Whether XFixes QueryVersion has been exchanged on this connection
     /// (reset by reconnect — a fresh connection must renegotiate).
     xfixes_negotiated: bool,
+    /// Active MIT-SHM segment, sized for the current geometry. `None` until
+    /// first use, after a geometry change, or when broken (see below).
+    shm: Option<ShmCapture>,
+    /// Consecutive SHM grab failures; past [`SHM_MAX_FAILURES`] the core
+    /// GetImage path is used permanently.
+    shm_failures: u32,
+    /// Set once MIT-SHM has been judged unusable — no further attempts.
+    shm_broken: bool,
 }
 
 impl ScreenGrabber {
@@ -451,6 +568,9 @@ impl ScreenGrabber {
             display_name,
             consecutive_failures: 0,
             xfixes_negotiated: false,
+            shm: None,
+            shm_failures: 0,
+            shm_broken: false,
         }
     }
 
@@ -490,6 +610,12 @@ impl ScreenGrabber {
                 self.conn = Arc::new(conn);
                 self.prev_frame = None;
                 self.xfixes_negotiated = false;
+                // The old segment is bound to the dead connection; a fresh one
+                // is created lazily on the next grab (SHM itself is retried —
+                // whatever broke may have been the connection, not SHM).
+                self.shm = None;
+                self.shm_failures = 0;
+                self.shm_broken = false;
                 true
             }
             Err(_) => false,
@@ -505,11 +631,59 @@ impl ScreenGrabber {
             .unwrap_or((self.width, self.height))
     }
 
-    fn grab(&self) -> Option<(Vec<u8>, u16, u16)> {
+    /// Grab the current root-window contents, preferring the MIT-SHM path
+    /// (server writes into our shared segment; no full-frame socket transfer).
+    /// Falls back to core GetImage while SHM is failing (bounded) and
+    /// permanently once it is judged unusable. `None` on transient X11
+    /// failure (retry next tick).
+    fn grab(&mut self) -> Option<(Vec<u8>, u16, u16)> {
         let (w, h) = self.current_geometry();
+        let want = usize::from(w) * usize::from(h) * 4;
+
+        // Geometry changed since the segment was sized: rebuild at the new
+        // size (drops the old segment via Drop).
+        if self.shm.as_ref().is_some_and(|capture| capture.size != want) {
+            self.shm = None;
+        }
+        if self.shm.is_none() && !self.shm_broken && want > 0 {
+            match ShmCapture::create(&self.conn, w, h) {
+                Some(capture) => self.shm = Some(capture),
+                None => {
+                    // No MIT-SHM (extension missing, /proc/sys/kernel/shmmax
+                    // too small, remote X server): core GetImage still works.
+                    self.shm_broken = true;
+                    tracing::info!("MIT-SHM unavailable — using core-protocol GetImage");
+                }
+            }
+        }
+
+        if let Some(capture) = self.shm.as_ref() {
+            let grabbed = shm::get_image(&*capture.conn, self.root, 0, 0, w, h, !0, u8::from(ImageFormat::Z_PIXMAP), capture.seg, 0)
+                .ok()
+                .and_then(|cookie| cookie.reply().ok())
+                .map(|_| capture.read());
+            match grabbed {
+                Some(data) => {
+                    self.shm_failures = 0;
+                    return Some((data, w, h));
+                }
+                None => {
+                    // One failure can be a transient resize race (BadMatch);
+                    // fall through to the core path THIS grab so the frame is
+                    // not lost, and only give up on SHM after a run of them.
+                    self.shm_failures += 1;
+                    self.shm = None;
+                    if self.shm_failures >= SHM_MAX_FAILURES {
+                        self.shm_broken = true;
+                        tracing::warn!(failures = self.shm_failures, "MIT-SHM keeps failing — using core-protocol GetImage");
+                    }
+                }
+            }
+        }
+
         self.conn
             .get_image(
-                x11rb::protocol::xproto::ImageFormat::Z_PIXMAP,
+                ImageFormat::Z_PIXMAP,
                 self.root,
                 0,
                 0,
