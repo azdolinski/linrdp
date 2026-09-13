@@ -1148,7 +1148,12 @@ fn create_gcc_blocks(
 ) -> gcc::ServerGccBlocks {
     gcc::ServerGccBlocks {
         core: gcc::ServerCoreData {
-            version: gcc::RdpVersion::V5_PLUS,
+            // Announce an RDP 10.7-era server (Server 2022/Win11 class): mstsc
+            // gates client-side features on the server version — notably its
+            // SYN offered RDP-UDP v1/v2 while this announced V5_PLUS
+            // (0x00080004), and version 3 of the UDP protocol (RDP-UDP2) is
+            // what this server implements.
+            version: gcc::RdpVersion::V10_7,
             optional_data: gcc::ServerCoreOptionalData {
                 client_requested_protocols: Some(requested),
                 early_capability_flags: skip_channel_join
