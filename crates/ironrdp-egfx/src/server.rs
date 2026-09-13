@@ -689,6 +689,9 @@ pub struct CodecCapabilities {
     pub avc420: bool,
     /// AVC444 (H.264 4:4:4) is available
     pub avc444: bool,
+
+    /// AVC444v2 layout (cap version >= 10.6) is available.
+    pub avc444v2: bool,
     /// Small cache mode
     pub small_cache: bool,
     /// Thin client mode
@@ -702,24 +705,28 @@ impl CodecCapabilities {
             CapabilitySet::V8 { flags } => Self {
                 avc420: false,
                 avc444: false,
+                avc444v2: false,
                 small_cache: flags.contains(CapabilitiesV8Flags::SMALL_CACHE),
                 thin_client: flags.contains(CapabilitiesV8Flags::THIN_CLIENT),
             },
             CapabilitySet::V8_1 { flags } => Self {
                 avc420: flags.contains(CapabilitiesV81Flags::AVC420_ENABLED),
                 avc444: false,
+                avc444v2: false,
                 small_cache: flags.contains(CapabilitiesV81Flags::SMALL_CACHE),
                 thin_client: flags.contains(CapabilitiesV81Flags::THIN_CLIENT),
             },
             CapabilitySet::V10 { flags } | CapabilitySet::V10_2 { flags } => Self {
                 avc420: !flags.contains(CapabilitiesV10Flags::AVC_DISABLED),
                 avc444: !flags.contains(CapabilitiesV10Flags::AVC_DISABLED),
+                avc444v2: false,
                 small_cache: flags.contains(CapabilitiesV10Flags::SMALL_CACHE),
                 thin_client: false,
             },
             CapabilitySet::V10_1 => Self {
                 avc420: true,
                 avc444: true,
+                avc444v2: false,
                 small_cache: false,
                 thin_client: false,
             },
@@ -727,21 +734,31 @@ impl CodecCapabilities {
                 // V10.3 lacks SMALL_CACHE flag
                 avc420: !flags.contains(CapabilitiesV103Flags::AVC_DISABLED),
                 avc444: !flags.contains(CapabilitiesV103Flags::AVC_DISABLED),
+                avc444v2: false,
                 small_cache: false,
                 thin_client: flags.contains(CapabilitiesV103Flags::AVC_THIN_CLIENT),
             },
             CapabilitySet::V10_4 { flags }
-            | CapabilitySet::V10_5 { flags }
-            | CapabilitySet::V10_6 { flags }
+            | CapabilitySet::V10_5 { flags } => Self {
+                avc420: !flags.contains(CapabilitiesV104Flags::AVC_DISABLED),
+                avc444: !flags.contains(CapabilitiesV104Flags::AVC_DISABLED),
+                avc444v2: false,
+                small_cache: flags.contains(CapabilitiesV104Flags::SMALL_CACHE),
+                thin_client: flags.contains(CapabilitiesV104Flags::AVC_THIN_CLIENT),
+            },
+            // 10.6+ understands the AVC444v2 layout.
+            CapabilitySet::V10_6 { flags }
             | CapabilitySet::V10_6Err { flags } => Self {
                 avc420: !flags.contains(CapabilitiesV104Flags::AVC_DISABLED),
                 avc444: !flags.contains(CapabilitiesV104Flags::AVC_DISABLED),
+                avc444v2: true,
                 small_cache: flags.contains(CapabilitiesV104Flags::SMALL_CACHE),
                 thin_client: flags.contains(CapabilitiesV104Flags::AVC_THIN_CLIENT),
             },
             CapabilitySet::V10_7 { flags } => Self {
                 avc420: !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
                 avc444: !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
+                avc444v2: true,
                 small_cache: flags.contains(CapabilitiesV107Flags::SMALL_CACHE),
                 thin_client: flags.contains(CapabilitiesV107Flags::AVC_THIN_CLIENT),
             },
@@ -1120,6 +1137,12 @@ impl GraphicsPipelineServer {
     #[must_use]
     pub fn supports_avc444(&self) -> bool {
         self.codec_caps.avc444
+    }
+
+    /// Check if the AVC444v2 layout (cap version >= 10.6) is available
+    #[must_use]
+    pub fn supports_avc444v2(&self) -> bool {
+        self.codec_caps.avc444v2
     }
 
     /// Get the graphics output buffer dimensions

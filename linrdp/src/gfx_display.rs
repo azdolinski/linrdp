@@ -8,9 +8,11 @@
 //!   mandatory-lossless EGFX codec, exactly the "crisp text" path Windows
 //!   uses for static content;
 //! - small damage (typing, cursor, UI): a lossless ClearCodec rectangle;
-//! - large damage (video, scrolling): a full-frame **H.264 AVC420** encode
+//! - large damage (video, scrolling): a full-frame **H.264** encode
 //!   (OpenH264, camera-class coding tools with multi-threaded size-limited
-//!   slices, bitrate-target rate control).
+//!   slices, bitrate-target rate control). Clients with cap version >= 10.6
+//!   get **AVC444v2** — full-resolution chroma, dual-view encoding — while
+//!   the rest get AVC420.
 //!
 //! If the channel is not negotiated (older clients, macOS Microsoft Remote
 //! Desktop), or it goes down mid-session, the loop transparently falls back
@@ -22,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ironrdp_egfx::pdu::{Avc420Region, PixelFormat};
+use ironrdp_egfx::pdu::{Avc420Region, Encoding, PixelFormat};
 use ironrdp_egfx::server::GraphicsPipelineServer;
 use ironrdp_graphics::clearcodec::ClearCodecEncoder;
 use ironrdp_pdu::geometry::ExclusiveRectangle;
@@ -205,6 +207,9 @@ const MAX_VALID_RTT_MS: f64 = 60_000.0;
 /// CPU-heavy encoders, moved in and out of `spawn_blocking` per frame.
 struct Encoders {
     h264: Option<OpenH264>,
+    /// Second encoder for the AVC444v2 chroma view (only when the client
+    /// negotiated v2 and H.264 is enabled).
+    h264_chroma: Option<OpenH264>,
     clear: ClearCodecEncoder,
 }
 
@@ -330,6 +335,7 @@ impl RdpServerDisplay for EgfxDisplay {
             hb_last: Instant::now(),
             avc_disabled: false,
             started: Instant::now(),
+            avc444v2_enabled: false,
             stat_frames: 0,
             stat_h264: 0,
             stat_clear: 0,
@@ -421,6 +427,9 @@ struct EgfxUpdates {
     /// Client negotiated EGFX without AVC (AVC_DISABLED), or the H.264
     /// encoder failed to initialize — lossless ClearCodec only.
     avc_disabled: bool,
+    /// Client negotiated cap version >= 10.6: the AVC444v2 chroma layout may
+    /// be used for motion frames.
+    avc444v2_enabled: bool,
     started: Instant,
     stat_frames: u64,
     stat_h264: u64,
@@ -927,10 +936,15 @@ impl EgfxUpdates {
             self.ensure_surface(handle, grab.width, grab.height);
             self.generation = Some(Arc::clone(handle));
             if let Some(Encoders {
-                h264: Some(h264), ..
+                h264: Some(h264),
+                h264_chroma,
+                ..
             }) = self.encoders.as_mut()
             {
                 h264.force_intra_frame();
+                if let Some(chroma) = h264_chroma {
+                    chroma.force_intra_frame();
+                }
             }
             self.pending_full = true;
         }
@@ -954,10 +968,15 @@ impl EgfxUpdates {
                 );
                 self.surface = None;
                 if let Some(Encoders {
-                    h264: Some(h264), ..
+                    h264: Some(h264),
+                    h264_chroma,
+                    ..
                 }) = self.encoders.as_mut()
                 {
                     h264.force_intra_frame();
+                    if let Some(chroma) = h264_chroma {
+                        chroma.force_intra_frame();
+                    }
                 }
                 self.ensure_surface(handle, grab.width, grab.height);
                 self.pending_full = true;
@@ -1087,6 +1106,7 @@ impl EgfxUpdates {
         if self.avc_disabled {
             tracing::warn!("EGFX: client has AVC disabled — using lossless ClearCodec only");
         }
+        self.avc444v2_enabled = server.supports_avc444v2();
 
         let Some(id) = server.create_surface_with_format(pad_width, pad_height, PixelFormat::XRgb) else {
             tracing::warn!("EGFX: surface creation failed — legacy path resumes next frame");
@@ -1356,13 +1376,17 @@ impl EgfxUpdates {
             _ => true,
         };
         if bitrate_stale {
-            match make_h264_encoder(target_bitrate, target_rate_fps) {
-                Ok(h264) => {
+            match make_h264_encoder_pair(target_bitrate, target_rate_fps, self.avc444v2_enabled) {
+                Ok((h264, h264_chroma)) => {
                     match self.encoders.as_mut() {
-                        Some(encoders) => encoders.h264 = Some(h264),
+                        Some(encoders) => {
+                            encoders.h264 = Some(h264);
+                            encoders.h264_chroma = h264_chroma;
+                        }
                         None => {
                             self.encoders = Some(Encoders {
                                 h264: Some(h264),
+                                h264_chroma,
                                 clear: ClearCodecEncoder::new(),
                             });
                         }
@@ -1381,27 +1405,39 @@ impl EgfxUpdates {
 
         let (pw, ph) = (surface.pad_width, surface.pad_height);
         let ts = self.timestamp_ms();
+        let avc444v2 = self.avc444v2_enabled;
 
         let joined = tokio::task::spawn_blocking(move || {
-            let yuv = bgrx_to_yuv420(&data, usize::from(w), usize::from(h), usize::from(pw), usize::from(ph));
-            // Materialize the bitstream inside the closure: EncodedBitStream
+            // Materialize the bitstreams inside the closure: EncodedBitStream
             // borrows the encoder's internal buffer and is not Send.
-            let bitstream = encoders.h264.as_mut().map(|enc| enc.encode(&yuv).map(|bs| bs.to_vec()));
-            (encoders, bitstream)
+            if avc444v2 {
+                let (luma, chroma) =
+                    bgrx_to_yuv444v2(&data, usize::from(w), usize::from(h), usize::from(pw), usize::from(ph));
+                let luma_bs = encoders.h264.as_mut().map(|enc| enc.encode(&luma).map(|bs| bs.to_vec()));
+                let chroma_bs = encoders
+                    .h264_chroma
+                    .as_mut()
+                    .map(|enc| enc.encode(&chroma).map(|bs| bs.to_vec()));
+                (encoders, luma_bs, chroma_bs)
+            } else {
+                let yuv = bgrx_to_yuv420(&data, usize::from(w), usize::from(h), usize::from(pw), usize::from(ph));
+                let luma_bs = encoders.h264.as_mut().map(|enc| enc.encode(&yuv).map(|bs| bs.to_vec()));
+                (encoders, luma_bs, None)
+            }
         })
         .await;
 
-        let Ok((encoders, bitstream)) = joined else {
+        let Ok((encoders, luma_bs, chroma_bs)) = joined else {
             return;
         };
         self.encoders = Some(encoders);
 
-        let Some(Ok(bitstream)) = bitstream else {
+        let Some(Ok(luma_bitstream)) = luma_bs else {
             // No encoder or encoder error: recover with a lossless full paint.
             self.pending_full = true;
             return;
         };
-        if bitstream.is_empty() {
+        if luma_bitstream.is_empty() {
             return; // encoder skipped unchanged input
         }
 
@@ -1413,8 +1449,40 @@ impl EgfxUpdates {
             quantization_parameter: 21, // low QP = high quality
             quality: 90,
         };
+        let chroma_region = Avc420Region { ..region.clone() };
         let mut server = handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let sent = server.send_avc420_frame(surface.id, &bitstream, &[region], ts);
+
+        let sent = if avc444v2 {
+            let chroma_bitstream = chroma_bs
+                .unwrap_or_else(|| Ok(Vec::new()))
+                .unwrap_or_default();
+            // LC=1 fallback when the chroma encoder produced nothing: the
+            // client keeps waiting for the chroma view of these updates and
+            // the next v2 frame delivers it.
+            if chroma_bitstream.is_empty() {
+                server.send_avc444v2_frame(
+                    surface.id,
+                    Encoding::LUMA,
+                    &luma_bitstream,
+                    &[region],
+                    None,
+                    None,
+                    ts,
+                )
+            } else {
+                server.send_avc444v2_frame(
+                    surface.id,
+                    Encoding::LUMA_AND_CHROMA,
+                    &luma_bitstream,
+                    &[region],
+                    Some(&chroma_bitstream),
+                    Some(&[chroma_region]),
+                    ts,
+                )
+            }
+        } else {
+            server.send_avc420_frame(surface.id, &luma_bitstream, &[region], ts)
+        };
         drop(server);
 
         if sent.is_some() {
@@ -1435,6 +1503,7 @@ impl EgfxUpdates {
         if self.encoders.is_none() {
             self.encoders = Some(Encoders {
                 h264: None,
+                h264_chroma: None,
                 clear: ClearCodecEncoder::new(),
             });
         }
@@ -1505,6 +1574,31 @@ impl EgfxUpdates {
             self.stat_last = Instant::now();
         }
     }
+}
+
+/// Bitrate split between the AVC444v2 luma and chroma encoders. The luma
+/// view carries the detail; the chroma view only has to be good enough for
+/// the decoder's chroma reconstruction.
+const AVC444V2_LUMA_BITRATE_SHARE: u32 = 6; // out of 10
+
+/// Build the AVC444v2 encoder pair: one encoder per YUV420 view, the chroma
+/// view at a smaller bitrate share. Without v2 this is the single AVC420
+/// encoder at the full target.
+fn make_h264_encoder_pair(
+    target_bitrate: u32,
+    rc_fps: f32,
+    avc444v2: bool,
+) -> anyhow::Result<(OpenH264, Option<OpenH264>)> {
+    let luma = make_h264_encoder(target_bitrate * AVC444V2_LUMA_BITRATE_SHARE / 10, rc_fps)?;
+    let chroma = if avc444v2 {
+        Some(make_h264_encoder(
+            target_bitrate * (10 - AVC444V2_LUMA_BITRATE_SHARE) / 10,
+            rc_fps,
+        )?)
+    } else {
+        None
+    };
+    Ok((luma, chroma))
 }
 
 fn make_h264_encoder(bitrate_bps: u32, rc_fps: f32) -> anyhow::Result<OpenH264> {
@@ -1633,6 +1727,177 @@ fn convert_rows(
             for (p, (dx, dy)) in [(p00, (0usize, 0usize)), (p01, (0, 1)), (p10, (1, 0)), (p11, (1, 1))] {
                 let y_val = (54 * p.0 + 183 * p.1 + 18 * p.2) >> 8;
                 y_plane[(j_local * 2 + dy) * pw + (i * 2 + dx)] = y_val.clamp(0, 255) as u8;
+            }
+        }
+    }
+}
+
+/// Convert a BGRX grab into the two YUV420 views of the AVC444v2 layout
+/// (MS-RDPEGFX 3.3.8.3.3): the luma view carries full-resolution Y with
+/// 2x2-subsampled U/V (identical to the AVC420 path), and the chroma view
+/// carries the full-resolution chroma distributed so a compliant decoder can
+/// reconstruct U/V at 4:4:4. Port of FreeRDP's
+/// `general_RGBToAVC444YUVv2_BGRX` (libfreerdp/primitives/prim_YUV.c) with
+/// our full-range BT.709 conversion.
+///
+/// The chroma view's Y plane (full resolution) holds, per source row pair:
+/// even row — left half U444 at odd source columns, right half V444 at odd
+/// columns; odd row — same for the odd source row. The chroma view's U plane
+/// carries the even source columns of the odd row (U left, V right), and the
+/// V plane the odd source columns of the odd row (U left, V right).
+fn bgrx_to_yuv444v2(
+    src: &[u8],
+    w: usize,
+    h: usize,
+    pw: usize,
+    ph: usize,
+) -> (openh264::formats::YUVBuffer, openh264::formats::YUVBuffer) {
+    let mut luma = vec![0u8; 3 * (pw * ph) / 2];
+    let mut chroma = vec![0u8; 3 * (pw * ph) / 2];
+    let (ly, rest) = luma.split_at_mut(pw * ph);
+    let (lu, lv) = rest.split_at_mut(pw * ph / 4);
+    let (cy, rest2) = chroma.split_at_mut(pw * ph);
+    let (cu, cv) = rest2.split_at_mut(pw * ph / 4);
+
+    let pairs = ph / 2;
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 8)
+        .min(pairs.max(1));
+    let pairs_per_worker = pairs.div_ceil(workers);
+    let chunk_count = pairs.div_ceil(pairs_per_worker);
+    let j0s: Vec<usize> = (0..chunk_count).map(|c| c * pairs_per_worker).collect();
+    // Luma Y and chroma Y carry two rows per pair; the sub-sampled planes
+    // one. Each plane is pre-split into per-worker chunks so the scoped
+    // threads get disjoint regions.
+    let lys = split_row_chunks(ly, 2 * pairs_per_worker, pw, chunk_count);
+    let lus = split_row_chunks(lu, pairs_per_worker, half_of(pw), chunk_count);
+    let lvs = split_row_chunks(lv, pairs_per_worker, half_of(pw), chunk_count);
+    let cys = split_row_chunks(cy, 2 * pairs_per_worker, pw, chunk_count);
+    let cus = split_row_chunks(cu, pairs_per_worker, half_of(pw), chunk_count);
+    let cvs = split_row_chunks(cv, pairs_per_worker, half_of(pw), chunk_count);
+
+    std::thread::scope(|scope| {
+        for ((((j0, ly), lu), (lv, cy)), (cu, cv)) in j0s
+            .into_iter()
+            .zip(lys)
+            .zip(lus)
+            .zip(lvs.into_iter().zip(cys))
+            .zip(cus.into_iter().zip(cvs))
+        {
+            let j1 = (j0 + pairs_per_worker).min(pairs);
+            scope.spawn(move || convert_rows_v2(src, w, h, pw, ly, lu, lv, cy, cu, cv, j0, j1));
+        }
+    });
+
+    (
+        openh264::formats::YUVBuffer::from_vec(luma, pw, ph),
+        openh264::formats::YUVBuffer::from_vec(chroma, pw, ph),
+    )
+}
+
+fn half_of(pw: usize) -> usize {
+    pw / 2
+}
+
+/// Mean of four i32 component samples, saturated to u8 (always in 0..=1020/4).
+fn v8_mean(sum: i32) -> u8 {
+    u8::try_from(sum / 4).unwrap_or(u8::MAX)
+}
+
+/// Convert row-pair range `[j0, j1)` (source rows `2*j0 .. 2*j1`) into the
+/// provided AVC444v2 view planes: luma Y (2 rows per pair) + sub-sampled
+/// U/V (1 row per pair), and the chroma view's Y (2 rows) + U/V (1 row).
+#[expect(clippy::too_many_arguments, reason = "worker signature over the six plane chunks of one row-pair range")]
+fn convert_rows_v2(
+    src: &[u8],
+    w: usize,
+    h: usize,
+    pw: usize,
+    luma_y: &mut [u8],
+    luma_u: &mut [u8],
+    luma_v: &mut [u8],
+    chroma_y: &mut [u8],
+    chroma_u: &mut [u8],
+    chroma_v: &mut [u8],
+    j0: usize,
+    j1: usize,
+) {
+    let stride = w * 4;
+    // Full-range BT.709 per component, coordinates clamped to the frame so
+    // the padding replicates the edge (the destination rectangle crops it).
+    let yuv_at = |x: usize, y: usize| -> (u8, u8, u8) {
+        let x = x.min(w - 1);
+        let y = y.min(h - 1);
+        let off = y * stride + x * 4;
+        let b = i32::from(src[off]);
+        let g = i32::from(src[off + 1]);
+        let r = i32::from(src[off + 2]);
+        // Precision guard: each formula is clamped to 0..=255, so the casts
+        // cannot truncate or wrap.
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_sign_loss,
+            reason = "clamped to 0..=255"
+        )]
+        let (yv, uv, vv) = (
+            ((54 * r + 183 * g + 18 * b) >> 8).clamp(0, 255) as u8,
+            (((-29 * r - 99 * g + 128 * b) >> 8) + 128).clamp(0, 255) as u8,
+            (((128 * r - 116 * g - 12 * b) >> 8) + 128).clamp(0, 255) as u8,
+        );
+        (yv, uv, vv)
+    };
+
+    let half = pw / 2;
+    for j in j0..j1 {
+        let j_local = j - j0;
+        let ye = 2 * j;
+        let yo = 2 * j + 1;
+        let yo_in_frame = yo < h;
+
+        for x2 in 0..half {
+            let xe = 2 * x2;
+            let xo = xe + 1;
+
+            let (y00, u00, v00) = yuv_at(xe, ye);
+            let (y01, u01, v01) = yuv_at(xo, ye);
+            let (y10, u10, v10) = yuv_at(xe, yo);
+            let (y11, u11, v11) = yuv_at(xo, yo);
+
+            // Luma view: full-resolution Y, 2x2-averaged chroma [B1, B2, B3].
+            luma_y[ye * pw + 2 * x2] = y00;
+            luma_y[ye * pw + 2 * x2 + 1] = y01;
+            if yo_in_frame {
+                luma_y[yo * pw + 2 * x2] = y10;
+                luma_y[yo * pw + 2 * x2 + 1] = y11;
+            }
+            // The mean of four u8 samples always fits in u8. The sum is
+            // computed in i32: u8 arithmetic would overflow for bright
+            // pixels (4 x 255).
+            let u_sum = i32::from(u00) + i32::from(u01) + i32::from(u10) + i32::from(u11);
+            let v_sum = i32::from(v00) + i32::from(v01) + i32::from(v10) + i32::from(v11);
+            luma_u[j_local * half + x2] = u8::try_from(u_sum / 4).unwrap_or(u8::MAX);
+            luma_v[j_local * half + x2] = v8_mean(v_sum);
+
+            // Chroma view Y, even source row [B4, B5]: odd source columns.
+            chroma_y[ye * pw + x2] = u01;
+            chroma_y[ye * pw + x2 + half] = v01;
+            // Chroma view Y, odd source row [B6-left, B5-odd-right]: odd
+            // source columns of the odd row.
+            if yo_in_frame {
+                chroma_y[yo * pw + x2] = u11;
+                chroma_y[yo * pw + x2 + half] = v11;
+            }
+
+            // Chroma view U/V planes [B6/B7, B8/B9]: the even source column
+            // of the odd row, split left/right per 4-column group.
+            if x2 % 2 == 0 {
+                chroma_u[j_local * half + x2 / 2] = u10;
+                chroma_v[j_local * half + x2 / 2] = v10;
+            } else {
+                chroma_v[j_local * half + x2 / 2] = u10;
+                chroma_v[j_local * half + half + x2 / 2] = v10;
             }
         }
     }
