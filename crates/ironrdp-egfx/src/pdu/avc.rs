@@ -201,8 +201,10 @@ impl Encode for Avc444BitmapStream<'_> {
         ensure_fixed_part_size!(in: dst);
 
         let mut stream_info = 0u32;
-        stream_info.set_bits(0..30, cast_length!("stream1size", self.stream1.size(), in: dst)?);
-        stream_info.set_bits(30..32, self.encoding.bits().into());
+        // [MS-RDPEGFX 2.2.4.6]: cbAvc420EncodedBitstream1 occupies the high
+        // 30 bits and LC the two least significant bits.
+        stream_info.set_bits(2..32, cast_length!("stream1size", self.stream1.size(), in: dst)?);
+        stream_info.set_bits(0..2, self.encoding.bits().into());
         dst.write_u32(stream_info);
         self.stream1.encode(dst)?;
         if let Some(stream) = self.stream2.as_ref() {
@@ -231,9 +233,9 @@ impl<'de> Decode<'de> for Avc444BitmapStream<'de> {
         ensure_fixed_part_size!(in: src);
 
         let stream_info = src.read_u32();
-        let stream_len = stream_info.get_bits(0..30);
+        let stream_len = stream_info.get_bits(2..32);
         #[expect(clippy::unwrap_used, reason = "2-bit extraction always fits in u8")]
-        let encoding_raw: u8 = stream_info.get_bits(30..32).try_into().unwrap();
+        let encoding_raw: u8 = stream_info.get_bits(0..2).try_into().unwrap();
         // Only 0x00 (LUMA_AND_CHROMA), 0x01 (LUMA), 0x02 (CHROMA) are defined.
         if encoding_raw > 2 {
             return Err(invalid_field_err!("encoding", "reserved encoding value", in: src));
