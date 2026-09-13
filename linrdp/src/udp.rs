@@ -119,12 +119,28 @@ async fn listen_loop(
             }
             Err(error) => {
                 // Most common: the accept timed out because the client is
-                // TCP-only or UDP is filtered. Rebind and wait again.
-                tracing::debug!(error = format!("{error:#}"), "RDP-UDP accept ended; rebinding");
+                // TCP-only or UDP is filtered. Log the whole cause chain —
+                // "handshake failed" alone hides whether the SYN cookieHash,
+                // the TLS exchange or the tunnel negotiation failed.
+                tracing::debug!(error = %error_chain(&error), "RDP-UDP accept ended; rebinding");
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
     }
+}
+
+/// Render an error and its whole `source()` chain on one line: the wrapper
+/// types' `Display` only prints the top message, which is exactly the part
+/// that says nothing useful.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(" <- ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
 }
 
 fn fill_random(buf: &mut [u8]) -> anyhow::Result<()> {

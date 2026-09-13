@@ -611,6 +611,25 @@ async fn accept_udp_inner(socket: UdpSocket, config: UdpAcceptConfig) -> Result<
     let mut connection_config = config.connection_config;
     connection_config.cookie_hash = Some(cookie_hash(&config.tunnel_config));
 
+    // Surface the cookieHash comparison in the log: when a client fails SYN
+    // validation, "handshake failed" alone does not say which side hashed
+    // what. The expected value is the word-swapped SHA-256 (see cookie_hash).
+    if let Some(syn_ex) = &syn_datagram.syn_data_ex {
+        if let Some(offered) = &syn_ex.cookie_hash {
+            tracing::debug!(
+                offered = %offered.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                expected = %connection_config
+                    .cookie_hash
+                    .as_ref()
+                    .map(|h| h.iter().map(|b| format!("{b:02x}")).collect::<String>())
+                    .unwrap_or_default(),
+                "SYN cookieHash check"
+            );
+        } else {
+            tracing::warn!("SYN carries no cookieHash (version 3 requires it)");
+        }
+    }
+
     let conn = RdpeudpConnection::accept(connection_config, &syn_datagram, Clock::new().now()).map_err(|error| {
         UdpTransportError::handshake("accept UDP", DriverError::rdpeudp("accept RDP-UDP connection", error))
     })?;
@@ -768,8 +787,22 @@ where
 /// is always over the same cookie the RDPEMT tunnel will present a moment
 /// later. The sans-I/O crate takes the finished hash and stays free of any
 /// cryptographic dependency.
+/// The SYN's cookieHash: the SHA-256 digest of the security cookie,
+/// serialized as eight little-endian DWORDs, each transmitted in network
+/// byte order — that is, every 4-byte group of the raw digest is
+/// byte-swapped. MS-RDPEUDP 2.2.2.9 (`RDPUDP_SYNDATAEX_PAYLOAD.cookieHash`)
+/// says the field "MUST be interpreted as an array of 8 4-byte unsigned
+/// integer values where each value is transmitted in network byte order",
+/// and mstsc sends exactly that permutation; the raw digest does not match
+/// and the connection is refused during SYN validation.
 fn cookie_hash(tunnel_config: &TunnelConfig) -> [u8; 32] {
-    Sha256::digest(tunnel_config.security_cookie).into()
+    let digest: [u8; 32] = Sha256::digest(tunnel_config.security_cookie).into();
+    let mut hash = [0u8; 32];
+    for (word, out) in digest.chunks_exact(4).zip(hash.chunks_exact_mut(4)) {
+        out.copy_from_slice(word);
+        out.reverse();
+    }
+    hash
 }
 
 #[cfg(test)]
@@ -777,6 +810,31 @@ mod tests {
     use core::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+
+    /// The SYN cookieHash is the SHA-256 of the security cookie with every
+    /// 4-byte group byte-swapped (MS-RDPEUDP 2.2.2.9: 8 little-endian DWORDs
+    /// transmitted in network byte order). mstsc sends that permutation; the
+    /// raw digest fails its SYN validation.
+    #[test]
+    fn cookie_hash_word_swaps_the_digest() {
+        let cookie = [0x00u8, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let tunnel = TunnelConfig {
+            request_id: 7,
+            security_cookie: cookie,
+        };
+
+        let hash = cookie_hash(&tunnel);
+        let raw: [u8; 32] = Sha256::digest(cookie).into();
+
+        // Every 4-byte group is the reverse of the raw digest's group.
+        for (word, raw_word) in hash.chunks_exact(4).zip(raw.chunks_exact(4)) {
+            let reversed: Vec<u8> = raw_word.iter().rev().copied().collect();
+            assert_eq!(word, reversed.as_slice());
+        }
+        // And the whole thing differs from the raw digest (guard against a
+        // palindromic fixture).
+        assert_ne!(hash, raw);
+    }
 
     /// Dropping the guard stops the task rather than detaching it.
     ///
