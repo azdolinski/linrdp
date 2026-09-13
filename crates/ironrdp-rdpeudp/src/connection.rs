@@ -628,7 +628,20 @@ impl RdpeudpConnection {
 
         match self.state {
             State::SynSent => self.handle_syn_ack(wire, now),
-            State::SynReceived => self.handle_final_ack(wire, now),
+            State::SynReceived => {
+                // Our own client answers the SYN+ACK with a bare v1-format
+                // ACK datagram.
+                if self.handle_final_ack(wire, now)? {
+                    return Ok(());
+                }
+                // mstsc completes the handshake with its first v2-framed
+                // packet instead: an ACK carrying the start of the TLS
+                // ClientHello as data (MS-RDPEUDP 3.1.5.1.1 allows source
+                // packets appended to the ACK). Transition first so the v2
+                // receive window exists, then process the packet normally.
+                self.transition_to_established(now);
+                self.handle_v2_packet(wire, now)
+            }
             State::Established => {
                 // A server that missed our final ACK repeats its SYN+ACK, in
                 // the v1 format, long after we have moved on to v2.
@@ -1034,27 +1047,34 @@ impl RdpeudpConnection {
     }
 
     /// Server receives the client's final ACK.
-    fn handle_final_ack(&mut self, wire: &[u8], now: MonotonicInstant) -> Result<(), RdpeudpError> {
-        let datagram: V1Datagram = decode(wire).map_err(RdpeudpError::decode)?;
+    /// Handle the bare v1-format final ACK. Returns `false` when the
+    /// datagram is not one — the caller then replays it through the v2 path
+    /// (a client that settled on version 3 sends its handshake ACK and its
+    /// first data packet combined, prefix-framed).
+    fn handle_final_ack(&mut self, wire: &[u8], now: MonotonicInstant) -> Result<bool, RdpeudpError> {
+        let Ok(datagram) = decode::<V1Datagram>(wire) else {
+            // Not decodable as a v1 datagram at all: leave it to the v2 path.
+            return Ok(false);
+        };
 
         // The client repeats its SYN when our SYN+ACK goes missing. Answer it
         // again rather than reading it as a protocol violation.
         if datagram.header.flags.contains(V1Flags::SYN) {
             self.resend_handshake_datagram();
-            return Ok(());
+            return Ok(true);
         }
 
         if !datagram.header.flags.contains(V1Flags::ACK) {
-            return Err(RdpeudpError::invalid_packet(
-                "handle final ACK",
-                "expected ACK during handshake",
-            ));
+            // Note: a transformed v2 packet can decode to garbage-plausible
+            // v1 fields, so "no ACK flag" means "not a bare v1 ACK", not a
+            // protocol violation.
+            return Ok(false);
         }
 
         self.sample_handshake_rtt(now);
 
         self.transition_to_established(now);
-        Ok(())
+        Ok(true)
     }
 
     /// Build and enqueue the client's final ACK.
