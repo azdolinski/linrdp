@@ -1139,9 +1139,16 @@ impl RdpeudpConnection {
             .as_ref()
             .expect("params must be set before transitioning to established");
 
-        // Data sequence numbers start at ISN + 1
-        let local_initial_data_seq = u64::from(params.local_isn) + 1;
-        let remote_initial_data_seq = u64::from(params.remote_isn) + 1;
+        // MS-RDPEUDP2 restarts the data sequence numbering after the
+        // handshake: mstsc's first data packet carries DataSeqNum 100
+        // regardless of the SYN initial sequence numbers (observed on the
+        // wire: ClientHello at 100, then 101, 102, ...; retransmissions
+        // advancing), and the peer expects the same base for our
+        // transmissions. Numbering from the SYN ISNs lands every packet in
+        // the receive window as out-of-order and silently starves TLS.
+        const INITIAL_DATA_SEQ: u64 = 100;
+        let local_initial_data_seq = INITIAL_DATA_SEQ;
+        let remote_initial_data_seq = INITIAL_DATA_SEQ;
 
         // Channel sequence numbers start at 1
         let initial_channel_seq = 1u64;
