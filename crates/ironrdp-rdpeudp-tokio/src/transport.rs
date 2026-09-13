@@ -615,6 +615,7 @@ async fn accept_udp_inner(socket: UdpSocket, config: UdpAcceptConfig) -> Result<
     // validation, "handshake failed" alone does not say which side hashed
     // what. The expected value is the word-swapped SHA-256 (see cookie_hash).
     if let Some(syn_ex) = &syn_datagram.syn_data_ex {
+        tracing::debug!(udp_ver = ?syn_ex.udp_ver, "client SYN version offer");
         if let Some(offered) = &syn_ex.cookie_hash {
             tracing::debug!(
                 offered = %offered.iter().map(|b| format!("{b:02x}")).collect::<String>(),

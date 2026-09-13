@@ -351,6 +351,7 @@ impl RdpServerDisplay for EgfxDisplay {
             process_ms: 0.0,
             motion_frames: 0,
             motion_frames_mark: 0,
+            backpressure_events: 0,
             busy_ms: 0.0,
         }))
     }
@@ -447,6 +448,10 @@ struct EgfxUpdates {
     /// "is motion actually flowing" gate (see MIN_MOTION_FRAMES_PER_EVAL).
     motion_frames: u64,
     motion_frames_mark: u64,
+    /// Backpressure incidents (client decode queue full) observed since the
+    /// last adaptive-quality evaluation — together with RTT inflation, one of
+    /// the two real strain signals.
+    backpressure_events: u64,
     /// Capture+process CPU-proxy time accumulated in the heartbeat window:
     /// every consumed grab's poll duration plus every frame's processing
     /// duration. Divided by the window length in the heartbeat log, this is
@@ -525,6 +530,7 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
                     && Self::lock_handle(&handle).should_backpressure()
                 {
                     self.pending_full = true;
+                    self.backpressure_events += 1;
                     tokio::time::sleep(POLL_INTERVAL).await;
                     continue;
                 }
@@ -954,6 +960,7 @@ impl EgfxUpdates {
         // frame entirely; the full-frame send that follows covers this grab.
         if handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).should_backpressure() {
             self.pending_full = true;
+            self.backpressure_events += 1;
             return;
         }
 
@@ -1120,14 +1127,6 @@ impl EgfxUpdates {
         }
         let full_kbit = full_quality_kbit(pixels);
 
-        let target = ((f64::from(goodput_kbit) / full_kbit) * 100.0)
-            .round()
-            .clamp(f64::from(MIN_ADAPTIVE_QUALITY), 100.0);
-        // Precision guard: the value is clamped into 10..=100 above, so the
-        // f64→i32 cast cannot truncate.
-        #[expect(clippy::as_conversions, clippy::cast_possible_truncation, reason = "clamped to 10..=100")]
-        let mut target = target as i32;
-
         let avg_rtt = self.rtt.load(Ordering::Relaxed);
         let min_rtt = self.rtt_baseline.load(Ordering::Relaxed);
         // Sub-millisecond LAN samples are whole-millisecond quantized (0/1 ms)
@@ -1138,6 +1137,33 @@ impl EgfxUpdates {
         let congested = f64::from(min_rtt) >= MIN_VALID_RTT_MS
             && avg_rtt != u32::MAX
             && f64::from(avg_rtt) > f64::from(min_rtt) * 1.5;
+
+        // Two real strain signals gate the quality target: RTT inflation
+        // (queueing on the path) and client backpressure (decode queue full).
+        // Measured goodput alone is NOT a strain signal — it counts what we
+        // just sent (MS-RDPBCGR 3.2.5.14), so on a healthy link it is our own
+        // output rather than the network's capacity. Letting it drive the
+        // target created a self-referential spiral down to the quality floor
+        // (measured: quality 100 -> 10 during plain text scrolling on a
+        // 1 ms LAN with in_flight=1 and zero backpressure).
+        let strained = congested || self.backpressure_events > 0;
+        let backpressure_events = self.backpressure_events;
+        self.backpressure_events = 0;
+
+        let mut target = if strained {
+            ((f64::from(goodput_kbit) / full_kbit) * 100.0)
+                .round()
+                .clamp(f64::from(MIN_ADAPTIVE_QUALITY), 100.0)
+        } else {
+            // No strain: hold the full-quality target regardless of how many
+            // bytes the encoder happened to emit.
+            100.0
+        };
+        // Precision guard: the value is clamped into 10..=100 above, so the
+        // f64→i32 cast cannot truncate.
+        #[expect(clippy::as_conversions, clippy::cast_possible_truncation, reason = "clamped to 10..=100")]
+        let mut target = target as i32;
+
         if congested {
             // Congested: cap the target below the current quality so the next
             // step is guaranteed to shed load (KRdp clamps the same way).
@@ -1162,6 +1188,7 @@ impl EgfxUpdates {
             target,
             goodput_kbit,
             congested,
+            backpressure_events,
             "adaptive H.264 quality"
         );
         self.quality = next;
