@@ -1106,7 +1106,10 @@ impl EgfxUpdates {
         if self.avc_disabled {
             tracing::warn!("EGFX: client has AVC disabled — using lossless ClearCodec only");
         }
-        self.avc444v2_enabled = server.supports_avc444v2();
+        // AVC444v2 is opt-in while the chroma-view packing is being validated
+        // against mstsc's strict decoder: LINRDP_AVC444V2=1 enables it.
+        self.avc444v2_enabled = server.supports_avc444v2()
+            && std::env::var("LINRDP_AVC444V2").as_deref() == Ok("1");
 
         let Some(id) = server.create_surface_with_format(pad_width, pad_height, PixelFormat::XRgb) else {
             tracing::warn!("EGFX: surface creation failed — legacy path resumes next frame");
