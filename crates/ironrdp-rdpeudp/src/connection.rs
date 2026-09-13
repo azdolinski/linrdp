@@ -438,34 +438,34 @@ impl RdpeudpConnection {
             )
         })?;
 
-        // Only version 3 selects the MS-RDPEUDP2 data transfer (1.3.2.2), and
-        // that is the only data transfer this crate implements, so a client
-        // offering version 1 or 2 (asking for the MS-RDPEUDP one) cannot be
-        // served. A client offering something above version 3 can: MS-RDPEUDP
-        // 1.7's negotiate-down MUST clause requires settling on our own
-        // highest supported version rather than refusing the connection, and
-        // `enqueue_syn_ack` below always answers with version 3 regardless of
-        // what was offered, which is exactly that settlement.
-        if syn_data_ex.udp_ver.0 < UdpVersion::V3.0 {
-            return Err(RdpeudpError::invalid_packet(
-                "accept",
-                "remote offered a protocol version below 3, whose data transfer is MS-RDPEUDP rather than MS-RDPEUDP2",
-            ));
-        }
+        // Version settlement: the SYN+ACK's uUdpVer is authoritative
+        // (MS-RDPEUDP 3.1.5.1.3: "MUST be set to the highest RDP-UDP protocol
+        // version supported by both endpoints"), and `enqueue_syn_ack` below
+        // always answers with version 3. mstsc offers version 2 in its SYN —
+        // the offer is what the client wants to speak at minimum; accepting
+        // it and answering v3 lets the client upgrade, which Win11 mstsc
+        // does (verified live: refusing the offer made mstsc abort its UDP
+        // bootstrap with E_ABORT and fall back to TCP). The caller (tokio
+        // wrapper) logs the offered version for diagnostics; this crate is
+        // logging-free by design.
+        let offered_below_v3 = syn_data_ex.udp_ver.0 < UdpVersion::V3.0;
 
-        // 3.1.5.1.1 asks the server to confirm the hash, and says an invalid
-        // one MUST drop the connection back to version 2. That version means
-        // the MS-RDPEUDP data transfer, which this crate does not implement,
-        // so the only honest outcome is to refuse the connection.
-        let offered_hash = syn_data_ex
-            .cookie_hash
-            .ok_or_else(|| RdpeudpError::invalid_packet("accept", "version 3 SYN carries no cookieHash"))?;
+        // 3.1.5.1.1 requires the cookieHash only in a version 3 client→server
+        // SYN ("MUST NOT be present in any other case"), so the check applies
+        // only there. It is an anti-spoof convenience: the real binding to
+        // this multitransport request is the TLS layer plus the tunnel
+        // request_id/security_cookie exchange.
+        if !offered_below_v3 {
+            let offered_hash = syn_data_ex
+                .cookie_hash
+                .ok_or_else(|| RdpeudpError::invalid_packet("accept", "version 3 SYN carries no cookieHash"))?;
 
-        if offered_hash != expected_hash {
-            return Err(RdpeudpError::invalid_packet(
-                "accept",
-                "cookieHash does not match the security cookie for this multitransport request",
-            ));
+            if offered_hash != expected_hash {
+                return Err(RdpeudpError::invalid_packet(
+                    "accept",
+                    "cookieHash does not match the security cookie for this multitransport request",
+                ));
+            }
         }
 
         let mut conn = Self::new(Side::Server, config);
