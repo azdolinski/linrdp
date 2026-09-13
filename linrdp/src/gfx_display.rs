@@ -351,6 +351,7 @@ impl RdpServerDisplay for EgfxDisplay {
             process_ms: 0.0,
             motion_frames: 0,
             motion_frames_mark: 0,
+            busy_ms: 0.0,
         }))
     }
 }
@@ -446,6 +447,12 @@ struct EgfxUpdates {
     /// "is motion actually flowing" gate (see MIN_MOTION_FRAMES_PER_EVAL).
     motion_frames: u64,
     motion_frames_mark: u64,
+    /// Capture+process CPU-proxy time accumulated in the heartbeat window:
+    /// every consumed grab's poll duration plus every frame's processing
+    /// duration. Divided by the window length in the heartbeat log, this is
+    /// the display loop's own load figure (does not count the X server side
+    /// or the rate-limit skips that burn grabs).
+    busy_ms: f64,
     /// Cursor shape cache: shape hash → cache slot. Bounded by the client's
     /// negotiated pointer cache size; LRU eviction frees a slot on overflow.
     cursor_cache: HashMap<u64, CursorCacheEntry>,
@@ -621,6 +628,7 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
                 .is_ok();
             let process_ms = process_started.elapsed().as_secs_f64() * 1000.0;
             self.process_ms = if self.process_ms == 0.0 { process_ms } else { self.process_ms * 0.75 + process_ms * 0.25 };
+            self.busy_ms += process_ms;
             if !frame_done {
                 tracing::error!(
                     process_timeout = ?FRAME_PROCESS_TIMEOUT,
@@ -695,6 +703,7 @@ impl EgfxUpdates {
                 self.hb_damaged += u64::from(polled.as_ref().is_some_and(|(g, _)| g.damage.is_some()));
                 let grab_ms = pending.started.elapsed().as_secs_f64() * 1000.0;
                 self.grab_ms = if self.grab_ms == 0.0 { grab_ms } else { self.grab_ms * 0.75 + grab_ms * 0.25 };
+                self.busy_ms += grab_ms;
                 let name = source.name().to_owned();
                 self.source = Some(source);
                 self.heartbeat(&name);
@@ -1404,7 +1413,7 @@ impl EgfxUpdates {
             clippy::cast_sign_loss,
             reason = "durations are non-negative milliseconds"
         )]
-        let (grab_ms, process_ms) = (self.grab_ms as u64, self.process_ms as u64);
+        let (grab_ms, process_ms, busy_ms) = (self.grab_ms as u64, self.process_ms as u64, self.busy_ms as u64);
         tracing::info!(
             source,
             polls = self.hb_polls,
@@ -1414,10 +1423,12 @@ impl EgfxUpdates {
             pending_full = self.pending_full,
             grab_ms,
             process_ms,
+            busy_ms,
             "EGFX display heartbeat (5s window)"
         );
         self.hb_polls = 0;
         self.hb_damaged = 0;
+        self.busy_ms = 0.0;
         self.hb_last = Instant::now();
     }
 

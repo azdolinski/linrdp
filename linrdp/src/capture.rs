@@ -6,6 +6,13 @@
 //! socket round trip of a core-protocol `GetImage` reply — the dominant
 //! per-grab cost at high resolutions. Everything falls back to the core
 //! protocol when MIT-SHM is unavailable (remote X, restricted SysV limits).
+//!
+//! Grabs are also gated on the DAMAGE extension: a damage object on the root
+//! window (level NonEmpty, subtracted after every grab) tells us whether
+//! anything changed since the previous frame, so a static desktop costs no
+//! GetImage traffic at all. Root damage catches child-window redraws on
+//! Xvfb (verified empirically, `examples/damage_probe.rs`); when the
+//! extension is unusable the grabber falls back to blind polling.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -15,8 +22,9 @@ use core::time::Duration;
 
 use anyhow::Context as _;
 use x11rb::connection::Connection as _;
+use x11rb::protocol::damage::{self, ConnectionExt as _};
 use x11rb::protocol::shm;
-use x11rb::protocol::xfixes::ConnectionExt as _;
+use x11rb::protocol::xfixes::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat};
 
 use ironrdp_connector::DesktopSize;
@@ -561,6 +569,12 @@ pub(crate) struct ScreenGrabber {
     shm_failures: u32,
     /// Set once MIT-SHM has been judged unusable — no further attempts.
     shm_broken: bool,
+    /// Root-window damage object gating grabs (`None` until first use).
+    damage: Option<damage::Damage>,
+    /// Set once DAMAGE has been judged unusable — grab every poll, as before.
+    damage_ok: bool,
+    /// The next poll grabs unconditionally (first grab, reconnect, resize).
+    force_grab: bool,
 }
 
 impl ScreenGrabber {
@@ -583,6 +597,9 @@ impl ScreenGrabber {
             shm: None,
             shm_failures: 0,
             shm_broken: false,
+            damage: None,
+            damage_ok: false,
+            force_grab: true,
         }
     }
 
@@ -628,6 +645,10 @@ impl ScreenGrabber {
                 self.shm = None;
                 self.shm_failures = 0;
                 self.shm_broken = false;
+                // Same for the damage object (connection-scoped resource).
+                self.damage = None;
+                self.damage_ok = false;
+                self.force_grab = true;
                 true
             }
             Err(_) => false,
@@ -785,6 +806,18 @@ impl ScreenGrabber {
     }
 
     fn poll_inner(&mut self) -> Option<Grab> {
+        // Damage gate: skip the whole GetImage + diff when the root window has
+        // not changed since the previous grab. The first grab (and the first
+        // after a reconnect) is forced so the diff baseline exists.
+        let force = std::mem::take(&mut self.force_grab);
+        if !force && !self.damage_pending() {
+            return None;
+        }
+        // Re-arm BEFORE taking the image: any change that happens after the
+        // subtraction re-arms the damage, so it can never be silently
+        // swallowed by a grab that already contains it.
+        self.rearm_damage();
+
         let (data, width, height) = tokio::task::block_in_place(|| self.grab())?;
         let stride = usize::from(width) * 4;
         if data.len() != stride * usize::from(height) {
@@ -816,6 +849,74 @@ impl ScreenGrabber {
             changed_tiles,
             total_tiles,
         })
+    }
+
+    /// Whether the root window changed since the last grab, per the DAMAGE
+    /// extension. Lazily creates the damage object; if the extension is
+    /// unusable this always reports "changed" (blind polling, the previous
+    /// behavior). Pending events are drained; anything that is not a damage
+    /// notification is discarded.
+    fn damage_pending(&mut self) -> bool {
+        if !self.damage_ok && self.damage.is_none() {
+            self.damage_ok = self.setup_damage();
+            if !self.damage_ok {
+                tracing::warn!("X DAMAGE unavailable — capturing with blind polling");
+                return true;
+            }
+        }
+        if !self.damage_ok {
+            return true;
+        }
+
+        let mut pending = false;
+        loop {
+            match self.conn.poll_for_event() {
+                Ok(Some(event)) => {
+                    if matches!(event, x11rb::protocol::Event::DamageNotify(_)) {
+                        pending = true;
+                    }
+                }
+                Ok(None) => return pending,
+                Err(_) => {
+                    // Connection is in trouble; grab anyway so the failure
+                    // surfaces through the usual reconnect path.
+                    return true;
+                }
+            }
+        }
+    }
+
+    /// Create the root-window damage object (level NonEmpty: one notification
+    /// per change batch, re-armed by subtracting — minimal event traffic).
+    fn setup_damage(&mut self) -> bool {
+        if damage::query_version(&*self.conn, 1, 1)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .is_none()
+        {
+            return false;
+        }
+        let Some(dmg) = self.conn.generate_id().ok() else {
+            return false;
+        };
+        match damage::create(&*self.conn, dmg, self.root, damage::ReportLevel::NON_EMPTY) {
+            Ok(cookie) => {
+                if cookie.check().is_err() {
+                    return false;
+                }
+                self.damage = Some(dmg);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Clear the damage state so the next change re-arms the notification.
+    /// Called after deciding to grab, before taking the image.
+    fn rearm_damage(&mut self) {
+        if let Some(dmg) = self.damage {
+            let _ = damage::subtract(&*self.conn, dmg, xfixes::RegionEnum::NONE, xfixes::RegionEnum::NONE);
+        }
     }
 }
 
