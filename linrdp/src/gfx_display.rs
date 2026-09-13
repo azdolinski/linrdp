@@ -85,7 +85,7 @@ const LEGACY_GRACE: Duration = Duration::from_millis(1500);
 /// H.264 encoder ceiling. The adaptive target below stays at or under the
 /// resolution anchor (7.5 Mbit/s at 4K); this only bounds pathological frames.
 /// (Kept as an absolute last-resort clamp for the rate controller.)
-const H264_BITRATE_CEILING_BPS: u32 = 12_000_000;
+const H264_BITRATE_CEILING_BPS: u32 = 50_000_000;
 
 /// OpenH264 multi-threading works through size-limited slices (single-slice
 /// mode internally forces `iMultipleThreadIdc = 1`); 32 KB slices split a
@@ -93,6 +93,14 @@ const H264_BITRATE_CEILING_BPS: u32 = 12_000_000;
 /// header overhead. Measured on this machine (`examples/h264_bench.rs`):
 /// screen-content single-slice 424 ms/frame -> camera-mode sliced 32 ms.
 const ENCODER_SLICE_BYTES: u32 = 32 * 1024;
+
+/// Bitrate multiplier applied when the link shows no strain (RTT flat,
+/// client keeping up). The quality anchors are conservative "works over
+/// WAN" targets; on an unstrained link they are the floor, not the ceiling —
+/// a 1 Gbit LAN carries 10-50 Mbit without blinking, and the strain gates
+/// (RTT inflation, client backpressure) are what pull the target back the
+/// moment the client or path objects.
+const UNSTRAINED_BITRATE_BOOST: f64 = 3.0;
 
 /// Bounds for the rate-control frame-rate assumption fed to OpenH264. The RC
 /// spreads the target bitrate across this many frames per second, so it has
@@ -352,6 +360,7 @@ impl RdpServerDisplay for EgfxDisplay {
             motion_frames: 0,
             motion_frames_mark: 0,
             backpressure_events: 0,
+            bitrate_boost: 1.0,
             busy_ms: 0.0,
         }))
     }
@@ -452,6 +461,10 @@ struct EgfxUpdates {
     /// last adaptive-quality evaluation — together with RTT inflation, one of
     /// the two real strain signals.
     backpressure_events: u64,
+    /// Bitrate multiplier over the anchor: 3x while the link is unstrained
+    /// (quality anchors are WAN-safe floors; a LAN wants best-effort quality
+    /// bounded only by what the client can decode), 1x under strain.
+    bitrate_boost: f64,
     /// Capture+process CPU-proxy time accumulated in the heartbeat window:
     /// every consumed grab's poll duration plus every frame's processing
     /// duration. Divided by the window length in the heartbeat log, this is
@@ -1149,6 +1162,7 @@ impl EgfxUpdates {
         let strained = congested || self.backpressure_events > 0;
         let backpressure_events = self.backpressure_events;
         self.backpressure_events = 0;
+        self.bitrate_boost = if strained { 1.0 } else { UNSTRAINED_BITRATE_BOOST };
 
         let mut target = if strained {
             ((f64::from(goodput_kbit) / full_kbit) * 100.0)
@@ -1183,12 +1197,16 @@ impl EgfxUpdates {
         if next == self.quality {
             return;
         }
+        // Precision guard: the boost only ever holds 1.0 or 3.0.
+        #[expect(clippy::as_conversions, clippy::cast_sign_loss, reason = "boost is 1.0 or 3.0")]
+        let bitrate_boost_u64 = self.bitrate_boost as u64;
         tracing::info!(
             quality = next,
             target,
             goodput_kbit,
             congested,
             backpressure_events,
+            bitrate_boost = bitrate_boost_u64,
             "adaptive H.264 quality"
         );
         self.quality = next;
@@ -1202,13 +1220,13 @@ impl EgfxUpdates {
             .surface
             .map(|s| f64::from(s.width) * f64::from(s.height))
             .unwrap_or(f64::from(1920) * f64::from(1080));
-        let kbit = full_quality_kbit(pixels) * f64::from(self.quality) / 100.0;
+        let kbit = full_quality_kbit(pixels) * f64::from(self.quality) / 100.0 * self.bitrate_boost;
         // Precision guard: the kbit figure is clamped to a sane bitrate range.
         #[expect(
             clippy::as_conversions,
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
-            reason = "clamped to 250 kbit/s..12 Mbit/s"
+            reason = "clamped to 250 kbit/s..50 Mbit/s"
         )]
         let bps = (kbit * 1000.0).clamp(250_000.0, f64::from(H264_BITRATE_CEILING_BPS)) as u32;
         bps
