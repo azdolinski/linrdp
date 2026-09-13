@@ -1428,6 +1428,7 @@ impl EgfxUpdates {
         .await;
 
         let Ok((encoders, luma_bs, chroma_bs)) = joined else {
+            tracing::error!("H.264 encode task failed to join — motion frame dropped");
             return;
         };
         self.encoders = Some(encoders);
@@ -1849,21 +1850,30 @@ fn convert_rows_v2(
         (yv, uv, vv)
     };
 
+    // Plane geometry: `half` is the chroma-view Y plane's left/right half
+    // width, `quarter` the chroma U/V plane's left/right half width. All
+    // destination indices are CHUNK-LOCAL (the planes arrive split per
+    // worker); only the source sampling uses global coordinates.
     let half = pw / 2;
+    let quarter = half / 2;
     for j in j0..j1 {
         let j_local = j - j0;
-        let ye = 2 * j;
-        let yo = 2 * j + 1;
-        let yo_in_frame = yo < h;
+        let ye_global = 2 * j;
+        let yo_global = yo_of(j);
+        let ye = 2 * j_local;
+        let yo = ye + 1;
+        let yo_in_frame = yo_global < h;
 
         for x2 in 0..half {
-            let xe = 2 * x2;
-            let xo = xe + 1;
+            let xe_src = (2 * x2).min(w - 1);
+            let xo_src = (xe_src + 1).min(w - 1);
+            let ye_src = ye_global.min(h - 1);
+            let yo_src = yo_global.min(h - 1);
 
-            let (y00, u00, v00) = yuv_at(xe, ye);
-            let (y01, u01, v01) = yuv_at(xo, ye);
-            let (y10, u10, v10) = yuv_at(xe, yo);
-            let (y11, u11, v11) = yuv_at(xo, yo);
+            let (y00, u00, v00) = yuv_at(xe_src, ye_src);
+            let (y01, u01, v01) = yuv_at(xo_src, ye_src);
+            let (y10, u10, v10) = yuv_at(xe_src, yo_src);
+            let (y11, u11, v11) = yuv_at(xo_src, yo_src);
 
             // Luma view: full-resolution Y, 2x2-averaged chroma [B1, B2, B3].
             luma_y[ye * pw + 2 * x2] = y00;
@@ -1894,11 +1904,83 @@ fn convert_rows_v2(
             // of the odd row, split left/right per 4-column group.
             if x2 % 2 == 0 {
                 chroma_u[j_local * half + x2 / 2] = u10;
-                chroma_v[j_local * half + x2 / 2] = v10;
+                chroma_u[j_local * half + quarter + x2 / 2] = v10;
             } else {
                 chroma_v[j_local * half + x2 / 2] = u10;
-                chroma_v[j_local * half + half + x2 / 2] = v10;
+                chroma_v[j_local * half + quarter + x2 / 2] = v10;
             }
+        }
+    }
+}
+
+/// The odd source row of the row-pair `j`.
+fn yo_of(j: usize) -> usize {
+    2 * j + 1
+}
+
+#[cfg(test)]
+mod avc444v2_tests {
+    use super::bgrx_to_yuv444v2;
+
+    /// A constant-color frame converted across many worker chunks (j0 > 0 for
+    /// most of them) must come out uniformly: every luma Y is the color's Y,
+    /// every chroma-view Y is its U (odd columns, clamped at the edge), and
+    /// the chroma U/V planes hold the odd-row samples per the B6-B9 split.
+    /// Regression for the global-vs-local row indexing panic.
+    #[test]
+    fn avc444v2_conversion_is_chunk_safe() {
+        let (w, h) = (112usize, 80usize);
+        let pw = w.div_ceil(16) * 16;
+        let ph = h.div_ceil(16) * 16;
+        let mut src = vec![0u8; w * h * 4];
+        for px in src.chunks_exact_mut(4) {
+            px[0] = 30; // B
+            px[1] = 160; // G
+            px[2] = 240; // R
+            px[3] = 0xFF;
+        }
+
+        let (luma, chroma) = bgrx_to_yuv444v2(&src, w, h, pw, ph);
+
+        let (b, g, r) = (i32::from(30), i32::from(160), i32::from(240));
+        let y_c = ((54 * r + 183 * g + 18 * b) >> 8).clamp(0, 255) as u8;
+        let u_c = (((-29 * r - 99 * g + 128 * b) >> 8) + 128).clamp(0, 255) as u8;
+        let v_c = (((128 * r - 116 * g - 12 * b) >> 8) + 128).clamp(0, 255) as u8;
+
+        use openh264::formats::YUVSource as _;
+        assert!(luma.y().iter().all(|&v| v == y_c), "luma Y must be uniform");
+        assert!(luma.u().iter().all(|&v| v == u_c), "luma U must be uniform");
+        assert!(luma.v().iter().all(|&v| v == v_c), "luma V must be uniform");
+
+        // Chroma view Y plane: left half carries U of odd source columns,
+        // right half V of odd source columns.
+        let half = pw / 2;
+        let quarter = half / 2;
+        for row in 0..ph {
+            let row_data = &chroma.y()[row * pw..(row + 1) * pw];
+            assert!(
+                row_data[..half].iter().all(|&v| v == u_c)
+                    && row_data[half..].iter().all(|&v| v == v_c),
+                "chroma Y row {row}: left must be U, right V"
+            );
+        }
+        // Chroma U and V planes: each row is [U block | V block] — the left
+        // quarter of the plane holds U of the odd row's even source columns,
+        // the right quarter holds V of the odd row's odd source columns
+        // (even pairs fill the U plane, odd pairs the V plane).
+        for row in 0..ph / 2 {
+            let u_row = &chroma.u()[row * half..(row + 1) * half];
+            let v_row = &chroma.v()[row * half..(row + 1) * half];
+            assert!(
+                u_row[..quarter].iter().all(|&v| v == u_c)
+                    && u_row[quarter..].iter().all(|&v| v == v_c),
+                "chroma U row {row}: left must be U, right V"
+            );
+            assert!(
+                v_row[..quarter].iter().all(|&v| v == u_c)
+                    && v_row[quarter..].iter().all(|&v| v == v_c),
+                "chroma V row {row}: left must be U, right V"
+            );
         }
     }
 }
