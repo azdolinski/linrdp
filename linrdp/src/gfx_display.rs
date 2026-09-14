@@ -207,9 +207,6 @@ const MAX_VALID_RTT_MS: f64 = 60_000.0;
 /// CPU-heavy encoders, moved in and out of `spawn_blocking` per frame.
 struct Encoders {
     h264: Option<OpenH264>,
-    /// Second encoder for the AVC444v2 chroma view (only when the client
-    /// negotiated v2 and H.264 is enabled).
-    h264_chroma: Option<OpenH264>,
     clear: ClearCodecEncoder,
 }
 
@@ -940,15 +937,10 @@ impl EgfxUpdates {
             self.ensure_surface(handle, grab.width, grab.height);
             self.generation = Some(Arc::clone(handle));
             if let Some(Encoders {
-                h264: Some(h264),
-                h264_chroma,
-                ..
+                h264: Some(h264), ..
             }) = self.encoders.as_mut()
             {
                 h264.force_intra_frame();
-                if let Some(chroma) = h264_chroma {
-                    chroma.force_intra_frame();
-                }
             }
             self.pending_full = true;
         }
@@ -972,15 +964,10 @@ impl EgfxUpdates {
                 );
                 self.surface = None;
                 if let Some(Encoders {
-                    h264: Some(h264),
-                    h264_chroma,
-                    ..
+                    h264: Some(h264), ..
                 }) = self.encoders.as_mut()
                 {
                     h264.force_intra_frame();
-                    if let Some(chroma) = h264_chroma {
-                        chroma.force_intra_frame();
-                    }
                 }
                 self.ensure_surface(handle, grab.width, grab.height);
                 self.pending_full = true;
@@ -1388,17 +1375,13 @@ impl EgfxUpdates {
             _ => true,
         };
         if bitrate_stale {
-            match make_h264_encoder_pair(target_bitrate, target_rate_fps, self.avc444v2_enabled) {
-                Ok((h264, h264_chroma)) => {
+            match make_h264_encoder(target_bitrate, target_rate_fps) {
+                Ok(h264) => {
                     match self.encoders.as_mut() {
-                        Some(encoders) => {
-                            encoders.h264 = Some(h264);
-                            encoders.h264_chroma = h264_chroma;
-                        }
+                        Some(encoders) => encoders.h264 = Some(h264),
                         None => {
                             self.encoders = Some(Encoders {
                                 h264: Some(h264),
-                                h264_chroma,
                                 clear: ClearCodecEncoder::new(),
                             });
                         }
@@ -1424,13 +1407,26 @@ impl EgfxUpdates {
             // Materialize the bitstreams inside the closure: EncodedBitStream
             // borrows the encoder's internal buffer and is not Send.
             if avc444v2 {
-                let (luma, chroma) =
-                    bgrx_to_yuv444v2(&data, usize::from(w), usize::from(h), usize::from(pw), usize::from(ph), luma_only);
+                let (luma, chroma) = bgrx_to_yuv444v2(
+                    &data,
+                    usize::from(w),
+                    usize::from(h),
+                    usize::from(pw),
+                    usize::from(ph),
+                    luma_only,
+                );
+                // [MS-RDPEGFX 2.2.4.6]: the two substreams are parts of ONE
+                // H.264 stream — encode both views through the single encoder
+                // as consecutive frames. Two independent encoders would emit
+                // interleaved SPS/PPS/IDRs that reset mstsc's decoder every
+                // frame (observed: flickering garbage with periodic correct
+                // ClearCodec repaints).
                 let luma_bs = encoders.h264.as_mut().map(|enc| enc.encode(&luma).map(|bs| bs.to_vec()));
-                let chroma_bs = encoders
-                    .h264_chroma
-                    .as_mut()
-                    .map(|enc| enc.encode(&chroma).map(|bs| bs.to_vec()));
+                let chroma_bs = if luma_only {
+                    None
+                } else {
+                    encoders.h264.as_mut().map(|enc| enc.encode(&chroma).map(|bs| bs.to_vec()))
+                };
                 (encoders, luma_bs, chroma_bs)
             } else {
                 let yuv = bgrx_to_yuv420(&data, usize::from(w), usize::from(h), usize::from(pw), usize::from(ph));
@@ -1532,7 +1528,6 @@ impl EgfxUpdates {
         if self.encoders.is_none() {
             self.encoders = Some(Encoders {
                 h264: None,
-                h264_chroma: None,
                 clear: ClearCodecEncoder::new(),
             });
         }
@@ -1603,31 +1598,6 @@ impl EgfxUpdates {
             self.stat_last = Instant::now();
         }
     }
-}
-
-/// Bitrate split between the AVC444v2 luma and chroma encoders. The luma
-/// view carries the detail; the chroma view only has to be good enough for
-/// the decoder's chroma reconstruction.
-const AVC444V2_LUMA_BITRATE_SHARE: u32 = 6; // out of 10
-
-/// Build the AVC444v2 encoder pair: one encoder per YUV420 view, the chroma
-/// view at a smaller bitrate share. Without v2 this is the single AVC420
-/// encoder at the full target.
-fn make_h264_encoder_pair(
-    target_bitrate: u32,
-    rc_fps: f32,
-    avc444v2: bool,
-) -> anyhow::Result<(OpenH264, Option<OpenH264>)> {
-    let luma = make_h264_encoder(target_bitrate, rc_fps)?;
-    let chroma = if avc444v2 {
-        Some(make_h264_encoder(
-            target_bitrate * (10 - AVC444V2_LUMA_BITRATE_SHARE) / 10,
-            rc_fps,
-        )?)
-    } else {
-        None
-    };
-    Ok((luma, chroma))
 }
 
 fn make_h264_encoder(bitrate_bps: u32, rc_fps: f32) -> anyhow::Result<OpenH264> {
