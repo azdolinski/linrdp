@@ -97,6 +97,7 @@ async fn listen_loop(
                         incoming = transport.recv() => {
                             match incoming {
                                 Some(frame) => {
+                                    tracing::debug!(bytes = frame.len(), "UDP tunnel: client -> server");
                                     let _ = events.send(ironrdp_server::ServerEvent::UdpTunnelData(frame));
                                 }
                                 None => break,
@@ -105,6 +106,7 @@ async fn listen_loop(
                         outgoing = from_server.recv() => {
                             match outgoing {
                                 Some(frame) => {
+                                    tracing::debug!(bytes = frame.len(), "UDP tunnel: server -> client");
                                     if transport.send(frame).await.is_err() {
                                         break;
                                     }

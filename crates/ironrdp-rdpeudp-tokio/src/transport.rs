@@ -254,20 +254,20 @@ impl UdpTransport {
     ///
     /// # Errors
     ///
-    /// Returns `PayloadTooLarge` if `data` exceeds 65535 bytes, the wire
-    /// `PayloadLength` field's capacity ([MS-RDPEMT] 2.2.2.3). Checked here,
-    /// synchronously, rather than left for the background write pump to
-    /// discover: that task has no way to report a per-payload failure back
-    /// to a caller who already received `Ok(())` from a channel send.
+    /// Returns an error only when the transport is closed. Payloads longer
+    /// than 65535 bytes - the wire `PayloadLength` field's capacity
+    /// ([MS-RDPEMT] 2.2.2.3) - are written as several consecutive Tunnel
+    /// Data PDUs: the tunnel is a byte stream and the peer's DVC layer
+    /// reassembles each message from its u32 length header, so chunking
+    /// here is transparent to the graphics/clipboard channels above.
     pub async fn send(&self, data: Vec<u8>) -> Result<(), UdpTransportError> {
-        if data.len() > usize::from(u16::MAX) {
-            return Err(UdpTransportError::payload_too_large("send", data.len()));
+        for chunk in data.chunks(usize::from(u16::MAX)) {
+            self.data_tx
+                .send(chunk.to_vec())
+                .await
+                .map_err(|_| UdpTransportError::driver("send", DriverError::connection_closed("send")))?;
         }
-
-        self.data_tx
-            .send(data)
-            .await
-            .map_err(|_| UdpTransportError::driver("send", DriverError::connection_closed("send")))
+        Ok(())
     }
 
     /// Shut down the transport, closing the RDPEUDP2 connection.
