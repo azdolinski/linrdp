@@ -336,6 +336,7 @@ impl RdpServerDisplay for EgfxDisplay {
             avc_disabled: false,
             started: Instant::now(),
             avc444v2_enabled: false,
+            avc444v2_luma_only: false,
             stat_frames: 0,
             stat_h264: 0,
             stat_clear: 0,
@@ -430,6 +431,9 @@ struct EgfxUpdates {
     /// Client negotiated cap version >= 10.6: the AVC444v2 chroma layout may
     /// be used for motion frames.
     avc444v2_enabled: bool,
+    /// When set, v2 frames carry the luma substream only (LC=1) — bisect
+    /// mode for the v2 envelope vs chroma packing.
+    avc444v2_luma_only: bool,
     started: Instant,
     stat_frames: u64,
     stat_h264: u64,
@@ -1106,10 +1110,15 @@ impl EgfxUpdates {
         if self.avc_disabled {
             tracing::warn!("EGFX: client has AVC disabled — using lossless ClearCodec only");
         }
-        // AVC444v2 is opt-in while the chroma-view packing is being validated
-        // against mstsc's strict decoder: LINRDP_AVC444V2=1 enables it.
-        self.avc444v2_enabled = server.supports_avc444v2()
-            && std::env::var("LINRDP_AVC444V2").as_deref() == Ok("1");
+        // AVC444v2 is opt-in while the v2 stream is being validated against
+        // mstsc's strict decoder: LINRDP_AVC444V2=1 enables it, and
+        // LINRDP_AVC444V2_LUMA_ONLY=1 narrows it to luma-only subframes
+        // (LC=1) — the bisect switch separating the v2 PDU envelope from the
+        // chroma-view packing.
+        let avc444v2_requested = std::env::var("LINRDP_AVC444V2").as_deref() == Ok("1");
+        let luma_only = std::env::var("LINRDP_AVC444V2_LUMA_ONLY").as_deref() == Ok("1");
+        self.avc444v2_enabled = server.supports_avc444v2() && avc444v2_requested;
+        self.avc444v2_luma_only = luma_only;
 
         let Some(id) = server.create_surface_with_format(pad_width, pad_height, PixelFormat::XRgb) else {
             tracing::warn!("EGFX: surface creation failed — legacy path resumes next frame");
@@ -1409,13 +1418,14 @@ impl EgfxUpdates {
         let (pw, ph) = (surface.pad_width, surface.pad_height);
         let ts = self.timestamp_ms();
         let avc444v2 = self.avc444v2_enabled;
+        let luma_only = self.avc444v2_luma_only;
 
         let joined = tokio::task::spawn_blocking(move || {
             // Materialize the bitstreams inside the closure: EncodedBitStream
             // borrows the encoder's internal buffer and is not Send.
             if avc444v2 {
                 let (luma, chroma) =
-                    bgrx_to_yuv444v2(&data, usize::from(w), usize::from(h), usize::from(pw), usize::from(ph));
+                    bgrx_to_yuv444v2(&data, usize::from(w), usize::from(h), usize::from(pw), usize::from(ph), luma_only);
                 let luma_bs = encoders.h264.as_mut().map(|enc| enc.encode(&luma).map(|bs| bs.to_vec()));
                 let chroma_bs = encoders
                     .h264_chroma
@@ -1469,9 +1479,12 @@ impl EgfxUpdates {
         let mut server = handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let sent = if avc444v2 {
-            let chroma_bitstream = chroma_bs
-                .unwrap_or_else(|| Ok(Vec::new()))
-                .unwrap_or_default();
+            let chroma_bitstream = if luma_only {
+                Ok(Vec::new()) // bisect mode: luma substream only (LC=1)
+            } else {
+                chroma_bs.unwrap_or_else(|| Ok(Vec::new()))
+            }
+            .unwrap_or_default();
             // LC=1 fallback when the chroma encoder produced nothing: the
             // client keeps waiting for the chroma view of these updates and
             // the next v2 frame delivers it.
@@ -1605,7 +1618,7 @@ fn make_h264_encoder_pair(
     rc_fps: f32,
     avc444v2: bool,
 ) -> anyhow::Result<(OpenH264, Option<OpenH264>)> {
-    let luma = make_h264_encoder(target_bitrate * AVC444V2_LUMA_BITRATE_SHARE / 10, rc_fps)?;
+    let luma = make_h264_encoder(target_bitrate, rc_fps)?;
     let chroma = if avc444v2 {
         Some(make_h264_encoder(
             target_bitrate * (10 - AVC444V2_LUMA_BITRATE_SHARE) / 10,
@@ -1767,9 +1780,10 @@ fn bgrx_to_yuv444v2(
     h: usize,
     pw: usize,
     ph: usize,
+    luma_only: bool,
 ) -> (openh264::formats::YUVBuffer, openh264::formats::YUVBuffer) {
     let mut luma = vec![0u8; 3 * (pw * ph) / 2];
-    let mut chroma = vec![0u8; 3 * (pw * ph) / 2];
+    let mut chroma = vec![0u8; if luma_only { 0 } else { 3 * (pw * ph) / 2 }];
     let (ly, rest) = luma.split_at_mut(pw * ph);
     let (lu, lv) = rest.split_at_mut(pw * ph / 4);
     let (cy, rest2) = chroma.split_at_mut(pw * ph);
@@ -1803,7 +1817,13 @@ fn bgrx_to_yuv444v2(
             .zip(cus.into_iter().zip(cvs))
         {
             let j1 = (j0 + pairs_per_worker).min(pairs);
-            scope.spawn(move || convert_rows_v2(src, w, h, pw, ly, lu, lv, cy, cu, cv, j0, j1));
+            scope.spawn(move || {
+                if luma_only {
+                    convert_rows_v2(src, w, h, pw, ly, lu, lv, &mut [], &mut [], &mut [], j0, j1);
+                } else {
+                    convert_rows_v2(src, w, h, pw, ly, lu, lv, cy, cu, cv, j0, j1);
+                }
+            });
         }
     });
 
@@ -1905,6 +1925,9 @@ fn convert_rows_v2(
             luma_u[j_local * half + x2] = u8::try_from(u_sum / 4).unwrap_or(u8::MAX);
             luma_v[j_local * half + x2] = v8_mean(v_sum);
 
+            if chroma_y.is_empty() {
+                continue; // luma-only mode (LC=1 bisect): no chroma view
+            }
             // Chroma view Y, even source row [B4, B5]: odd source columns.
             chroma_y[ye * pw + x2] = u01;
             chroma_y[ye * pw + x2 + half] = v01;
@@ -1955,7 +1978,7 @@ mod avc444v2_tests {
             px[3] = 0xFF;
         }
 
-        let (luma, chroma) = bgrx_to_yuv444v2(&src, w, h, pw, ph);
+        let (luma, chroma) = bgrx_to_yuv444v2(&src, w, h, pw, ph, false);
 
         let (b, g, r) = (i32::from(30), i32::from(160), i32::from(240));
         let y_c = ((54 * r + 183 * g + 18 * b) >> 8).clamp(0, 255) as u8;
