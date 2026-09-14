@@ -1445,11 +1445,23 @@ impl EgfxUpdates {
             return; // encoder skipped unchanged input
         }
 
+        // AVC444v2 region rects must align to the 16x16 macroblock grid the
+        // decoder works on (an unaligned bottom tripped mstsc into protocol
+        // error 0xD06 + disconnect); the padded surface covers exactly that
+        // grid and the converter fills the padding with replicated edges.
+        let (region_right, region_bottom): (u16, u16) = if avc444v2 {
+            (
+                pw.try_into().unwrap_or(u16::MAX),
+                ph.try_into().unwrap_or(u16::MAX),
+            )
+        } else {
+            (w, h)
+        };
         let region = Avc420Region {
             left: 0,
             top: 0,
-            right: w,
-            bottom: h,
+            right: region_right,
+            bottom: region_bottom,
             quantization_parameter: 21, // low QP = high quality
             quality: 90,
         };
