@@ -363,6 +363,7 @@ impl RdpServerDisplay for EgfxDisplay {
             process_ms: 0.0,
             motion_frames: 0,
             motion_frames_mark: 0,
+            last_sent: 0,
             backpressure_events: 0,
             bitrate_boost: 1.0,
             busy_ms: 0.0,
@@ -467,6 +468,8 @@ struct EgfxUpdates {
     /// "is motion actually flowing" gate (see MIN_MOTION_FRAMES_PER_EVAL).
     motion_frames: u64,
     motion_frames_mark: u64,
+    /// Total v2 frames sent — drives the chroma-every-other-frame parity.
+    last_sent: u64,
     /// Backpressure incidents (client decode queue full) observed since the
     /// last adaptive-quality evaluation — together with RTT inflation, one of
     /// the two real strain signals.
@@ -1284,10 +1287,37 @@ impl EgfxUpdates {
         let Some(surface) = self.surface else { return };
         let Some(mut encoders) = self.take_encoders() else { return };
         let ts = self.timestamp_ms();
+        // A full paint covers the 16-padded surface, not just the real
+        // rows: v2 motion frames paint the padding too (16-aligned region
+        // rects), so an unpainted padding strip would flicker between
+        // stale-surface black and content on every motion/idle transition.
         let full = x == 0 && y == 0 && w == frame_w && h == frame_h;
+        let (x, y, w, h) = if full {
+            (0u16, 0u16, surface.pad_width, surface.pad_height)
+        } else {
+            (x, y, w, h)
+        };
 
         let joined = tokio::task::spawn_blocking(move || {
-            let bgra = if full {
+            let bgra = if full && (w != frame_w || h != frame_h) {
+                // Full paint of the padded surface: replicate the last real
+                // row/column into the padding.
+                let mut padded = vec![0u8; usize::from(w) * usize::from(h) * 4];
+                for row in 0..usize::from(h) {
+                    let src_row = row.min(usize::from(frame_h) - 1);
+                    let start = src_row * usize::from(frame_w) * 4;
+                    let copy_w = (usize::from(frame_w) * 4).min(usize::from(w) * 4);
+                    padded[row * usize::from(w) * 4..row * usize::from(w) * 4 + copy_w]
+                        .copy_from_slice(&data[start..start + copy_w]);
+                    for col in copy_w..usize::from(w) * 4 {
+                        padded[row * usize::from(w) * 4 + col] = data[start + copy_w - 4 + col % 4];
+                    }
+                }
+                for px in padded.chunks_exact_mut(4) {
+                    px[3] = 0xFF;
+                }
+                padded
+            } else if full {
                 // Whole frame: just force the alpha byte opaque in place.
                 let mut bgra = data;
                 for px in bgra.chunks_exact_mut(4) {
@@ -1402,6 +1432,7 @@ impl EgfxUpdates {
         let ts = self.timestamp_ms();
         let avc444v2 = self.avc444v2_enabled;
         let luma_only = self.avc444v2_luma_only;
+        let chroma_parity = self.last_sent % 2 == 0;
 
         let joined = tokio::task::spawn_blocking(move || {
             // Materialize the bitstreams inside the closure: EncodedBitStream
@@ -1422,10 +1453,15 @@ impl EgfxUpdates {
                 // frame (observed: flickering garbage with periodic correct
                 // ClearCodec repaints).
                 let luma_bs = encoders.h264.as_mut().map(|enc| enc.encode(&luma).map(|bs| bs.to_vec()));
-                let chroma_bs = if luma_only {
-                    None
-                } else {
+                // The chroma view doubles the encode cost; sending it every
+                // other motion frame halves that while keeping 4:4:4 sharpness
+                // (chroma lags ~50-80 ms — invisible next to the luma rate).
+                // LC then alternates 0/1 per [MS-RDPEGFX 2.2.4.6].
+                let chroma_due = !luma_only && chroma_parity;
+                let chroma_bs = if chroma_due {
                     encoders.h264.as_mut().map(|enc| enc.encode(&chroma).map(|bs| bs.to_vec()))
+                } else {
+                    None
                 };
                 (encoders, luma_bs, chroma_bs)
             } else {
@@ -1514,6 +1550,7 @@ impl EgfxUpdates {
             self.stat_h264 += 1;
             self.producer_frames += 1;
             self.motion_frames += 1;
+            self.last_sent += 1;
             self.last_h264 = Instant::now();
             self.pending_full = false;
         } else {
