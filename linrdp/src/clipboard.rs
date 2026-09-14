@@ -853,8 +853,11 @@ impl CliprdrBackend for X11CliprdrBackend {
     fn on_format_data_request(&mut self, request: FormatDataRequest) {
         tracing::debug!(format = ?request.format, "clipboard: client requests format data");
         let response: OwnedFormatDataResponse = if request.format == CF_UNICODETEXT {
+            // CF_UNICODETEXT is UTF-16LE with CRLF line endings, NUL-terminated.
+            // Sending UTF-8 bytes here makes Windows decode them as UTF-16LE,
+            // which renders every two ASCII characters as one CJK glyph.
             match self.read_x11_text() {
-                Some(text) => FormatDataResponse::new_data(text_to_crlf(&text).into_bytes()).into_owned(),
+                Some(text) => FormatDataResponse::new_data(text_to_utf16_crlf(&text)).into_owned(),
                 None => FormatDataResponse::new_error(),
             }
         } else {
@@ -1112,11 +1115,10 @@ pub(crate) fn text_to_crlf(text: &str) -> String {
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\n' {
+            // Bare LF: emit CRLF; the next line's newline is its own.
             out.push_str("\r\n");
-            if chars.peek() == Some(&'\n') {
-                chars.next();
-            }
         } else if c == '\r' {
+            // CRLF pair already: emit once, skip the LF half.
             out.push_str("\r\n");
             if chars.peek() == Some(&'\n') {
                 chars.next();
@@ -1126,6 +1128,16 @@ pub(crate) fn text_to_crlf(text: &str) -> String {
         }
     }
     out
+}
+
+/// CF_UNICODETEXT wire format: UTF-16LE, CRLF line endings, NUL-terminated.
+pub(crate) fn text_to_utf16_crlf(text: &str) -> Vec<u8> {
+    let mut bytes: Vec<u8> = text_to_crlf(text)
+        .encode_utf16()
+        .flat_map(|unit| unit.to_le_bytes())
+        .collect();
+    bytes.extend_from_slice(&[0, 0]);
+    bytes
 }
 
 /// Forwards clipboard messages from the backend into the session event loop,
@@ -1180,16 +1192,20 @@ mod tests {
     use super::*;
     use ironrdp_cliprdr::pdu::ClipboardFormatName;
 
-    /// Records the ClipboardMessages the backend emits (discriminant + id).
+    /// Records the ClipboardMessages the backend emits (discriminant + id),
+    /// plus the payload of the last SendFormatData (text serving).
     #[derive(Debug)]
-    struct CapturingProxy(Mutex<Vec<(&'static str, u32)>>);
+    struct CapturingProxy(Mutex<Vec<(&'static str, u32)>>, Mutex<Option<Vec<u8>>>);
 
     impl ClipboardMessageProxy for CapturingProxy {
         fn send_clipboard_message(&self, message: ClipboardMessage) {
             let entry = match &message {
                 ClipboardMessage::SendInitiatePaste(id) => ("paste", id.0),
                 ClipboardMessage::SendInitiateCopy(_) => ("copy", 0),
-                ClipboardMessage::SendFormatData(_) => ("data", 0),
+                ClipboardMessage::SendFormatData(data) => {
+                    *self.1.lock().expect("poisoned") = Some(data.data().to_vec());
+                    ("data", 0)
+                }
                 ClipboardMessage::SendFileContentsRequest(request) => ("freq", request.stream_id),
                 ClipboardMessage::SendFileContentsResponse(_) => ("fresp", 0),
                 ClipboardMessage::SendInitiateFileCopy(_) => ("fcopy", 0),
@@ -1209,8 +1225,11 @@ mod tests {
     }
 
     fn backend_with_proxy() -> (X11CliprdrBackend, Arc<CapturingProxy>) {
-        let proxy = Arc::new(CapturingProxy(Mutex::new(Vec::new())));
-        let mut backend = X11CliprdrBackend::new(String::new(), String::new());
+        let proxy = Arc::new(CapturingProxy(
+            Mutex::new(Vec::new()),
+            Mutex::new(None),
+        ));
+        let backend = X11CliprdrBackend::new(String::new(), String::new());
         *backend.proxy.lock().expect("poisoned") =
             Some(Box::new(CapturingProxyHandle(Arc::clone(&proxy))));
         (backend, proxy)
@@ -1361,6 +1380,39 @@ mod tests {
             }
         }
         assert_eq!(found, 1, "exactly one paste dir with both files");
+    }
+
+    #[test]
+    fn served_text_is_utf16le_with_crlf() {
+        let _guard = crate::x11_selection::X11_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let display = std::env::var("DISPLAY").unwrap_or_default();
+        if !display.contains(':') {
+            eprintln!("skipping: no X11 display");
+            return;
+        }
+        set_x11_text_selection(&display, "cześć\nlinie");
+        std::thread::sleep(Duration::from_millis(400));
+
+        let (mut backend, proxy) = backend_with_proxy();
+        backend.on_format_data_request(FormatDataRequest { format: CF_UNICODETEXT });
+
+        let sent = proxy.1.lock().expect("poisoned").clone().expect("format data sent");
+        // Round-trip: Windows decodes these bytes as UTF-16LE, CRLF, NUL-terminated.
+        let decoded = read_utf16_string(&sent, None).expect("valid UTF-16LE");
+        assert_eq!(decoded, "cześć\r\nlinie");
+        assert!(sent.ends_with(&[0, 0]), "must be NUL-terminated");
+    }
+
+    #[test]
+    fn text_to_utf16_crlf_encodes_ascii_pairs() {
+        assert_eq!(text_to_utf16_crlf("hi"), vec![0x68, 0x00, 0x69, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            text_to_utf16_crlf("a\nb"),
+            vec![0x61, 0x00, 0x0D, 0x00, 0x0A, 0x00, 0x62, 0x00, 0x00, 0x00]
+        );
+        // Blank lines must survive, and an existing CRLF must not double.
+        assert_eq!(text_to_crlf("a\n\nb"), "a\r\n\r\nb");
+        assert_eq!(text_to_crlf("a\r\nb"), "a\r\nb");
     }
 
     #[test]
