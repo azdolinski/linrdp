@@ -40,7 +40,13 @@ impl X264Encoder {
         let enc = Setup::preset(Preset::Superfast, Tune::None, false, true)
             .fps(fps_u, 1)
             .bitrate(kbps)
-            .max_keyframe_interval(250)
+            // All-intra: every frame is an independent IDR. Temporal
+            // prediction across screen frames makes static dark areas pump
+            // (per-frame requantization of unchanged pixels, the flicker
+            // the user sees on panels/black backgrounds); with all-intra
+            // identical content encodes to identical output every frame.
+            .max_keyframe_interval(1)
+            .min_keyframe_interval(1)
             .annexb(true)
             .build(Colorspace::I420, i32::from(width), i32::from(height))
             .map_err(|e| anyhow::anyhow!("x264 setup: {e:?}"))
