@@ -71,6 +71,23 @@ impl Setup {
     /// Approximately restricts the bitrate.
     ///
     /// The value is in metric kilobits per second.
+    /// Constant-quality rate control (CRF): stable QP across frames —
+    /// identical input encodes to identical output, no rate-control feedback
+    /// pumping on static content. Pair with `vbv` to bound the rate.
+    pub fn crf(mut self, crf: i32) -> Self {
+        self.raw.rc.i_rc_method = x264_sys::x264::X264_RC_CRF as i32;
+        self.raw.rc.f_rf_constant = crf as f32;
+        self
+    }
+
+    /// VBV peak rate and buffer size (both kbps/kbit) — caps the
+    /// instantaneous bitrate under CRF.
+    pub fn vbv(mut self, maxrate: i32, bufsize: i32) -> Self {
+        self.raw.rc.i_vbv_max_bitrate = maxrate;
+        self.raw.rc.i_vbv_buffer_size = bufsize;
+        self
+    }
+
     pub fn bitrate(mut self, bitrate: i32) -> Self {
         self.raw.rc.i_bitrate = bitrate;
         self

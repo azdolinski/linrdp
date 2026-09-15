@@ -37,7 +37,7 @@ ironrdp-graphics = { path = "../crates/ironrdp-graphics" }
 openh264 = { version = "0.9", default-features = false, features = ["source"] }
 # Reference-grade software H.264 encoder (the selkies/x264 path): native
 # multithreading, High 4:4:4 profile, far better compression than OpenH264.
-x264 = "0.5.0"
+x264 = { path = "../crates/x264" }
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
