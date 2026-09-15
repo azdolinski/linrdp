@@ -1445,7 +1445,6 @@ impl EgfxUpdates {
         let ts = self.timestamp_ms();
         let avc444v2 = self.avc444v2_enabled;
         let luma_only = self.avc444v2_luma_only;
-        let chroma_parity = self.last_sent % 2 == 0;
 
         let joined = tokio::task::spawn_blocking(move || {
             // Materialize the bitstreams inside the closure: EncodedBitStream
@@ -1469,18 +1468,18 @@ impl EgfxUpdates {
                     .h264
                     .as_mut()
                     .map(|enc| enc.encode_planes(luma.y(), luma.u(), luma.v()));
-                // The chroma view doubles the encode cost; sending it every
-                // other motion frame halves that while keeping 4:4:4 sharpness
-                // (chroma lags ~50-80 ms — invisible next to the luma rate).
-                // LC then alternates 0/1 per [MS-RDPEGFX 2.2.4.6].
-                let chroma_due = !luma_only && chroma_parity;
-                let chroma_bs = if chroma_due {
+                // Chroma rides EVERY v2 frame (LC=0 always): alternating
+                // LC=0/LC=1 made mstsc flip between two chroma renditions
+                // (fresh subframe vs held previous) — the visible flicker of
+                // the bottom line. Deterministic all-intra + CRF keeps the
+                // cost acceptable; drop LINRDP_AVC444V2 to go back to 420.
+                let chroma_bs = if luma_only {
+                    None
+                } else {
                     encoders
                         .h264
                         .as_mut()
                         .map(|enc| enc.encode_planes(chroma.y(), chroma.u(), chroma.v()))
-                } else {
-                    None
                 };
                 (encoders, luma_bs, chroma_bs)
             } else {
