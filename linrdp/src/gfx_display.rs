@@ -1099,6 +1099,8 @@ impl EgfxUpdates {
 
     /// (Re)create the EGFX surface for the current screen geometry.
     fn ensure_surface(&mut self, handle: &GfxHandle, width: u16, height: u16) {
+        let pad_width = width.div_ceil(16) * 16; // H.264 macroblock alignment
+        let pad_height = height.div_ceil(16) * 16;
         let mut server = handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if self.surface.is_some() {
@@ -1121,7 +1123,7 @@ impl EgfxUpdates {
         self.avc444v2_enabled = server.supports_avc444v2() && avc444v2_requested;
         self.avc444v2_luma_only = luma_only;
 
-        let Some(id) = server.create_surface_with_format(width, height, PixelFormat::XRgb) else {
+        let Some(id) = server.create_surface_with_format(pad_width, pad_height, PixelFormat::XRgb) else {
             tracing::warn!("EGFX: surface creation failed — legacy path resumes next frame");
             return;
         };
@@ -1130,11 +1132,11 @@ impl EgfxUpdates {
             id,
             width,
             height,
-            pad_width: width,
-            pad_height: height,
+            pad_width,
+            pad_height,
         });
 
-        tracing::info!(surface = id, width, height, "EGFX surface created");
+        tracing::info!(surface = id, width, height, pad_width, pad_height, "EGFX surface created");
         drop(server);
         self.session.drain_and_send(handle);
     }
@@ -1298,10 +1300,37 @@ impl EgfxUpdates {
         let Some(surface) = self.surface else { return };
         let Some(mut encoders) = self.take_encoders() else { return };
         let ts = self.timestamp_ms();
+        // A full paint covers the 16-padded surface, not just the real
+        // rows: v2 motion frames paint the padding too (16-aligned region
+        // rects), so an unpainted padding strip would flicker between
+        // stale-surface black and content on every motion/idle transition.
         let full = x == 0 && y == 0 && w == frame_w && h == frame_h;
+        let (x, y, w, h) = if full {
+            (0u16, 0u16, surface.pad_width, surface.pad_height)
+        } else {
+            (x, y, w, h)
+        };
 
         let joined = tokio::task::spawn_blocking(move || {
-            let bgra = if full {
+            let bgra = if full && (w != frame_w || h != frame_h) {
+                // Full paint of the padded surface: replicate the last real
+                // row/column into the padding.
+                let mut padded = vec![0u8; usize::from(w) * usize::from(h) * 4];
+                for row in 0..usize::from(h) {
+                    let src_row = row.min(usize::from(frame_h) - 1);
+                    let start = src_row * usize::from(frame_w) * 4;
+                    let copy_w = (usize::from(frame_w) * 4).min(usize::from(w) * 4);
+                    padded[row * usize::from(w) * 4..row * usize::from(w) * 4 + copy_w]
+                        .copy_from_slice(&data[start..start + copy_w]);
+                    for col in copy_w..usize::from(w) * 4 {
+                        padded[row * usize::from(w) * 4 + col] = data[start + copy_w - 4 + col % 4];
+                    }
+                }
+                for px in padded.chunks_exact_mut(4) {
+                    px[3] = 0xFF;
+                }
+                padded
+            } else if full {
                 // Whole frame: just force the alpha byte opaque in place.
                 let mut bgra = data;
                 for px in bgra.chunks_exact_mut(4) {
