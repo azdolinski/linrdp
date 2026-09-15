@@ -1,0 +1,25 @@
+[package]
+name = "x264-sys"
+version = "0.2.3"
+edition = "2018"
+build = "build.rs"
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "FFI bindings to x264, built from the vendored source"
+license = "MIT"
+links = "x264"
+
+[lib]
+name = "x264_sys"
+path = "src/lib.rs"
+
+[dependencies]
+
+[build-dependencies.bindgen]
+version = "0.72.0"
+
+[build-dependencies.cc]
+version = "1"

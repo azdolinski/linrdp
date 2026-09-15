@@ -19,6 +19,7 @@
 //! to yielding legacy bitmap updates, which the server encodes with
 //! RemoteFX/NSCodec as before.
 
+use anyhow::Context as _;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -32,11 +33,9 @@ use ironrdp_server::{
     DesktopSize, DisplayUpdate, LargePointer, RdpServerDisplay, RdpServerDisplayUpdates,
     RGBAPointer, ServerResult,
 };
-use openh264::encoder::{
-    BitRate, Encoder as OpenH264, EncoderConfig, FrameRate, RateControlMode, UsageType, VuiConfig,
-};
-
 use crate::capture::{CursorImage, Grab, ScreenGrabber, X11Display, POLL_INTERVAL, RESIZE_SETTLE};
+use crate::x264_encoder::X264Encoder;
+use openh264::formats::YUVSource;
 use crate::gfx::GfxSession;
 
 type GfxHandle = Arc<Mutex<GraphicsPipelineServer>>;
@@ -206,7 +205,7 @@ const MAX_VALID_RTT_MS: f64 = 60_000.0;
 
 /// CPU-heavy encoders, moved in and out of `spawn_blocking` per frame.
 struct Encoders {
-    h264: Option<OpenH264>,
+    h264: Option<X264Encoder>,
     clear: ClearCodecEncoder,
 }
 
@@ -251,6 +250,20 @@ pub(crate) trait DisplaySourceFactory: Send + Sync + 'static {
     fn request_initial_size(&self, client_size: DesktopSize) -> DesktopSize;
     fn request_layout(&self, layout: ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout);
     fn updates_source(&self) -> Box<dyn FrameSource>;
+}
+
+/// Build the x264 motion encoder: ABR at `target_bitrate`, superfast preset
+/// with zero-latency tuning (no B-frames, no lookahead — interactive), full
+/// multithreading. Annex-B output with in-band SPS/PPS at each IDR.
+#[must_use]
+fn make_h264_encoder(
+    target_bitrate: u32,
+    rc_fps: f32,
+    pw: u16,
+    ph: u16,
+) -> anyhow::Result<crate::x264_encoder::X264Encoder> {
+    crate::x264_encoder::X264Encoder::new(target_bitrate, rc_fps, pw, ph)
+        .context("x264 encoder init")
 }
 
 /// Display backend that routes frames over EGFX when available.
@@ -943,7 +956,7 @@ impl EgfxUpdates {
                 h264: Some(h264), ..
             }) = self.encoders.as_mut()
             {
-                h264.force_intra_frame();
+                h264.force_intra();
             }
             self.pending_full = true;
         }
@@ -970,7 +983,7 @@ impl EgfxUpdates {
                     h264: Some(h264), ..
                 }) = self.encoders.as_mut()
                 {
-                    h264.force_intra_frame();
+                    h264.force_intra();
                 }
                 self.ensure_surface(handle, grab.width, grab.height);
                 self.pending_full = true;
@@ -1405,21 +1418,21 @@ impl EgfxUpdates {
             _ => true,
         };
         if bitrate_stale {
-            match make_h264_encoder(target_bitrate, target_rate_fps) {
+            match make_h264_encoder(
+                target_bitrate,
+                target_rate_fps,
+                surface.pad_width,
+                surface.pad_height,
+            ) {
                 Ok(h264) => {
-                    match self.encoders.as_mut() {
-                        Some(encoders) => encoders.h264 = Some(h264),
-                        None => {
-                            self.encoders = Some(Encoders {
-                                h264: Some(h264),
-                                clear: ClearCodecEncoder::new(),
-                            });
-                        }
-                    }
+                    self.encoders = Some(Encoders {
+                        h264: Some(h264),
+                        clear: ClearCodecEncoder::new(),
+                    });
                     self.enc_built = Some((target_bitrate, target_rate_fps));
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "EGFX: OpenH264 init failed — ClearCodec only");
+                    tracing::warn!(error = %e, "EGFX: x264 init failed — ClearCodec only");
                     self.avc_disabled = true;
                     self.send_clear(handle, data, w, h, 0, 0, w, h).await;
                     return;
@@ -1452,21 +1465,30 @@ impl EgfxUpdates {
                 // interleaved SPS/PPS/IDRs that reset mstsc's decoder every
                 // frame (observed: flickering garbage with periodic correct
                 // ClearCodec repaints).
-                let luma_bs = encoders.h264.as_mut().map(|enc| enc.encode(&luma).map(|bs| bs.to_vec()));
+                let luma_bs = encoders
+                    .h264
+                    .as_mut()
+                    .map(|enc| enc.encode_planes(luma.y(), luma.u(), luma.v()));
                 // The chroma view doubles the encode cost; sending it every
                 // other motion frame halves that while keeping 4:4:4 sharpness
                 // (chroma lags ~50-80 ms — invisible next to the luma rate).
                 // LC then alternates 0/1 per [MS-RDPEGFX 2.2.4.6].
                 let chroma_due = !luma_only && chroma_parity;
                 let chroma_bs = if chroma_due {
-                    encoders.h264.as_mut().map(|enc| enc.encode(&chroma).map(|bs| bs.to_vec()))
+                    encoders
+                        .h264
+                        .as_mut()
+                        .map(|enc| enc.encode_planes(chroma.y(), chroma.u(), chroma.v()))
                 } else {
                     None
                 };
                 (encoders, luma_bs, chroma_bs)
             } else {
                 let yuv = bgrx_to_yuv420(&data, usize::from(w), usize::from(h), usize::from(pw), usize::from(ph));
-                let luma_bs = encoders.h264.as_mut().map(|enc| enc.encode(&yuv).map(|bs| bs.to_vec()));
+                let luma_bs = encoders
+                    .h264
+                    .as_mut()
+                    .map(|enc| enc.encode_planes(yuv.y(), yuv.u(), yuv.v()));
                 (encoders, luma_bs, None)
             }
         })
@@ -1478,8 +1500,8 @@ impl EgfxUpdates {
         };
         self.encoders = Some(encoders);
 
-        let Some(Ok(luma_bitstream)) = luma_bs else {
-            // No encoder or encoder error: recover with a lossless full paint.
+        let Some(luma_bitstream) = luma_bs else {
+            // No encoder: recover with a lossless full paint.
             self.pending_full = true;
             return;
         };
@@ -1512,11 +1534,10 @@ impl EgfxUpdates {
 
         let sent = if avc444v2 {
             let chroma_bitstream = if luma_only {
-                Ok(Vec::new()) // bisect mode: luma substream only (LC=1)
+                Vec::new() // bisect mode: luma substream only (LC=1)
             } else {
-                chroma_bs.unwrap_or_else(|| Ok(Vec::new()))
-            }
-            .unwrap_or_default();
+                chroma_bs.unwrap_or_default()
+            };
             // LC=1 fallback when the chroma encoder produced nothing: the
             // client keeps waiting for the chroma view of these updates and
             // the next v2 frame delivers it.
@@ -1637,30 +1658,6 @@ impl EgfxUpdates {
     }
 }
 
-fn make_h264_encoder(bitrate_bps: u32, rc_fps: f32) -> anyhow::Result<OpenH264> {
-    let api = openh264::OpenH264API::from_source();
-    let config = EncoderConfig::new()
-        .bitrate(BitRate::from_bps(bitrate_bps))
-        .max_frame_rate(FrameRate::from_hz(rc_fps))
-        // Camera-class coding tools (what KRdp's GStreamer x264/hw encoders
-        // and RustDesk effectively use). The screen-content encoder's
-        // exhaustive mode search measured 420+ ms per 2880x1800 frame on
-        // this machine — a hard ~2 fps ceiling — while camera mode with
-        // size-limited slices encodes the same frame in ~32 ms. Static UI
-        // never goes through H.264 anyway: ClearCodec repaints it lossless.
-        .usage_type(UsageType::CameraVideoRealTime)
-        .rate_control_mode(RateControlMode::Bitrate)
-        // Size-limited slices are what unlock OpenH264's multi-threaded
-        // slice encoder; a single slice caps it at one thread.
-        .max_slice_len(ENCODER_SLICE_BYTES)
-        .skip_frames(false)
-        // Signal the colorspace in the SPS VUI: the planes are full-range
-        // BT.709 (MS-RDPEGFX §3.3.8.3.1), and without this flag a
-        // spec-compliant decoder assumes limited range (Y 16..235) and
-        // crushes our dark-theme desktop (luma ~20) to near-black.
-        .vui(VuiConfig::bt709().full_range(true));
-    OpenH264::with_api_config(api, config).map_err(|e| anyhow::anyhow!("openh264 init: {e}"))
-}
 
 /// Convert a BGRX grab into macroblock-padded I420 planes, **full-range
 /// BT.709**, split across worker threads (single-threaded the conversion

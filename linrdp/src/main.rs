@@ -18,6 +18,7 @@ mod sam;
 mod sound;
 mod sound_real;
 mod tls;
+mod x264_encoder;
 mod udp;
 mod usb;
 mod session_ctl;
