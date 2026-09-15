@@ -61,7 +61,7 @@ use std::time::Instant;
 use ironrdp_core::{Encode, EncodeResult, WriteCursor, decode, impl_as_any};
 use ironrdp_dvc::{DvcEncode, DvcMessage, DvcProcessor, DvcServerProcessor};
 use ironrdp_graphics::zgfx::{CompressionMode, Compressor, compress_and_wrap_egfx, wrap_uncompressed};
-use ironrdp_pdu::gcc::Monitor;
+use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp_pdu::geometry::ExclusiveRectangle;
 use ironrdp_pdu::{PduResult, decode_err};
 use tracing::{debug, trace, warn};
@@ -1183,10 +1183,18 @@ impl GraphicsPipelineServer {
                 height
             };
 
+            // KRdp (and Windows) populate a MONITOR_PRIMARY monitor covering
+            // the desktop; an empty monitor array has no reference behavior.
             self.output_queue.push_back(GfxPdu::ResetGraphics(ResetGraphicsPdu {
                 width: u32::from(desktop_width),
                 height: u32::from(desktop_height),
-                monitors: Vec::new(),
+                monitors: vec![Monitor {
+                    left: 0,
+                    top: 0,
+                    right: i32::from(desktop_width),
+                    bottom: i32::from(desktop_height),
+                    flags: MonitorFlags::PRIMARY,
+                }],
             }));
 
             self.output_width = desktop_width;
@@ -2046,11 +2054,24 @@ impl GraphicsPipelineServer {
         // ResetGraphics + CreateSurface(id=0) + MapSurfaceToOutput + IDR.
         let is_readvertise = self.state == ServerState::Ready;
         if is_readvertise {
+            // KRdp's proven mstsc-recovery sequence (VideoStream.cpp
+            // `onCapsAdvertise` + `destroySurface`): confirm caps, send an
+            // explicit DeleteSurface for every live surface, and allocate a
+            // FRESH surface id on the next create. A silent state clear that
+            // re-created the SAME id (duplicate CreateSurface(0), no Delete)
+            // tripped mstsc 26100 into an instant RST — observed 5-20 ms
+            // after the re-create, on every session, when the dims matched
+            // or not. KRdp also populates a MONITOR_PRIMARY monitor in
+            // ResetGraphics (below) — mirrored here.
             debug!(
-                "EGFX: mid-session CapsAdvertise observed, silently clearing surface and frame \
-                 state for re-initialization (no DeleteSurface PDU emitted, surface ID counter reset)"
+                "EGFX: mid-session CapsAdvertise observed — CapsConfirm + DeleteSurface + \
+                 fresh surface id on next create (KRdp recovery sequence)"
             );
-            self.surfaces.reset_for_reinit();
+            for surface_id in self.surfaces.surface_ids().collect::<Vec<_>>() {
+                self.output_queue
+                    .push_back(GfxPdu::DeleteSurface(DeleteSurfacePdu { surface_id }));
+            }
+            self.surfaces.clear();
             self.frames.clear();
             self.reset_graphics_sent = false;
         }
