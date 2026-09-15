@@ -27,7 +27,7 @@ impl X264Encoder {
     /// superfast + zero-latency (no B-frames, no lookahead — interactive
     /// latency), IDR every ~250 frames. Recreate to force a keyframe.
     pub fn new(bitrate_bps: u32, fps: f32, width: u16, height: u16) -> anyhow::Result<Self> {
-        let _ = bitrate_bps; // CRF mode: constant quality; VBV caps the rate.
+        let kbps = i32::try_from((bitrate_bps / 1000).clamp(1, 50_000)).unwrap_or(19_000);
         // Precision guard: clamped to 1..=60 fps, so the f32→u32 cast is
         // lossless for the integer part.
         #[expect(
@@ -39,12 +39,9 @@ impl X264Encoder {
         let fps_u = fps.round().clamp(1.0, 60.0) as u32;
         let enc = Setup::preset(Preset::Superfast, Tune::None, false, true)
             .fps(fps_u, 1)
-            // CRF (constant QP) + all-intra: identical screen content
-            // encodes to identical bytes every frame — static dark areas
-            // and panels are pixel-stable, no flicker, no pumping.
-            // The VBV cap bounds bursts; on a LAN it is rarely hit.
-            .crf(18)
-            .vbv(80_000, 160_000)
+            // ABR at the adaptive bitrate target; VBV bounds bursts.
+            .bitrate(kbps)
+            .vbv(kbps * 2, kbps * 4)
             // All-intra: every frame is an independent IDR. Temporal
             // prediction across screen frames makes static dark areas pump
             // (per-frame requantization of unchanged pixels, the flicker
