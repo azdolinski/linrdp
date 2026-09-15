@@ -78,9 +78,6 @@ fn main() {
         .clang_arg("-std=c99")
         .clang_arg(format!("-I{}", build_dir.display()))
         .clang_arg(format!("-I{}", src_dir.display()))
-        .allowlist_type("x264_.*")
-        .allowlist_function("x264_.*")
-        .allowlist_var("x264_.*")
         .size_t_is_usize(true);
 
     let bindings = builder.generate().expect("bindgen x264");
