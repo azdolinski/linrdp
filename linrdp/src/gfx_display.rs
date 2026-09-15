@@ -1313,8 +1313,9 @@ impl EgfxUpdates {
 
         let joined = tokio::task::spawn_blocking(move || {
             let bgra = if full && (w != frame_w || h != frame_h) {
-                // Full paint of the padded surface: replicate the last real
-                // row/column into the padding.
+                // Full paint of the padded surface: the padding rows are
+                // BLACK — constant in every frame (no flicker), and reads
+                // as part of the dark theme rather than a duplicated edge.
                 let mut padded = vec![0u8; usize::from(w) * usize::from(h) * 4];
                 for row in 0..usize::from(h) {
                     let src_row = row.min(usize::from(frame_h) - 1);
@@ -1322,9 +1323,6 @@ impl EgfxUpdates {
                     let copy_w = (usize::from(frame_w) * 4).min(usize::from(w) * 4);
                     padded[row * usize::from(w) * 4..row * usize::from(w) * 4 + copy_w]
                         .copy_from_slice(&data[start..start + copy_w]);
-                    for col in copy_w..usize::from(w) * 4 {
-                        padded[row * usize::from(w) * 4 + col] = data[start + copy_w - 4 + col % 4];
-                    }
                 }
                 for px in padded.chunks_exact_mut(4) {
                     px[3] = 0xFF;
@@ -1864,11 +1862,15 @@ fn convert_rows_v2(
     j1: usize,
 ) {
     let stride = w * 4;
-    // Full-range BT.709 per component, coordinates clamped to the frame so
-    // the padding replicates the edge (the destination rectangle crops it).
+    // Full-range BT.709 per component. Coordinates outside the real frame
+    // (the 16-macroblock padding) yield BLACK: the padding rows of the
+    // encoded frame are composited by mstsc into the visible bottom strip,
+    // and a constant black strip is invisible on the dark theme, while a
+    // replicated edge would visibly duplicate the last desktop row.
     let yuv_at = |x: usize, y: usize| -> (u8, u8, u8) {
-        let x = x.min(w - 1);
-        let y = y.min(h - 1);
+        if x >= w || y >= h {
+            return (0, 128, 128);
+        }
         let off = y * stride + x * 4;
         let b = i32::from(src[off]);
         let g = i32::from(src[off + 1]);
@@ -1903,10 +1905,10 @@ fn convert_rows_v2(
         let yo_in_frame = yo_global < h;
 
         for x2 in 0..half {
-            let xe_src = (2 * x2).min(w - 1);
-            let xo_src = (xe_src + 1).min(w - 1);
-            let ye_src = ye_global.min(h - 1);
-            let yo_src = yo_global.min(h - 1);
+            let xe_src = 2 * x2;
+            let xo_src = xe_src + 1;
+            let ye_src = ye_global;
+            let yo_src = yo_global;
 
             let (y00, u00, v00) = yuv_at(xe_src, ye_src);
             let (y01, u01, v01) = yuv_at(xo_src, ye_src);
