@@ -106,62 +106,7 @@ impl X11Display {
     /// Per MS-RDPBCGR the server resizes its desktop to the negotiated
     /// session size — exactly what this performs on the X server.
     fn resize_screen(&mut self, width: u16, height: u16) -> anyhow::Result<()> {
-        // X11 resize via the standard `xrandr` utility (part of the X11
-        // server stack this server requires — same as Xvfb itself).
-        // Sequence: create CVT mode (if missing) → add to output → apply.
-        // This is the exact sequence of `xrandr --newmode/--addmode/--output`.
-        let mode_name = format!("{width}x{height}_60.00");
-
-        let run = |args: &[&str]| -> anyhow::Result<()> {
-            let status = std::process::Command::new("xrandr")
-                .args(args)
-                .env("DISPLAY", self.display_name.as_str())
-                .env("XAUTHORITY", self.xauthority.as_str())
-                .status()
-                .context("spawn xrandr")?;
-            if !status.success() {
-                anyhow::bail!("xrandr {:?} failed: {status}", args);
-            }
-            Ok(())
-        };
-
-        // Fast path: switch straight to the mode if one with this exact name
-        // already exists. Modes persist in the X server across linrdp
-        // restarts, so reconnects usually land here.
-        let switched = run(&["--output", "screen", "--mode", &mode_name]);
-        if switched.is_err() {
-            // Create a standard CVT timing for width×height @60Hz.
-            let output = std::process::Command::new("cvt")
-                .args([width.to_string().as_str(), height.to_string().as_str(), "60"])
-                .env("DISPLAY", self.display_name.as_str())
-                .env("XAUTHORITY", self.xauthority.as_str())
-                .output()
-                .context("spawn cvt")?;
-            let cvt_out = String::from_utf8_lossy(&output.stdout).to_string();
-            // cvt prints: Modeline "2880x1800_60.00" 442.00 2880 3104 3416 3952 ...
-            let modeline = cvt_out
-                .lines()
-                .find(|l| l.contains("Modeline"))
-                .context("cvt produced no modeline")?;
-            let params: Vec<&str> = modeline.split_whitespace().skip(1).collect();
-            // The name comes back wrapped in quotes — strip them, or the mode
-            // gets created under a name that includes the `"` characters and
-            // can never be selected by the clean name used above.
-            let name = params
-                .first()
-                .copied()
-                .context("no mode name")
-                .map(|n| n.trim_matches('"').to_owned())?;
-            let nums: Vec<&str> = params[1..].to_vec();
-            let mut a: Vec<&str> = vec!["--newmode", &name];
-            a.extend(nums);
-            // newmode/addmode failures are fine when the mode is already
-            // registered (e.g. added to the output in a previous run) — the
-            // definitive check is whether the final mode switch applies.
-            let _ = run(&a);
-            let _ = run(&["--addmode", "screen", &name]);
-            run(&["--output", "screen", "--mode", &mode_name])?;
-        }
+        xrandr_resize(&self.display_name, &self.xauthority, width, height)?;
 
         let (w, h) = self.query_root_geometry()?;
         if w != width || h != height {
@@ -182,13 +127,15 @@ impl X11Display {
 
     /// A fresh damage-tracking poller over this display's root window.
     pub(crate) fn grabber(&self) -> ScreenGrabber {
-        ScreenGrabber::new(
+        let mut grabber = ScreenGrabber::new(
             Arc::clone(&self.conn),
             self.root,
             self.width,
             self.height,
             self.display_name.clone(),
-        )
+        );
+        grabber.set_fixed_size(self.fixed_size);
+        grabber
     }
 
     /// The X display this server captures (for reconnects).
@@ -211,9 +158,26 @@ impl X11Display {
     pub(crate) fn request_initial_size_sync(&mut self, client_size: DesktopSize) -> DesktopSize {
         tracing::info!(?client_size, "request_initial_size called");
         if let Some((w, h)) = self.fixed_size {
-            // Fixed desktop: never touch the X screen per-connection. The
-            // client scales the fixed framebuffer locally, exactly like a
-            // Windows RDP session to a monitor of a different resolution.
+            // Fixed desktop: never adopt a client size, but DO re-assert the
+            // fixed geometry when the X screen drifted (observed spontaneous
+            // 2880x1800 → 2880x1680). A surface built from a drifted grab
+            // contradicts the negotiated session size and mstsc resets the
+            // connection on the next EGFX pipeline re-init. The resize also
+            // arms the settle hold, so the first frames go out post-churn.
+            match self.query_root_geometry() {
+                Ok((cw, ch)) if (cw, ch) == (w, h) => {}
+                Ok((cw, ch)) => {
+                    tracing::warn!(
+                        current = format!("{cw}x{ch}"),
+                        fixed = format!("{w}x{h}"),
+                        "X screen drifted from the fixed size — re-applying before the session"
+                    );
+                    if let Err(e) = self.resize_screen(w, h) {
+                        tracing::warn!(error = format!("{e:#}"), "fixed-size re-apply failed");
+                    }
+                }
+                Err(e) => tracing::warn!(error = format!("{e:#}"), "root geometry query failed"),
+            }
             tracing::info!(w, h, client_w = client_size.width, client_h = client_size.height,
                            "fixed desktop size — client scales locally");
             return DesktopSize { width: w, height: h };
@@ -575,6 +539,14 @@ pub(crate) struct ScreenGrabber {
     damage_ok: bool,
     /// The next poll grabs unconditionally (first grab, reconnect, resize).
     force_grab: bool,
+    /// Fixed desktop size (`--fixed-size`): when set, the grabber re-asserts
+    /// this geometry if the X screen drifts (see [`Self::grab`]).
+    fixed_size: Option<(u16, u16)>,
+    /// Xauthority for the `xrandr` re-apply spawned by the fixed-size
+    /// enforcement.
+    xauthority: String,
+    /// Next instant the fixed-size enforcement may query the root geometry.
+    next_size_check: Instant,
 }
 
 impl ScreenGrabber {
@@ -600,7 +572,16 @@ impl ScreenGrabber {
             damage: None,
             damage_ok: false,
             force_grab: true,
+            fixed_size: None,
+            xauthority: std::env::var("XAUTHORITY").unwrap_or_default(),
+            next_size_check: Instant::now(),
         }
+    }
+
+    /// Pin the grabber to a fixed desktop size: the X screen is re-asserted
+    /// whenever it drifts (throttled — see [`Self::grab`]).
+    pub(crate) fn set_fixed_size(&mut self, fixed_size: Option<(u16, u16)>) {
+        self.fixed_size = fixed_size;
     }
 
     /// Connect a fresh grabber to `display_name` (blocking). Used at session
@@ -670,6 +651,31 @@ impl ScreenGrabber {
     /// permanently once it is judged unusable. `None` on transient X11
     /// failure (retry next tick).
     fn grab(&mut self) -> Option<(Vec<u8>, u16, u16)> {
+        // Fixed-size enforcement: nothing in linrdp moves the X screen once
+        // the fixed size is applied, yet the screen demonstrably drifts
+        // (observed 2880x1800 → 2880x1680 with no client asking for it). A
+        // surface built from a drifted grab contradicts the negotiated
+        // session size, and mstsc resets the connection on the next EGFX
+        // pipeline re-init — so re-assert the size here (throttled) before
+        // the grab bakes the wrong geometry into a frame.
+        if let Some((fw, fh)) = self.fixed_size {
+            if Instant::now() >= self.next_size_check {
+                self.next_size_check = Instant::now() + FIXED_SIZE_CHECK_INTERVAL;
+                let (cw, ch) = self.current_geometry();
+                if (cw, ch) != (fw, fh) {
+                    tracing::warn!(
+                        current = format!("{cw}x{ch}"),
+                        fixed = format!("{fw}x{fh}"),
+                        "X screen drifted from the fixed size — re-applying"
+                    );
+                    if xrandr_resize(&self.display_name, &self.xauthority, fw, fh).is_ok() {
+                        self.width = fw;
+                        self.height = fh;
+                    }
+                }
+            }
+        }
+
         let (w, h) = self.current_geometry();
         let want = usize::from(w) * usize::from(h) * 4;
 
@@ -936,6 +942,69 @@ pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(16);
 /// failure. Resolution-independent: it follows every actual resize.
 pub(crate) const RESIZE_SETTLE: Duration = Duration::from_millis(1500);
 
+/// How often the fixed-size grabber re-checks the root geometry.
+const FIXED_SIZE_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Resize the X screen to `width`×`height` via the standard `xrandr`
+/// utility. Sequence: create CVT mode (if missing) → add to output → apply.
+/// This is the exact sequence of `xrandr --newmode/--addmode/--output`.
+/// Shared by the per-connection resize and the fixed-size enforcement.
+fn xrandr_resize(display_name: &str, xauthority: &str, width: u16, height: u16) -> anyhow::Result<()> {
+    let mode_name = format!("{width}x{height}_60.00");
+
+    let run = |args: &[&str]| -> anyhow::Result<()> {
+        let status = std::process::Command::new("xrandr")
+            .args(args)
+            .env("DISPLAY", display_name)
+            .env("XAUTHORITY", xauthority)
+            .status()
+            .context("spawn xrandr")?;
+        if !status.success() {
+            anyhow::bail!("xrandr {args:?} failed: {status}");
+        }
+        Ok(())
+    };
+
+    // Fast path: switch straight to the mode if one with this exact name
+    // already exists. Modes persist in the X server across linrdp
+    // restarts, so reconnects usually land here.
+    let switched = run(&["--output", "screen", "--mode", &mode_name]);
+    if switched.is_err() {
+        // Create a standard CVT timing for width×height @60Hz.
+        let output = std::process::Command::new("cvt")
+            .args([width.to_string().as_str(), height.to_string().as_str(), "60"])
+            .env("DISPLAY", display_name)
+            .env("XAUTHORITY", xauthority)
+            .output()
+            .context("spawn cvt")?;
+        let cvt_out = String::from_utf8_lossy(&output.stdout).to_string();
+        // cvt prints: Modeline "2880x1800_60.00" 442.00 2880 3104 3416 3952 ...
+        let modeline = cvt_out
+            .lines()
+            .find(|l| l.contains("Modeline"))
+            .context("cvt produced no modeline")?;
+        let params: Vec<&str> = modeline.split_whitespace().skip(1).collect();
+        // The name comes back wrapped in quotes — strip them, or the mode
+        // gets created under a name that includes the `"` characters and
+        // can never be selected by the clean name used above.
+        let name = params
+            .first()
+            .copied()
+            .context("no mode name")
+            .map(|n| n.trim_matches('"').to_owned())?;
+        let nums: Vec<&str> = params[1..].to_vec();
+        let mut a: Vec<&str> = vec!["--newmode", &name];
+        a.extend(nums);
+        // newmode/addmode failures are fine when the mode is already
+        // registered (e.g. added to the output in a previous run) — the
+        // definitive check is whether the final mode switch applies.
+        let _ = run(&a);
+        let _ = run(&["--addmode", "screen", &name]);
+        run(&["--output", "screen", "--mode", &mode_name])?;
+    }
+    Ok(())
+}
+
 struct Updates {
     grabber: ScreenGrabber,
     first: bool,
@@ -1063,6 +1132,7 @@ impl crate::gfx_display::DisplaySourceFactory for X11DisplayFactory {
         Box::new(X11Source {
             grabber: Some(display.grabber()),
             display_name: display.display_name().to_owned(),
+            fixed_size: display.fixed_size,
         })
     }
 }
@@ -1071,6 +1141,7 @@ impl crate::gfx_display::DisplaySourceFactory for X11DisplayFactory {
 struct X11Source {
     grabber: Option<ScreenGrabber>,
     display_name: String,
+    fixed_size: Option<(u16, u16)>,
 }
 
 impl crate::gfx_display::FrameSource for X11Source {
@@ -1086,6 +1157,9 @@ impl crate::gfx_display::FrameSource for X11Source {
         if self.grabber.is_none() {
             tracing::warn!(display = %self.display_name, "X grabber lost — reconnecting");
             self.grabber = ScreenGrabber::connect_new(&self.display_name);
+            if let Some(grabber) = self.grabber.as_mut() {
+                grabber.set_fixed_size(self.fixed_size);
+            }
         }
     }
 

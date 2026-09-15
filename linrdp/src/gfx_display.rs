@@ -949,6 +949,18 @@ impl EgfxUpdates {
         let size_changed = !self
             .surface
             .is_some_and(|s| s.width == grab.width && s.height == grab.height);
+        // A size change under an EXISTING surface means the X screen moved
+        // mid-session (e.g. fixed-size enforcement re-applying a drifted
+        // screen): the desktop churns (WM re-layout) and H.264 pushed
+        // mid-churn is decoded but never composed (learnings #5) — hold it.
+        if size_changed && self.surface.is_some() {
+            self.settle_until = Instant::now() + RESIZE_SETTLE;
+            tracing::info!(
+                width = grab.width,
+                height = grab.height,
+                "screen size changed mid-session — settling before H.264 resumes"
+            );
+        }
         if generation_changed || size_changed {
             self.ensure_surface(handle, grab.width, grab.height);
             self.generation = Some(Arc::clone(handle));
