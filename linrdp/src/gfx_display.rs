@@ -1511,12 +1511,14 @@ impl EgfxUpdates {
 
         // AVC444v2 region rects must align to the 16x16 macroblock grid the
         // decoder works on (an unaligned bottom tripped mstsc into protocol
-        // error 0xD06 + disconnect); the padded surface covers exactly that
-        // grid and the converter fills the padding with replicated edges.
+        // error 0xD06 + disconnect). Align the bottom DOWN to the real
+        // content (1792 for an 1800-tall desktop): the padding rows inside
+        // the encoded frame are excluded from compositing, so they cannot
+        // flicker against the lossless repaints that cover them.
         let (region_right, region_bottom): (u16, u16) = if avc444v2 {
             (
-                pw.try_into().unwrap_or(u16::MAX),
-                ph.try_into().unwrap_or(u16::MAX),
+                w & !15,
+                h & !15,
             )
         } else {
             (w, h)
