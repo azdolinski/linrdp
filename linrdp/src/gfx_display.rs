@@ -953,6 +953,20 @@ impl EgfxUpdates {
 
     /// Process one grab through the graphics pipeline.
     async fn egfx_frame(&mut self, handle: &GfxHandle, grab: Grab) {
+        // The client re-advertised caps mid-session (decoder recovery): the
+        // surface stays, but the decoder gets a fresh IDR (new SPS/PPS via an
+        // encoder re-create) to resync against.
+        if self.session.take_force_idr() {
+            tracing::info!("caps re-advertised — forcing an IDR, surface untouched");
+            if let Some(Encoders {
+                h264: Some(h264), ..
+            }) = self.encoders.as_mut()
+            {
+                h264.force_intra();
+            }
+            self.pending_full = true;
+        }
+
         // New connection or screen resize: re-create the surface.
         let generation_changed = !self.generation.as_ref().is_some_and(|g| Arc::ptr_eq(g, handle));
         let size_changed = !self
@@ -1904,8 +1918,7 @@ fn convert_rows_v2(
     // Full-range BT.709 per component. Coordinates outside the real frame
     // (the 16-macroblock padding) replicate the nearest real pixel: mstsc
     // composites the padded bottom strip (v2 regions must cover the whole
-    // surface), and a constant fill shows up as a colored band — replicated
-    // edge content blends into the wallpaper/panel instead.
+    // surface), and any constant fill shows up as a colored band.
     let yuv_at = |x: usize, y: usize| -> (u8, u8, u8) {
         let x = x.min(w - 1);
         let y = y.min(h - 1);
@@ -1940,7 +1953,6 @@ fn convert_rows_v2(
         let yo_global = yo_of(j);
         let ye = 2 * j_local;
         let yo = ye + 1;
-        let yo_in_frame = yo_global < h;
 
         for x2 in 0..half {
             let xe_src = 2 * x2;
@@ -1954,12 +1966,12 @@ fn convert_rows_v2(
             let (y11, u11, v11) = yuv_at(xo_src, yo_src);
 
             // Luma view: full-resolution Y, 2x2-averaged chroma [B1, B2, B3].
+            // Odd rows past the real height replicate the last real row —
+            // skipped writes would leave zeros, which decode as purple.
             luma_y[ye * pw + 2 * x2] = y00;
             luma_y[ye * pw + 2 * x2 + 1] = y01;
-            if yo_in_frame {
-                luma_y[yo * pw + 2 * x2] = y10;
-                luma_y[yo * pw + 2 * x2 + 1] = y11;
-            }
+            luma_y[yo * pw + 2 * x2] = y10;
+            luma_y[yo * pw + 2 * x2 + 1] = y11;
             // The mean of four u8 samples always fits in u8. The sum is
             // computed in i32: u8 arithmetic would overflow for bright
             // pixels (4 x 255).
@@ -1975,11 +1987,10 @@ fn convert_rows_v2(
             chroma_y[ye * pw + x2] = u01;
             chroma_y[ye * pw + x2 + half] = v01;
             // Chroma view Y, odd source row [B6-left, B5-odd-right]: odd
-            // source columns of the odd row.
-            if yo_in_frame {
-                chroma_y[yo * pw + x2] = u11;
-                chroma_y[yo * pw + x2 + half] = v11;
-            }
+            // source columns of the odd row (replicated past the real
+            // height — see the luma odd-row note).
+            chroma_y[yo * pw + x2] = u11;
+            chroma_y[yo * pw + x2 + half] = v11;
 
             // Chroma view U/V planes [B6/B7, B8/B9]: the even source column
             // of the odd row, split left/right per 4-column group.

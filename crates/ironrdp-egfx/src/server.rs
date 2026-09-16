@@ -2054,26 +2054,16 @@ impl GraphicsPipelineServer {
         // ResetGraphics + CreateSurface(id=0) + MapSurfaceToOutput + IDR.
         let is_readvertise = self.state == ServerState::Ready;
         if is_readvertise {
-            // KRdp's proven mstsc-recovery sequence (VideoStream.cpp
-            // `onCapsAdvertise` + `destroySurface`): confirm caps, send an
-            // explicit DeleteSurface for every live surface, and allocate a
-            // FRESH surface id on the next create. A silent state clear that
-            // re-created the SAME id (duplicate CreateSurface(0), no Delete)
-            // tripped mstsc 26100 into an instant RST — observed 5-20 ms
-            // after the re-create, on every session, when the dims matched
-            // or not. KRdp also populates a MONITOR_PRIMARY monitor in
-            // ResetGraphics (below) — mirrored here.
-            debug!(
-                "EGFX: mid-session CapsAdvertise observed — CapsConfirm + DeleteSurface + \
-                 fresh surface id on next create (KRdp recovery sequence)"
-            );
-            for surface_id in self.surfaces.surface_ids().collect::<Vec<_>>() {
-                self.output_queue
-                    .push_back(GfxPdu::DeleteSurface(DeleteSurfacePdu { surface_id }));
-            }
-            self.surfaces.clear();
-            self.frames.clear();
-            self.reset_graphics_sent = false;
+            // Mid-session CapsAdvertise: reply with CapabilitiesConfirm
+            // (sent below) and change NOTHING else. Every flavor of surface
+            // teardown/re-create after it — silent state clear with a
+            // duplicate CreateSurface(0), and the KRdp-style
+            // DeleteSurface+fresh-id sequence alike — ended in an mstsc RST
+            // or a zombie (frames acked, picture frozen). Keeping the
+            // surface and letting the pipeline's forced IDR resync the
+            // decoder is the only behavior mstsc has tolerated. MS-RDPEGFX
+            // 3.3.5: the server MUST resend CapsConfirm on a re-advertise.
+            debug!("EGFX: mid-session CapsAdvertise observed — CapsConfirm only, state untouched");
         }
 
         self.handler.capabilities_advertise(&pdu);
