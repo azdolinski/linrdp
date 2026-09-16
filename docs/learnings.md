@@ -311,3 +311,54 @@ Every fix here is anchored in a MUST/SHOULD we were contradicting or ignoring.
     counts as backpressure.
 17. Producer rate is counted on offer, above the in-flight window it sizes —
     otherwise the window starves the producer whose rate sets the window.
+
+## Saga: the X server that could not compile a keymap
+
+Every session keeper started, opened its PAM session, wrote its cookie, and
+launched Xvfb — which died within a second, every time, leaving:
+
+```
+XKB: Failed to compile keymap
+Keyboard initialization failed. This could be a missing or incorrect setup of xkeyboard-config.
+Fatal server error: Failed to activate virtual core keyboard: 2
+```
+
+Hours went into `xkeyboard-config`, PATH, `PrivateTmp`, rlimits, the privilege
+drop and the `fork`/`execve` spawn path — all wrong, all eliminated one by one.
+A standalone probe driving the *exact* spawn code brought the server up cleanly,
+which made the spawn path look innocent.
+
+The cause was three call frames away and in another file: the supervisor sets
+`SIGCHLD` to `SIG_IGN` so worker processes never linger as zombies. **An ignored
+signal disposition survives `execve`** — handlers are reset by an exec, ignores
+are not — so every worker, keeper, X server and desktop process inherited
+auto-reaping. The X server runs `xkbcomp` through `Popen`/`Pclose` and reads its
+exit status with `waitpid`; with the child already reaped by the kernel that call
+returns ECHILD, so the server concludes the keymap never compiled and refuses to
+start. The same inherited ignore made the worker's `wait()` on the keeper fail
+with ECHILD, reporting a keeper that had started perfectly as a failure.
+
+- **`SIG_IGN` is inherited across `exec`; a signal handler is not.** Reaping
+  policy is process-local by intent but global by inheritance. Anything you
+  `exec` may wait on its own children, and a policy it never chose will break it
+  in a way that surfaces as a domain error ("keymap", "xkeyboard-config") with
+  nothing pointing back at signals.
+- **A probe that reproduces the spawn path but not the process ancestry proves
+  less than it looks.** My probe was correct in every detail I had thought to
+  copy, and inherited state is precisely what one does not think to copy. It
+  exonerated the spawn code and so steered the search away from the real
+  neighbourhood for hours.
+- **Bisect the difference, not the hypothesis.** The decisive experiment was
+  four lines: run the identical Xvfb command once with SIGCHLD default and once
+  ignored. Default, it runs; ignored, it prints that log byte for byte. That
+  should have come first — "what differs between my working probe and the
+  failing process" is a shorter list than "what could break XKB".
+- **`Stdio::null()` on a process that can fail is a self-inflicted blindfold.**
+  The keeper's own error went to `/dev/null` for two rounds of testing; the
+  first real progress came from making it log its failure itself.
+
+## Invariants now enforced (keep them)
+
+18. Every fork that execs a foreign program restores `SIGCHLD` to `SIG_DFL`
+    first (`session::keeper::restore_default_sigchld`). The supervisor's
+    auto-reaping is the supervisor's alone.

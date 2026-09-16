@@ -33,6 +33,14 @@ pub(crate) fn run(bind: SocketAddr, worker_argv: &[String]) -> anyhow::Result<()
 
     // Reap children without blocking: a worker that exits must not become a
     // zombie, and the supervisor never waits on a specific child.
+    //
+    // This disposition belongs to the supervisor ALONE. An ignored SIGCHLD is
+    // inherited across fork *and* across exec, so every worker, keeper, X
+    // server and desktop process would otherwise inherit auto-reaping and see
+    // its own `waitpid` calls fail with ECHILD. Each forked child restores the
+    // default before exec — see `session::keeper::restore_default_sigchld`,
+    // which documents what that cost us.
+    //
     // SAFETY: setting SIGCHLD to SIG_IGN is async-signal-safe and documented
     // on Linux to auto-reap.
     unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
@@ -51,6 +59,7 @@ pub(crate) fn run(bind: SocketAddr, worker_argv: &[String]) -> anyhow::Result<()
         match unsafe { libc::fork() } {
             -1 => tracing::error!(error = %std::io::Error::last_os_error(), "fork failed"),
             0 => {
+                crate::session::keeper::restore_default_sigchld();
                 exec_worker(stream, worker_argv);
                 // exec_worker only returns on failure.
                 std::process::exit(1);

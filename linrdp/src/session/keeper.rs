@@ -72,6 +72,38 @@ pub(crate) fn session_env(rec: &SessionRecord, user: &UserIds) -> Vec<(String, S
 }
 
 
+/// Restore SIGCHLD to its default disposition, between fork and exec.
+///
+/// An ignored SIGCHLD survives `execve` — handlers are reset by an exec,
+/// ignores are not — and the supervisor sets SIGCHLD to SIG_IGN so it never
+/// accumulates zombie workers. Every descendant inherited that ignore,
+/// including the X server: it runs `xkbcomp` through `Popen`/`Pclose` and
+/// reads its exit status with `waitpid`. Under SIG_IGN the kernel reaps the
+/// child first, that `waitpid` fails with ECHILD, the server concludes the
+/// keymap never compiled, and dies:
+///
+/// ```text
+/// XKB: Failed to compile keymap
+/// Fatal server error: Failed to activate virtual core keyboard: 2
+/// ```
+///
+/// Reproduced exactly, same Xvfb command line both ways: SIGCHLD default, the
+/// server runs; SIGCHLD ignored, that log appears byte for byte. The same
+/// inherited ignore also made the worker's `wait()` on the keeper fail with
+/// ECHILD, so a keeper that started perfectly was reported as a failure.
+///
+/// So every exec of a foreign program goes through here. A process we did not
+/// write may wait on its own children, and inheriting our reaping policy is
+/// not ours to impose.
+///
+/// Async-signal-safe: `signal` is on the list, and nothing between here and
+/// the exec is waiting on a child of its own.
+pub(crate) fn restore_default_sigchld() {
+    // SAFETY: async-signal-safe, and this runs in a freshly forked child
+    // whose only remaining act is to exec.
+    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
+}
+
 /// Point the grandchild's stdin at /dev/null and its output at `log`.
 ///
 /// Async-signal-safe: only open/dup2/close between fork and exec.
@@ -157,6 +189,7 @@ pub(crate) fn spawn_child(
     match unsafe { libc::fork() } {
         -1 => anyhow::bail!("fork: {}", std::io::Error::last_os_error()),
         0 => {
+            restore_default_sigchld();
             redirect_stdio(&log_c);
             if crate::session::privilege::drop_to(user).is_err() {
                 // SAFETY: _exit is async-signal-safe and never returns.
@@ -230,6 +263,7 @@ pub(crate) fn spawn_detached(
                     // the worker and a desktop that fails to start does so in
                     // complete silence — which is exactly how a failed Xvfb
                     // first looked like a working session.
+                    restore_default_sigchld();
                     redirect_stdio(&log_c);
                     // Become the user, then become the desktop.
                     if crate::session::privilege::drop_to(user).is_err() {
@@ -287,6 +321,49 @@ mod tests {
             cmd.args.iter().any(|a| a.starts_with("2880x1800x")),
             "screen geometry must be applied, got {:?}",
             cmd.args
+        );
+    }
+
+    /// A child that restored the default disposition can reap its own
+    /// children again.
+    ///
+    /// Regression: the supervisor ignores SIGCHLD, that ignore survives exec,
+    /// and the X server reads `xkbcomp`'s exit status with `waitpid`. Under an
+    /// inherited SIG_IGN the call returned ECHILD, the server reported
+    /// "XKB: Failed to compile keymap" and refused to start — every session
+    /// died before its desktop existed.
+    ///
+    /// Run inside a forked child so the test never touches the disposition of
+    /// the process running the suite.
+    #[test]
+    fn a_restored_sigchld_lets_the_child_wait_for_its_own_children() {
+        // SAFETY: the child does nothing but async-signal-safe calls
+        // (signal, fork, waitpid, _exit) before exiting.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // SAFETY: as above.
+            unsafe {
+                libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+                restore_default_sigchld();
+                let grandchild = libc::fork();
+                if grandchild == 0 {
+                    libc::_exit(7);
+                }
+                let mut status = 0;
+                let reaped = libc::waitpid(grandchild, &mut status, 0);
+                // Reaped the right child, with the status it chose: proof the
+                // kernel did not collect it behind our back.
+                let ok = reaped == grandchild && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 7;
+                libc::_exit(i32::from(!ok));
+            }
+        }
+        let mut status = 0;
+        // SAFETY: waiting on our own direct child.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "after restoring the default disposition a child must still be reapable by hand"
         );
     }
 
