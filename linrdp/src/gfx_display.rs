@@ -1644,6 +1644,21 @@ impl EgfxUpdates {
                 self.v2_luma_lead -= 1;
             }
         } else {
+            // A frame that never reached the wire breaks the P-frame
+            // reference chain: the encoder counts it as history the client's
+            // decoder never saw, and every following frame decodes as
+            // progressively wrong colors (observed: the image appears,
+            // decays, then nothing). The next frame must restart both
+            // streams from a clean IDR.
+            tracing::warn!("H.264 frame send failed — forcing an IDR on both substreams");
+            if let Some(Encoders { luma, chroma, .. }) = self.encoders.as_mut() {
+                if let Some(enc) = luma {
+                    enc.force_intra();
+                }
+                if let Some(enc) = chroma {
+                    enc.force_intra();
+                }
+            }
             self.pending_full = true;
         }
         self.record_drained(self.session.drain_and_send(handle));
@@ -2171,5 +2186,89 @@ mod tests {
         assert_eq!(got.y(), exp_y.as_slice(), "Y planes differ");
         assert_eq!(got.u(), exp_u.as_slice(), "U planes differ");
         assert_eq!(got.v(), exp_v.as_slice(), "V planes differ");
+    }
+}
+
+#[cfg(test)]
+mod v2_roundtrip_tests {
+    use super::{bgrx_to_yuv444v2, make_h264_encoder};
+    use openh264::formats::YUVSource as _;
+
+    /// End-to-end wire-format round trip: source BGRX -> per-view encoders
+    /// -> Annex-B streams on disk, for the ffmpeg-decode + FreeRDP-algorithm
+    /// recombine check (scripts/v2_roundtrip_check.sh). Session flow mirrors
+    /// the live path: luma-only lead frames, then dual-view.
+    #[test]
+    fn v2_roundtrip_writes_artifacts() {
+        let (w, h) = (640usize, 480usize);
+        let (pw, ph) = (640usize, 480usize);
+        let stride = w * 4;
+
+        let mut src = vec![0u8; pw * ph * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let o = y * stride + x * 4;
+                let (b, g, r);
+                if (y / 24) % 2 == 0 && (x / 8 + y / 3) % 7 < 3 {
+                    (b, g, r) = (235u8, 235u8, 235u8);
+                } else if x > w * 3 / 4 && y > h * 3 / 4 {
+                    (b, g, r) = (240, 60, 30);
+                } else if x < w / 8 && y < h / 8 {
+                    (b, g, r) = (40, 50, 230);
+                } else {
+                    (b, g, r) = ((20 + x / 24) as u8, (18 + y / 24) as u8, 22u8);
+                }
+                src[o] = b;
+                src[o + 1] = g;
+                src[o + 2] = r;
+                src[o + 3] = 0xFF;
+            }
+        }
+
+        let (mut luma_enc, mut chroma_enc) =
+            make_h264_encoder(12_000_000, 30.0, pw as u16, ph as u16).expect("encoders");
+
+        let mut luma_stream: Vec<u8> = Vec::new();
+        let mut chroma_stream: Vec<u8> = Vec::new();
+        for i in 0..8 {
+            let mut f = src.clone();
+            if i % 2 == 1 {
+                for px in f.chunks_exact_mut(4).step_by(97) {
+                    px[0] = px[0].wrapping_add(7);
+                }
+            }
+            let (luma, chroma) = bgrx_to_yuv444v2(&f, w, h, pw, ph, false);
+            luma_stream.extend_from_slice(&luma_enc.encode_planes(luma.y(), luma.u(), luma.v()));
+            if i >= 5 {
+                chroma_stream
+                    .extend_from_slice(&chroma_enc.encode_planes(chroma.y(), chroma.u(), chroma.v()));
+            }
+        }
+        std::fs::write("/tmp/v2_luma.h264", &luma_stream).unwrap();
+        std::fs::write("/tmp/v2_chroma.h264", &chroma_stream).unwrap();
+
+        let mut ref_planes = Vec::with_capacity(3 * pw * ph);
+        for y in 0..h {
+            for x in 0..w {
+                let o = y * stride + x * 4;
+                let (b, g, r) = (i32::from(src[o]), i32::from(src[o + 1]), i32::from(src[o + 2]));
+                ref_planes.push(((54 * r + 183 * g + 18 * b) >> 8).clamp(0, 255) as u8);
+            }
+        }
+        for off in [1usize, 2] {
+            for y in 0..h {
+                for x in 0..w {
+                    let o = y * stride + x * 4;
+                    let (b, g, r) = (i32::from(src[o]), i32::from(src[o + 1]), i32::from(src[o + 2]));
+                    let v = match off {
+                        1 => ((-29 * r - 99 * g + 128 * b) >> 8) + 128,
+                        _ => ((128 * r - 116 * g - 12 * b) >> 8) + 128,
+                    };
+                    ref_planes.push(v.clamp(0, 255) as u8);
+                }
+            }
+        }
+        std::fs::write("/tmp/v2_ref.y444", ref_planes).unwrap();
+        assert!(!luma_stream.is_empty() && !chroma_stream.is_empty());
     }
 }
