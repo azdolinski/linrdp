@@ -43,6 +43,16 @@ USAGE:
   linrdp [--bind-addr <ADDR>] [--usb] [--log-file <PATH>] [--fixed-size <WxH>]
 
 Serves a real Linux desktop over RDP (auth: system accounts from /etc/shadow).
+
+Multi-session:
+  --supervisor          accept on the bind address and fork one worker per
+                        connection; each worker serves its user's own desktop
+  --display-range L-H   X display numbers workers may allocate (default 10-99)
+  --console             attach to $DISPLAY instead of a per-user session
+                        (the mstsc /admin equivalent, for the shared screen)
+  --serve-fd N          internal: serve the connection the supervisor handed
+                        over on descriptor N
+
 Default bind: 0.0.0.0:3389. --usb enables USB device redirection (MS-RDPEUSB).
 --fixed-size pins the desktop (e.g. 2880x1800): X is resized once at startup
 and clients scale locally — recommended with mstsc, which composes EGFX
@@ -53,8 +63,40 @@ created (falling back to the terminal), or to the file given with --log-file.
 Verbosity: LINRDP_LOG env var (default \"info,ironrdp=warn\").
 ";
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Supervisor mode forks per connection, and `fork` in a multi-threaded
+/// runtime leaves only the calling thread alive in the child. So the argv is
+/// inspected before any runtime exists, and the supervisor never builds one.
+fn main() -> anyhow::Result<()> {
+    if std::env::args().any(|arg| arg == "--supervisor") {
+        return supervisor_main();
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?
+        .block_on(serve())
+}
+
+/// Accept on the bind address and fork a worker per connection.
+fn supervisor_main() -> anyhow::Result<()> {
+    let mut args = pico_args::Arguments::from_env();
+    let _ = args.contains("--supervisor");
+    let bind_addr: SocketAddr = args
+        .opt_value_from_str("--bind-addr")?
+        .unwrap_or_else(|| "0.0.0.0:3389".parse().expect("valid default bind addr"));
+    let log_file: Option<String> = args.opt_value_from_str("--log-file")?;
+    setup_logging(log_file.as_deref());
+
+    session::runtime_dir::ensure_state_dir(std::path::Path::new(session::runtime_dir::STATE_DIR))
+        .context("prepare the supervisor state directory")?;
+
+    // Everything except --supervisor is handed to each worker unchanged, so
+    // the two roles share one command line.
+    let worker_argv: Vec<String> = std::env::args().skip(1).filter(|a| a != "--supervisor").collect();
+    supervisor::run(bind_addr, &worker_argv)
+}
+
+async fn serve() -> anyhow::Result<()> {
     let mut args = pico_args::Arguments::from_env();
     if args.contains(["-h", "--help"]) {
         println!("{HELP}");
@@ -75,6 +117,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let enable_usb = args.contains("--usb");
+
+    // Multi-session wiring. `--serve-fd` marks a worker forked by the
+    // supervisor: it serves exactly the one connection on that descriptor.
+    // `--console` is the mstsc /admin equivalent — attach to the ambient
+    // $DISPLAY (the shared screen) instead of a per-user session.
+    let serve_fd: Option<i32> = args.opt_value_from_str("--serve-fd")?;
+    let console_mode = args.contains("--console");
+    let display_range = match args.opt_value_from_str::<_, String>("--display-range")? {
+        Some(spec) => supervisor::parse_display_range(&spec)?,
+        None => 10..=99,
+    };
+    let _ = (&console_mode, &display_range);
 
     let bind_addr: SocketAddr = args
         .opt_value_from_str("--bind-addr")?
@@ -354,6 +408,21 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     server.set_multitransport(multitransport);
+
+    if let Some(fd) = serve_fd {
+        // Worker: the supervisor already accepted this connection and handed
+        // it over on `fd`. Serving it directly keeps the accept loop — and
+        // the fork decision — in exactly one place.
+        tracing::info!(fd, "worker serving one connection from the supervisor");
+        // SAFETY: the supervisor dup2'd the accepted socket onto this
+        // descriptor immediately before exec, and nothing else in this
+        // process touches it.
+        let std_stream = unsafe { <std::net::TcpStream as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+        std_stream.set_nonblocking(true).context("set the handed-over socket non-blocking")?;
+        let stream = tokio::net::TcpStream::from_std(std_stream).context("adopt the handed-over socket")?;
+        server.run_connection(stream).await?;
+        return Ok(());
+    }
 
     tracing::info!("listening — connect with any RDP client");
     server.run().await?;
