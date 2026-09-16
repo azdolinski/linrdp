@@ -164,9 +164,11 @@ fn spawn_keeper(
         .write_all(password.as_bytes())
         .context("hand the password to the keeper")?;
 
-    // The keeper detaches itself; this direct child exits immediately, so
-    // reap it rather than leaving a zombie.
-    let _ = child.wait();
+    // The keeper forks and its parent exits at once, so this returns
+    // immediately; the real keeper is re-parented to init. Reaping here keeps
+    // the short-lived parent from lingering as a zombie.
+    let status = child.wait().context("wait for the keeper to detach")?;
+    anyhow::ensure!(status.success(), "the session keeper failed to start ({status})");
     Ok(())
 }
 

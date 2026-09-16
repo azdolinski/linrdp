@@ -114,8 +114,24 @@ fn keeper_main() -> anyhow::Result<()> {
     // Detach from the worker that spawned us: the session must outlive the
     // connection, and a keeper still in the worker's process group would be
     // torn down with it.
-    // SAFETY: setsid on a process that is not already a group leader.
-    unsafe { libc::setsid() };
+    //
+    // setsid alone is not enough. This process is the worker's direct child,
+    // so the worker's wait() would block for the whole session — the login
+    // would hang before it ever checked whether the session came up. Fork
+    // once more: the parent exits so that wait() returns immediately, and the
+    // real keeper is re-parented to init.
+    // SAFETY: fork from a single-threaded process that has not started a
+    // runtime; the child inherits a consistent address space.
+    match unsafe { libc::fork() } {
+        -1 => anyhow::bail!("fork the keeper: {}", std::io::Error::last_os_error()),
+        0 => {
+            // SAFETY: the child is not a group leader, so setsid succeeds.
+            unsafe { libc::setsid() };
+        }
+        // SAFETY: _exit avoids running atexit handlers and flushing buffers
+        // this forked copy shares with the worker.
+        _ => unsafe { libc::_exit(0) },
+    }
 
     session::keeper_main::run(&session::keeper_main::KeeperArgs {
         user,
