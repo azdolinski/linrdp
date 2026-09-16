@@ -24,6 +24,9 @@ static BOUND: OnceLock<Bound> = OnceLock::new();
 struct Bound {
     display: String,
     xauthority: String,
+    /// Desktop size this client negotiated — the size the session's screen is
+    /// scaled to once the capture path connects.
+    client_size: (u16, u16),
 }
 
 /// Mark this process as a multi-session worker: no ambient display may be
@@ -38,10 +41,16 @@ pub(crate) fn is_armed() -> bool {
 
 /// Bind this worker to the authenticated user's session. Idempotent; a second
 /// call with a different session is refused rather than silently ignored.
-pub(crate) fn bind(display: u16, xauthority: &str, runtime_dir: &str) -> anyhow::Result<()> {
+pub(crate) fn bind(
+    display: u16,
+    xauthority: &str,
+    runtime_dir: &str,
+    client_size: (u16, u16),
+) -> anyhow::Result<()> {
     let wanted = Bound {
         display: format!(":{display}"),
         xauthority: xauthority.to_owned(),
+        client_size,
     };
     // The subsystems that start later (clipboard, selection owner) read the
     // environment, so set it too — but the gate, not the environment, is what
@@ -139,6 +148,15 @@ pub(crate) fn connect() -> anyhow::Result<(x11rb::rust_connection::RustConnectio
     Ok((conn, screen))
 }
 
+/// The desktop size this connection negotiated, once a session is bound.
+///
+/// The session's X screen is created at the largest desktop we serve and
+/// scaled down to this — a client must never be shown a desktop smaller than
+/// the area it reserved for it.
+pub(crate) fn client_size() -> Option<(u16, u16)> {
+    BOUND.get().map(|b| b.client_size)
+}
+
 /// The Xauthority for the bound session, if any.
 pub(crate) fn xauthority() -> Option<String> {
     BOUND.get().map(|b| b.xauthority.clone())
@@ -168,6 +186,7 @@ mod tests {
         Bound {
             display: display.to_owned(),
             xauthority: format!("/run/user/1000/linrdp/Xauthority{display}"),
+            client_size: (1920, 1080),
         }
     }
 

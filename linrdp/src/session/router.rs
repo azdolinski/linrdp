@@ -19,8 +19,6 @@ use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use x11rb::connection::Connection as _;
-
 /// The account CredSSP is authenticating, stashed by the credential resolver
 /// for `on_connection_info` to consume once authentication has succeeded.
 #[derive(Default)]
@@ -81,17 +79,18 @@ impl SessionRouter {
         let Some((user, password)) = self.pending.take() else {
             anyhow::bail!("no authenticated identity recorded — cannot choose a desktop");
         };
-        // A new session is created at the size THIS client negotiated, because
-        // Xvfb fixes its screen at startup: `-screen 0 WxH` is also the
-        // RandR maximum, so a desktop born at 1920x1080 can never grow to a
-        // 2880x1800 client and the user gets a letterboxed corner of their
-        // monitor. `--fixed-size` still wins when the operator pinned one.
-        let size = self.fixed_size.unwrap_or(client_size);
+        // A session's X server is created at the LARGEST desktop we serve,
+        // not at this client's size: `-screen 0 WxH` is also Xvfb's RandR
+        // maximum and cannot grow afterwards, so a session born at one
+        // client's size could never fit the next one. The capture path scales
+        // the screen down to `client_size` when it connects.
+        // `--fixed-size` still wins when the operator pinned a geometry.
+        let size = self.fixed_size.unwrap_or(crate::session::SESSION_SCREEN_MAX);
         let rec = crate::session::attach_or_create(&self.state_dir, &user, &password, self.range.clone(), size)?;
         // The gate, not the environment, is what the capture and input paths
         // trust. Binding also sets the environment for the subsystems that
         // start later and read it (clipboard, selection owner).
-        crate::session::gate::bind(rec.display, &rec.xauthority, &rec.runtime_dir)?;
+        crate::session::gate::bind(rec.display, &rec.xauthority, &rec.runtime_dir, client_size)?;
         // The user just proved who they are, so the desktop is theirs to see.
         // Unlocking is recorded rather than assumed, so a later disconnect —
         // or a supervisor restart — can put it back.
@@ -100,40 +99,10 @@ impl SessionRouter {
         }
         self.bound_display.set(Some(rec.display));
         tracing::info!(user, display = rec.display, "routed to the user's desktop");
-        warn_on_size_mismatch(client_size);
         Ok(())
     }
 }
 
-
-/// An existing session keeps the screen it was born with.
-///
-/// Xvfb fixes its screen at startup — `-screen 0 WxH` is also the RandR
-/// maximum — so a session created for one client cannot be resized for the
-/// next. The client is told its own size by the acceptor, and the desktop
-/// underneath is a different one: the picture arrives letterboxed, which
-/// looks like a scaling bug and is really a session that predates this
-/// client. Say so, with both numbers and the way out.
-fn warn_on_size_mismatch(client: (u16, u16)) {
-    let Ok((conn, screen)) = crate::session::gate::connect() else {
-        return; // the capture path reports its own connection failures
-    };
-    let Some(setup) = conn.setup().roots.get(screen) else {
-        return;
-    };
-    let session = (setup.width_in_pixels, setup.height_in_pixels);
-    if session != client {
-        tracing::warn!(
-            session_width = session.0,
-            session_height = session.1,
-            client_width = client.0,
-            client_height = client.1,
-            "the existing session's screen does not match this client — the desktop \
-             cannot be resized while it runs (Xvfb fixes its screen at startup); \
-             end the session to get one at this client's size"
-        );
-    }
-}
 
 impl ironrdp_server::ConnectionHandler for SessionRouter {
     fn on_accept(&mut self, peer: core::net::SocketAddr) -> bool {

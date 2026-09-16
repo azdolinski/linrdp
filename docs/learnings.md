@@ -406,10 +406,42 @@ warning naming both numbers instead of a silently letterboxed screen.
   debugging.** `selection_owner_serves_gnome_copied_files` failed because the
   FreeRDP client I had left running owned the clipboard on `:99`.
 
+### The resize that two processes could never perform
+
+The first fix for the undersized desktop — create each session at the
+connecting client's size — was built on a wrong belief: that Xvfb cannot
+resize. It can. What cannot work is resizing it the way this code was trying
+to.
+
+`RRCreateMode` gives the mode a reference owned by **the client that created
+it**. `xrandr --newmode` creates the mode and exits; the mode dies with it, and
+the separate `xrandr --addmode` that follows reports "cannot find mode". Two
+processes can never hand a mode to each other. Selkies resizes the identical
+Xvfb build all day because it drives RandR over one long-lived connection —
+its own comment in `start-selkies.sh` says so plainly, and it was sitting on
+this machine the whole time.
+
+This also retires an older mystery. `capture.rs` carried a warning, "X screen
+drifted from the fixed size — re-applying", with a comment insisting nothing in
+linrdp moved the screen. Nothing did: a client holding the mode disconnected,
+and the server reverted.
+
+- **"It can't be done" deserves the same evidence as "it's broken".** A working
+  counter-example was running on `:99`, two commands away, for the whole
+  investigation.
+- **Read the neighbours' code before concluding the platform is at fault** —
+  especially the one doing the exact thing you believe impossible.
+- **The resize belongs on the connection that outlives it**, which is the
+  capture connection: it is opened when the client arrives and closed when it
+  leaves, which is precisely the lifetime a per-client desktop size should have.
+
 ## Invariants now enforced (keep them)
 
 19. Every X connection in a multi-session worker goes through `gate::connect`,
     which authenticates with the bound session's own cookie. No X path reads
     `$XAUTHORITY`.
-20. A session's X screen is created at the size the connecting client
-    negotiated, never a default, because Xvfb cannot resize afterwards.
+20. A session's X screen is created at `SESSION_SCREEN_MAX` — Xvfb's `-screen`
+    geometry is also its RandR maximum and cannot grow — and is scaled down to
+    each client over the capture connection, never by shelling out to xrandr.
+21. A resize that the X server refuses is a warning, not a failed session. An
+    old desktop served at its own size beats no desktop at all.

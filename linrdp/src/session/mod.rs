@@ -19,6 +19,16 @@ use std::path::Path;
 
 use anyhow::Context as _;
 
+/// The largest desktop linrdp serves, and therefore the geometry every
+/// session's X server is created at.
+///
+/// Xvfb's `-screen` size is also its RandR maximum: a screen can be scaled
+/// down from it but never past it. Creating every session here means any
+/// client up to this size gets a desktop that exactly fills its window, and
+/// the same session can be reattached from a different monitor. It matches
+/// the maximum the acceptor advertises with `honor_client_desktop_size`.
+pub(crate) const SESSION_SCREEN_MAX: (u16, u16) = (3840, 2160);
+
 /// The user's session, if one is recorded.
 pub(crate) fn attach_existing(
     base: &Path,

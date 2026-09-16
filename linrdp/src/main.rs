@@ -489,8 +489,8 @@ async fn serve() -> anyhow::Result<()> {
         // old session, so "reconnect while a session lives" just works.
         .with_preempt_existing_session(true)
         .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
-            width: 3840,
-            height: 2160,
+            width: session::SESSION_SCREEN_MAX.0,
+            height: session::SESSION_SCREEN_MAX.1,
         }))
         .with_ainput(false)
         .with_credential_resolver(sam_resolver)

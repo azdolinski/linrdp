@@ -38,7 +38,6 @@ pub(crate) struct X11Display {
     width: u16,
     height: u16,
     display_name: String,
-    xauthority: String,
     /// Fixed desktop size (`--fixed-size`): the X screen is resized once at
     /// startup and never per-connection again. Windows RDP works this way —
     /// the server desktop has one size and clients scale locally — and it
@@ -74,17 +73,31 @@ impl X11Display {
             width,
             height,
             display_name,
-            xauthority: std::env::var("XAUTHORITY").unwrap_or_default(),
             fixed_size,
             settle_until: Instant::now(),
         };
-        // Apply the fixed size once, before any client can connect: the
-        // desktop must be settled (layout done, no churn) by the time a
-        // session's first frames go out.
-        if let Some((w, h)) = fixed_size {
+        // Scale the session's screen to what this client negotiated, before
+        // any frame goes out: the desktop must be settled (layout done, no
+        // churn) by the time the first frames leave. `--fixed-size` pins a
+        // geometry and wins; otherwise the client's own size decides.
+        let target = fixed_size.or_else(crate::session::gate::client_size);
+        display.fixed_size = target;
+        if let Some((w, h)) = target {
             if w != width || h != height {
-                display.resize_screen(w, h)?;
-                tracing::info!(w, h, "X screen pre-resized to the fixed desktop size");
+                // A failure here must not cost the user their session: a
+                // desktop created before this machine served 4K has a smaller
+                // RandR maximum and simply cannot be scaled up. Serving it at
+                // its own size beats refusing to serve it at all.
+                match display.resize_screen(w, h) {
+                    Ok(()) => tracing::info!(w, h, "X screen scaled to the client's desktop size"),
+                    Err(error) => tracing::warn!(
+                        error = format!("{error:#}"),
+                        want = format!("{w}x{h}"),
+                        have = format!("{width}x{height}"),
+                        "could not scale this session's screen to the client — serving it at \
+                         its own size; end the session to get one sized for this client"
+                    ),
+                }
             }
         }
         Ok(display)
@@ -108,7 +121,7 @@ impl X11Display {
     /// Per MS-RDPBCGR the server resizes its desktop to the negotiated
     /// session size — exactly what this performs on the X server.
     fn resize_screen(&mut self, width: u16, height: u16) -> anyhow::Result<()> {
-        xrandr_resize(&self.display_name, &self.xauthority, width, height)?;
+        randr_resize(&self.conn, self.root, width, height)?;
 
         let (w, h) = self.query_root_geometry()?;
         if w != width || h != height {
@@ -633,9 +646,6 @@ pub(crate) struct ScreenGrabber {
     /// Fixed desktop size (`--fixed-size`): when set, the grabber re-asserts
     /// this geometry if the X screen drifts (see [`Self::grab`]).
     fixed_size: Option<(u16, u16)>,
-    /// Xauthority for the `xrandr` re-apply spawned by the fixed-size
-    /// enforcement.
-    xauthority: String,
     /// Next instant the fixed-size enforcement may query the root geometry.
     next_size_check: Instant,
 }
@@ -664,7 +674,6 @@ impl ScreenGrabber {
             damage_ok: false,
             force_grab: true,
             fixed_size: None,
-            xauthority: std::env::var("XAUTHORITY").unwrap_or_default(),
             next_size_check: Instant::now(),
         }
     }
@@ -759,7 +768,7 @@ impl ScreenGrabber {
                         fixed = format!("{fw}x{fh}"),
                         "X screen drifted from the fixed size — re-applying"
                     );
-                    if xrandr_resize(&self.display_name, &self.xauthority, fw, fh).is_ok() {
+                    if randr_resize(&self.conn, self.root, fw, fh).is_ok() {
                         self.width = fw;
                         self.height = fh;
                     }
@@ -1050,59 +1059,97 @@ const FIXED_SIZE_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 /// utility. Sequence: create CVT mode (if missing) → add to output → apply.
 /// This is the exact sequence of `xrandr --newmode/--addmode/--output`.
 /// Shared by the per-connection resize and the fixed-size enforcement.
-fn xrandr_resize(display_name: &str, xauthority: &str, width: u16, height: u16) -> anyhow::Result<()> {
-    let mode_name = format!("{width}x{height}_60.00");
+/// Resize the X screen to `width`x`height` over this connection, using the
+/// RandR protocol directly.
+///
+/// This must run on a connection that outlives the resize. A mode created by
+/// `RRCreateMode` is owned by the client that created it: when that client
+/// disconnects the mode is destroyed and the CRTC reverts. That is why the
+/// old implementation — `xrandr --newmode` then `xrandr --addmode`, two
+/// short-lived processes — could never work: the first one's mode was gone
+/// before the second one looked for it ("cannot find mode", reproduced on a
+/// clean Xvfb). It also explains the "X screen drifted from the fixed size"
+/// warning this file already carried: nothing moved the screen, a client
+/// holding the mode simply went away.
+///
+/// The ceiling is the Xvfb `-screen` geometry, which is the RandR maximum and
+/// cannot grow — sessions are therefore started at the largest desktop we
+/// serve and scaled down to each client from there.
+fn randr_resize(
+    conn: &x11rb::rust_connection::RustConnection,
+    root: u32,
+    width: u16,
+    height: u16,
+) -> anyhow::Result<()> {
+    use x11rb::protocol::randr::ConnectionExt as _;
 
-    let run = |args: &[&str]| -> anyhow::Result<()> {
-        let status = std::process::Command::new("xrandr")
-            .args(args)
-            .env("DISPLAY", display_name)
-            .env("XAUTHORITY", xauthority)
-            .status()
-            .context("spawn xrandr")?;
-        if !status.success() {
-            anyhow::bail!("xrandr {args:?} failed: {status}");
+    let res = conn
+        .randr_get_screen_resources_current(root)
+        .context("randr: request screen resources")?
+        .reply()
+        .context("randr: screen resources")?;
+    let output = *res.outputs.first().context("randr: no output")?;
+    let crtc = *res.crtcs.first().context("randr: no crtc")?;
+
+    let mode = match res.modes.iter().find(|m| m.width == width && m.height == height) {
+        Some(existing) => existing.id,
+        None => {
+            let name = format!("{width}x{height}_60");
+            // Timings for a framebuffer nothing scans out: plausible values in
+            // the right proportions, not a real display's CVT numbers.
+            let htotal = width.saturating_add(176);
+            let vtotal = height.saturating_add(30);
+            let info = x11rb::protocol::randr::ModeInfo {
+                id: 0,
+                width,
+                height,
+                dot_clock: u32::from(htotal) * u32::from(vtotal) * 60,
+                hsync_start: width.saturating_add(24),
+                hsync_end: width.saturating_add(96),
+                htotal,
+                hskew: 0,
+                vsync_start: height.saturating_add(3),
+                vsync_end: height.saturating_add(9),
+                vtotal,
+                name_len: u16::try_from(name.len()).unwrap_or(0),
+                mode_flags: x11rb::protocol::randr::ModeFlag::default(),
+            };
+            let created = conn
+                .randr_create_mode(root, info, name.as_bytes())
+                .context("randr: request create mode")?
+                .reply()
+                .with_context(|| format!("randr: create mode {name}"))?;
+            conn.randr_add_output_mode(output, created.mode)
+                .context("randr: request add output mode")?
+                .check()
+                .context("randr: add output mode")?;
+            created.mode
         }
-        Ok(())
     };
 
-    // Fast path: switch straight to the mode if one with this exact name
-    // already exists. Modes persist in the X server across linrdp
-    // restarts, so reconnects usually land here.
-    let switched = run(&["--output", "screen", "--mode", &mode_name]);
-    if switched.is_err() {
-        // Create a standard CVT timing for width×height @60Hz.
-        let output = std::process::Command::new("cvt")
-            .args([width.to_string().as_str(), height.to_string().as_str(), "60"])
-            .env("DISPLAY", display_name)
-            .env("XAUTHORITY", xauthority)
-            .output()
-            .context("spawn cvt")?;
-        let cvt_out = String::from_utf8_lossy(&output.stdout).to_string();
-        // cvt prints: Modeline "2880x1800_60.00" 442.00 2880 3104 3416 3952 ...
-        let modeline = cvt_out
-            .lines()
-            .find(|l| l.contains("Modeline"))
-            .context("cvt produced no modeline")?;
-        let params: Vec<&str> = modeline.split_whitespace().skip(1).collect();
-        // The name comes back wrapped in quotes — strip them, or the mode
-        // gets created under a name that includes the `"` characters and
-        // can never be selected by the clean name used above.
-        let name = params
-            .first()
-            .copied()
-            .context("no mode name")
-            .map(|n| n.trim_matches('"').to_owned())?;
-        let nums: Vec<&str> = params[1..].to_vec();
-        let mut a: Vec<&str> = vec!["--newmode", &name];
-        a.extend(nums);
-        // newmode/addmode failures are fine when the mode is already
-        // registered (e.g. added to the output in a previous run) — the
-        // definitive check is whether the final mode switch applies.
-        let _ = run(&a);
-        let _ = run(&["--addmode", "screen", &name]);
-        run(&["--output", "screen", "--mode", &mode_name])?;
-    }
+    // The CRTC must let go of the old geometry first: the screen cannot
+    // shrink below a CRTC still occupying it.
+    conn.randr_set_crtc_config(crtc, x11rb::CURRENT_TIME, x11rb::CURRENT_TIME, 0, 0, 0,
+        x11rb::protocol::randr::Rotation::ROTATE0, &[])
+        .context("randr: request disable crtc")?
+        .reply()
+        .context("randr: disable crtc")?;
+    // Millimetres at 96 dpi, so the desktop reports a sane physical size.
+    conn.randr_set_screen_size(root, width, height, u32::from(width) * 254 / 960, u32::from(height) * 254 / 960)
+        .context("randr: request screen size")?
+        .check()
+        .with_context(|| format!("randr: set screen size {width}x{height}"))?;
+    let applied = conn
+        .randr_set_crtc_config(crtc, x11rb::CURRENT_TIME, x11rb::CURRENT_TIME, 0, 0, mode,
+            x11rb::protocol::randr::Rotation::ROTATE0, &[output])
+        .context("randr: request crtc config")?
+        .reply()
+        .context("randr: crtc config")?;
+    anyhow::ensure!(
+        applied.status == x11rb::protocol::randr::SetConfig::SUCCESS,
+        "randr: the server refused {width}x{height} ({:?})",
+        applied.status
+    );
     Ok(())
 }
 
