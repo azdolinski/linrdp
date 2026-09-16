@@ -22,6 +22,7 @@ mod x264_encoder;
 mod udp;
 mod usb;
 mod session;
+mod supervisor;
 mod session_ctl;
 #[cfg(feature = "wayland")]
 mod wayland;
