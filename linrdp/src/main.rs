@@ -45,20 +45,20 @@ USAGE:
 
 Serves a real Linux desktop over RDP.
 
-Authentication (--auth, default `nla`):
-  nla     CredSSP/NTLMv2 — what mstsc and FreeRDP use by default, and the only
-          mode where the client asks for the credentials itself. NTLM makes the
-          server compute the expected response from the account secret
-          (MS-NLMP), which a one-way /etc/shadow hash cannot produce, so the
-          password must also be stored by linrdp:
-            linrdp --set-password USER:PASSWORD
-          It must BE the account's system password — --set-password verifies
-          that and refuses anything else, so the two can never drift apart.
-  system  TLS, and the account's own system password straight from the Client
-          Info PDU to /etc/shadow + PAM. Nothing to provision, but only for
-          clients that send credentials without NLA (FreeRDP /u /p). mstsc
-          does not: without NLA it waits for a server-drawn logon screen,
-          which linrdp does not have yet, and arrives with no username.
+Authentication (--auth, default `system`):
+  system  TLS, and the account's own system password: whatever the client's
+          credential prompt collects arrives in the Client Info PDU and is
+          checked against /etc/shadow with PAM behind it. Nothing is stored by
+          linrdp and nothing has to be provisioned. The client needs
+          credentials to send — in mstsc, fill in the User name field under
+          Options (and, for a client that insists on NLA, add
+          enablecredsspsupport:i:0 to the .rdp file).
+  nla     CredSSP/NTLMv2. NTLM makes the server compute the expected response
+          from the account secret (MS-NLMP), which a one-way /etc/shadow hash
+          cannot produce — so this mode cannot verify a system password at
+          all, only a secret the server stores as well. Present because some
+          deployments require pre-authentication; not the default, and not a
+          way to log in with a system password.
 
 Commands:
   doctor                report what this machine is and what linrdp may do on
@@ -365,25 +365,22 @@ async fn serve() -> anyhow::Result<()> {
 
     // How a login is verified.
     //
-    // `nla` (the default): CredSSP/NTLMv2. The client collects the credentials
-    // and proves them before the session exists. NTLM's own math (MS-NLMP)
-    // makes the server compute the expected response from the account secret,
-    // and a one-way `/etc/shadow` hash cannot produce it — so this mode can
-    // only authenticate against a secret linrdp stores itself
-    // (`--set-password`, which refuses a password that is not the account's
-    // real one). That is the protocol, not a design choice: the same reason
-    // xrdp offers no NLA for local accounts.
+    // `system` (the default): TLS, and the client's own credential prompt.
+    // The typed username and password arrive in the Client Info PDU
+    // (MS-RDPBCGR 2.2.1.11.1.1) and are checked against `/etc/shadow` with the
+    // system PAM stack behind it. The account's real password, nothing stored
+    // anywhere by linrdp. The client must have credentials to send: they come
+    // from its User name field, from a saved credential, or from its prompt
+    // after the server rejects an empty one.
     //
-    // `system`: TLS, and the credentials arrive in the Client Info PDU, where
-    // they are checked against `/etc/shadow` and PAM — the account's own
-    // password, nothing to provision. It needs a client that SENDS them:
-    // FreeRDP with `/u` and `/p` does, mstsc does not. Without NLA mstsc
-    // expects the server to draw a logon screen (Winlogon's job on Windows,
-    // xrdp's own dialog on Linux); linrdp has none yet, so mstsc arrives with
-    // an empty username and is refused.
+    // `nla`: CredSSP/NTLMv2. NTLM's own math (MS-NLMP) makes the server
+    // compute the expected response from the account secret, and a one-way
+    // `/etc/shadow` hash cannot produce it — so NLA can never verify a system
+    // password, only a secret the server also stores. That is the protocol,
+    // not a design choice, and it is why this is not the default.
     let auth_mode = args
         .opt_value_from_str::<_, String>("--auth")?
-        .unwrap_or_else(|| "nla".to_owned());
+        .unwrap_or_else(|| "system".to_owned());
     let nla = match auth_mode.as_str() {
         "system" => false,
         "nla" => true,
