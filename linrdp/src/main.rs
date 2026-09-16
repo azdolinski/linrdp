@@ -40,25 +40,26 @@ use crate::input::X11InputHandler;
 
 const HELP: &str = "\
 USAGE:
-  linrdp [--bind-addr <ADDR>] [--auth system|nla] [--usb] [--log-file <PATH>]
+  linrdp [--bind-addr <ADDR>] [--auth nla|system] [--usb] [--log-file <PATH>]
          [--fixed-size <WxH>]
 
 Serves a real Linux desktop over RDP.
 
-Authentication (--auth, default `system`):
-  system  TLS, and the account's own system password: whatever the client's
-          credential prompt collects arrives in the Client Info PDU and is
-          checked against /etc/shadow with PAM behind it. Nothing is stored by
-          linrdp and nothing has to be provisioned. The client needs
-          credentials to send — in mstsc, fill in the User name field under
-          Options (and, for a client that insists on NLA, add
-          enablecredsspsupport:i:0 to the .rdp file).
-  nla     CredSSP/NTLMv2. NTLM makes the server compute the expected response
-          from the account secret (MS-NLMP), which a one-way /etc/shadow hash
-          cannot produce — so this mode cannot verify a system password at
-          all, only a secret the server stores as well. Present because some
-          deployments require pre-authentication; not the default, and not a
-          way to log in with a system password.
+Authentication (--auth, default `nla`):
+  nla     CredSSP/NTLMv2 — the client's own credential prompt, which is what
+          every RDP client does out of the box. You log in with the account's
+          system password; there is no linrdp password to set, and no command
+          that sets one. NTLM does require the server to know the secret
+          (MS-NLMP: it computes the expected response from it), so linrdp
+          learns each password from the system's own authentication, the way
+          Samba's pam_smbpass did — see deploy/pam-capture. Authenticate once
+          on this machine (su -, ssh, console) and RDP works from then on.
+  system  TLS, and whatever credentials the client sends in the Client Info
+          PDU, checked against /etc/shadow and PAM. Stores nothing at all, but
+          only works with clients that send credentials without NLA.
+
+  `linrdp doctor` reports whether the capture is wired and whose password it
+  has seen.
 
 Commands:
   doctor                report what this machine is and what linrdp may do on
@@ -177,18 +178,93 @@ fn keeper_main() -> anyhow::Result<()> {
 /// like the user typed the wrong name.
 ///
 /// NLA needs the account secret (MS-NLMP), so `/etc/shadow` cannot serve it
-/// and linrdp keeps its own store. When that store is empty — never
-/// provisioned, or emptied by accident — CredSSP denies every logon with a
-/// message about the *name*, and nothing anywhere says the store is the
-/// problem. Say it at startup, where it is cheap to read.
+/// and linrdp keeps a copy it learns from the system's own PAM stack. Until
+/// that stack has handed one over, CredSSP denies every logon with a message
+/// about the *name*, and nothing anywhere says why. Say it at startup, where
+/// it is cheap to read.
 fn warn_if_no_accounts() {
     if sam::account_names().is_empty() {
         tracing::warn!(
             store = %sam::sam_path().display(),
-            "no NLA accounts are provisioned — every login will be denied as \
-             'invalid username'. Provision one with: linrdp --set-password USER:PASSWORD"
+            "no account's system password has been captured yet — every NLA login will be \
+             denied as 'invalid username'. Check `linrdp doctor`: if PAM capture is wired, \
+             authenticate once on this machine (su -, ssh, console) and it will be learned"
         );
     }
+}
+
+
+/// Store the password the system just verified, so NLA can use it.
+///
+/// Run as `auth optional pam_exec.so expose_authtok quiet /usr/local/bin/linrdp
+/// --capture-credential`: `pam_exec` hands us the account name in `PAM_USER`
+/// and the typed password on stdin.
+///
+/// Two rules keep this honest:
+///
+/// * **Never fail.** This sits in the system authentication stack; anything it
+///   returns other than success is a chance to lock someone out of their own
+///   machine. Every path here ends in a log line and a zero exit.
+/// * **Never keep an unverified password.** The module runs whether or not the
+///   authentication that carried it succeeded, so a typo at a `su` prompt
+///   would otherwise poison the store and break RDP until the next correct
+///   login. The password is checked against `/etc/shadow`/PAM first, and a
+///   password that does not authenticate is discarded.
+fn capture_credential() {
+    use std::io::Read as _;
+
+    let Ok(username) = std::env::var("PAM_USER") else {
+        tracing::debug!("credential capture: no PAM_USER — not called from pam_exec");
+        return;
+    };
+    let service = std::env::var("PAM_SERVICE").unwrap_or_default();
+    let mut password = String::new();
+    if std::io::stdin().read_to_string(&mut password).is_err() {
+        tracing::warn!(%username, "credential capture: could not read the token from pam_exec");
+        return;
+    }
+    // pam_exec terminates the token with NUL; some stacks add a newline.
+    let password = password.trim_end_matches(['\0', '\n', '\r']);
+    if password.is_empty() {
+        tracing::debug!(%username, %service, "credential capture: empty token (passwordless path)");
+        return;
+    }
+
+    match auth::verify_system_password(&username, password) {
+        Ok(true) => match sam::set_password(&username, password) {
+            Ok(()) => tracing::info!(
+                %username,
+                %service,
+                "captured this account's system password — NLA logins will use it"
+            ),
+            Err(error) => tracing::warn!(%username, %error, "credential capture: could not write the store"),
+        },
+        // The common case, not an error: a mistyped password, or a PAM stack
+        // where this module runs before the one that would have rejected it.
+        Ok(false) => tracing::debug!(%username, %service, "credential capture: token did not authenticate — discarded"),
+        Err(reason) => tracing::debug!(%username, %service, %reason, "credential capture: no verdict — discarded"),
+    }
+}
+
+
+/// Whether the PAM stack is wired to hand linrdp the passwords it verifies.
+///
+/// Looks for our `pam_exec` line in the files a Debian/Ubuntu-style stack
+/// includes everywhere (`common-auth`, `common-password`) and in the service
+/// stacks that matter on their own.
+fn pam_capture_wired() -> bool {
+    const CANDIDATES: [&str; 4] = [
+        "/etc/pam.d/common-auth",
+        "/etc/pam.d/common-password",
+        "/etc/pam.d/system-auth",
+        "/etc/pam.d/password-auth",
+    ];
+    CANDIDATES.iter().any(|path| {
+        std::fs::read_to_string(path).is_ok_and(|body| {
+            body.lines()
+                .any(|line| !line.trim_start().starts_with('#') && line.contains("--capture-credential"))
+        })
+    })
 }
 
 fn doctor() -> anyhow::Result<()> {
@@ -269,13 +345,23 @@ fn doctor() -> anyhow::Result<()> {
         }
     }
 
-    // Not part of `verdicts`, which reports what the *machine* can do. An
-    // empty store is only a problem under `--auth nla`, where CredSSP denies
-    // every login as "invalid username" without ever mentioning the store.
+    // Not part of `verdicts`, which reports what the *machine* can do: this is
+    // about how the machine is wired, and it is the difference between "NLA
+    // works" and "every login is denied as invalid username".
+    if pam_capture_wired() {
+        println!("  ok      PAM credential capture is wired — system passwords reach NLA by themselves");
+    } else {
+        blockers += 1;
+        println!(
+            "  BLOCKER PAM credential capture is NOT wired. NLA cannot verify an /etc/shadow \
+             hash, so linrdp has to learn each account's system password from the system's own \
+             authentication. Install deploy/pam-capture (see its header) into the PAM stack."
+        );
+    }
     if accounts.is_empty() {
         println!(
-            "  warn    no NLA account is provisioned — only needed with `--auth nla`; \
-             the default `--auth system` uses the account's own system password"
+            "  warn    no account's password has been captured yet — authenticate once on this \
+             machine (su -, ssh, console login) and the next RDP login will work"
         );
     }
 
@@ -332,55 +418,34 @@ async fn serve() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Account provisioning for NLA (MS-RDPBCGR 5.4.2): the CredSSP/NTLM
-    // protocol requires the server to know the account secret, so LinRDP
-    // keeps its own SAM (like Windows SAM on a Windows server).
-    if let Some(set_password) = args.opt_value_from_str::<_, String>("--set-password")? {
-        let (username, password) = match set_password.split_once(':') {
-            Some((u, p)) => (u.to_owned(), p.to_owned()),
-            None => anyhow::bail!("--set-password expects USER:PASSWORD"),
-        };
-        // The SAM exists because NTLM needs the secret, not because linrdp
-        // wants a password of its own. A SAM entry that is not the account's
-        // system password is a second password by accident — it would pass
-        // CredSSP and then be refused by the shadow/PAM re-check, or, worse,
-        // quietly outlive a password change. Hold it to the real one here.
-        match auth::verify_system_password(&username, &password) {
-            Ok(true) => {}
-            Ok(false) => anyhow::bail!(
-                "that is not {username}'s system password.\n\
-                 NLA needs linrdp to store the account's real password (NTLM computes its\n\
-                 answer from it), so it must be the same one `su - {username}` accepts.\n\
-                 Change the system password first if you meant to change it."
-            ),
-            Err(reason) => anyhow::bail!(
-                "cannot check {username}'s system password ({reason}).\n\
-                 Run as root so /etc/shadow and PAM are readable."
-            ),
-        }
-        sam::set_password(&username, &password).context("failed to write SAM")?;
-        println!("LinRDP account '{username}' provisioned for NLA login (matches the system password).");
+    // Credential capture, invoked by `pam_exec` from the system PAM stack.
+    //
+    // There is no command for setting a linrdp password and there must not be
+    // one: the account already has a password, and a second copy that a human
+    // maintains by hand is a copy that drifts. CredSSP/NTLM nonetheless needs
+    // the server to know the secret (MS-NLMP), so linrdp learns it the way
+    // Samba's pam_smbpass did — from the system's own authentication, as it
+    // happens, verified before it is kept.
+    if args.contains("--capture-credential") {
+        capture_credential();
         return Ok(());
     }
 
     // How a login is verified.
     //
-    // `system` (the default): TLS, and the client's own credential prompt.
-    // The typed username and password arrive in the Client Info PDU
-    // (MS-RDPBCGR 2.2.1.11.1.1) and are checked against `/etc/shadow` with the
-    // system PAM stack behind it. The account's real password, nothing stored
-    // anywhere by linrdp. The client must have credentials to send: they come
-    // from its User name field, from a saved credential, or from its prompt
-    // after the server rejects an empty one.
+    // `nla` (the default): CredSSP/NTLMv2 — the client's own credential
+    // prompt, which is what mstsc and every other client does out of the box.
+    // NTLM's math (MS-NLMP) makes the server compute the expected response
+    // from the account secret, so linrdp must know it; it learns that from the
+    // system's own PAM stack (see `capture_credential`), never from a human
+    // typing a second password into linrdp.
     //
-    // `nla`: CredSSP/NTLMv2. NTLM's own math (MS-NLMP) makes the server
-    // compute the expected response from the account secret, and a one-way
-    // `/etc/shadow` hash cannot produce it — so NLA can never verify a system
-    // password, only a secret the server also stores. That is the protocol,
-    // not a design choice, and it is why this is not the default.
+    // `system`: TLS, and whatever credentials the client sends in the Client
+    // Info PDU, checked against `/etc/shadow` and PAM. Nothing stored at all,
+    // but it needs a client that sends credentials without NLA.
     let auth_mode = args
         .opt_value_from_str::<_, String>("--auth")?
-        .unwrap_or_else(|| "system".to_owned());
+        .unwrap_or_else(|| "nla".to_owned());
     let nla = match auth_mode.as_str() {
         "system" => false,
         "nla" => true,

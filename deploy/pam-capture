@@ -1,0 +1,61 @@
+# linrdp credential capture — PAM stack snippet
+#
+# WHY THIS EXISTS
+#
+# RDP clients log in with NLA (CredSSP/NTLMv2) out of the box. NTLM makes the
+# *server* compute the expected response from the account secret (MS-NLMP), and
+# a one-way /etc/shadow hash cannot produce it — so a server that only has
+# /etc/shadow can never verify an NLA login. That is the protocol, not a design
+# choice.
+#
+# linrdp will not ask anyone to set a second password for this. Instead it
+# learns each account's real system password from the system's own
+# authentication, exactly as Samba's pam_smbpass did: whenever the account
+# authenticates (su, ssh, console login, sudo) or changes its password, the
+# password that PAM just verified is handed to linrdp, checked again against
+# /etc/shadow, and kept for NLA. It cannot drift from the system password,
+# because it IS the system password, refreshed every time it is used.
+#
+# HOW TO INSTALL (Debian/Ubuntu)
+#
+#   sudo sh -c 'cat /path/to/deploy/pam-capture >> /etc/pam.d/common-auth'
+#
+# To follow password changes too, add the same call as a `password` line —
+# the type must match the stack it lives in, so this one is written out rather
+# than appended from this file:
+#
+#   sudo sh -c 'echo "password  optional  pam_exec.so expose_authtok quiet \
+#     /usr/local/bin/linrdp --capture-credential" >> /etc/pam.d/common-password'
+#
+# Without it a password change leaves the stored copy stale until the account
+# next authenticates — the next su/ssh/console login refreshes it.
+#
+# On RHEL/SUSE-style stacks the equivalents are /etc/pam.d/system-auth and
+# /etc/pam.d/password-auth.
+#
+# Verify with: sudo linrdp doctor
+#
+# SAFETY
+#
+# * `optional` — this line can never make an authentication fail. If linrdp is
+#   missing, unreadable or broken, PAM ignores the result and the login
+#   proceeds exactly as before. This is also why the helper always exits 0.
+# * pam_exec is the stock PAM module, not something linrdp ships. A custom
+#   module with a bug in the system auth stack can lock every user out of the
+#   machine; this cannot.
+# * `expose_authtok` passes the password to the helper on stdin. The helper
+#   runs as the same (root) user PAM already runs as, verifies the password
+#   before keeping it — a mistyped password at a `su` prompt is discarded, not
+#   stored — and writes it to /var/lib/linrdp/sam, mode 0600, root-owned: the
+#   same trust model as /etc/shadow itself.
+# * This does mean the password is stored recoverably, which /etc/shadow does
+#   not do. That is inherent to NLA, and it is the trade this file exists to
+#   make explicit. To avoid it entirely, run linrdp with `--auth system` and
+#   use a client that sends credentials without NLA.
+#
+# TO REMOVE
+#
+# Delete the line below and empty the store:
+#   sudo sh -c ': > /var/lib/linrdp/sam'
+
+auth      optional  pam_exec.so expose_authtok quiet /usr/local/bin/linrdp --capture-credential

@@ -910,8 +910,19 @@ impl Sequence for Acceptor {
                     .optional_data
                     .auto_reconnect()
                     .cloned();
+                // What the client actually sent, so "logon failed" can be told
+                // apart from "the client sent nothing". Never the password:
+                // only whether one is present.
+                let (info_user, info_domain, info_password_len) = {
+                    let c = &client_info.client_info.credentials;
+                    (c.username.clone(), c.domain.clone(), c.password.len())
+                };
                 debug!(
                     has_auto_reconnect = auto_reconnect.is_some(),
+                    username = %info_user,
+                    domain = ?info_domain,
+                    password_present = info_password_len > 0,
+                    flags = ?client_info.client_info.flags,
                     "Received Client Info PDU"
                 );
                 self.received_auto_reconnect = auto_reconnect;

@@ -512,3 +512,47 @@ offer.
 24. An authentication mode is only "supported" once the user's own client has
     been tested against it. FreeRDP sends credentials the server can check;
     mstsc without NLA sends none at all.
+
+## Saga: the password the server may not ask for
+
+The operator's rule, stated with force: never make a human set a password in
+linrdp; logging in uses the account's system password. NLA makes that
+impossible on its face — NTLM has the server compute the expected response from
+the account secret (MS-NLMP), and the session key that protects both the
+pubKeyAuth exchange and the delegated credentials is derived from the same
+secret, so a server that does not know it cannot even decrypt the password the
+client is trying to hand over. `/etc/shadow` holds a one-way hash. Three
+constraints — a stock client, a system password, no server-drawn logon — cannot
+hold at once, and saying so plainly was the first useful thing to do.
+
+The resolution was the third option neither of us had named: linrdp does not
+have to be *told* the password, it can be *handed* it, by the system's own
+authentication. `auth optional pam_exec.so expose_authtok quiet linrdp
+--capture-credential` in the PAM stack gives linrdp every password the system
+verifies; linrdp re-verifies it and keeps it for NLA. Samba's `pam_smbpass`
+did exactly this for the SMB password database. The store is now the system
+password by construction, refreshed on every login, and no human maintains it.
+
+- **`pam_exec` beats a custom PAM module.** A module of our own with a bug in
+  `common-auth` locks every user out of the machine. pam_exec is stock, and
+  `optional` means a missing or broken helper cannot fail an authentication —
+  which is also why the helper always exits 0, whatever happens inside it.
+- **Never store an unverified secret.** The helper runs whether or not the
+  authentication carrying the password succeeded, so a typo at a `su` prompt
+  would poison the store. It verifies against `/etc/shadow`/PAM first;
+  measured: a wrong password is discarded and the good one survives.
+- **Edit `common-auth` behind a watchdog.** A background root process that
+  restores the backup unless told otherwise within a minute costs one line and
+  removes the only way this change could have been catastrophic.
+- **Three constraints that cannot all hold is a finding, not an obstacle.**
+  Naming the contradiction, with the protocol reason in one sentence, is what
+  turned a loop of rejected suggestions into a decision.
+
+## Invariants now enforced (keep them)
+
+25. There is no command that sets a password in linrdp, and there must never
+    be one. The NLA store is filled by the system's PAM stack and holds
+    nothing but passwords `/etc/shadow` or PAM has just accepted.
+26. Anything linrdp runs from inside a PAM stack exits successfully no matter
+    what goes wrong, and is wired `optional`. An authentication must never
+    fail because of us.

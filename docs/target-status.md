@@ -70,8 +70,11 @@ Rozwiązanie zgodne z dokumentacją Microsoft:
 - Serwer odpowiada HYBRID (CredSSP/NLA), gdy klient zaoferuje HYBRID — dokładnie jak serwer Windows
   (MS-RDPBCGR 5.4.2; mstsc wtedy pokazuje NATYWNE okno logowania).
 - MS-NLMP wymaga, by serwer znał sekret konta (hasło/NT hash) — LSA czyta go z SAM. Linuxowy
-  odpowiednik: własny SAM `/var/lib/linrdp/sam` (0600, root-only), zasilany przez
-  `linrdp --set-password USER:PASS` (odpowiednik ustawienia hasła konta).
+  odpowiednik: `/var/lib/linrdp/sam` (0600, root-only), **zasilany automatycznie** przez
+  systemowy stack PAM (`deploy/pam-capture`, model `pam_smbpass` Samby): hasło, które PAM
+  właśnie zweryfikował, trafia do linrdp, jest sprawdzane ponownie i zapamiętywane.
+  Nie ma i nie może być komendy ustawiającej hasło w linrdp — konto ma już hasło, a druga
+  kopia utrzymywana ręcznie to kopia, która się rozjeżdża.
 - `ironrdp-acceptor`: CredentialsProxy przepisany na resolver per-username (auth_data_by_user),
   zgodnie z MS-NLMP (serwer sprawdza odpowiedź NTLMv2 wyliczoną z sekretu konta).
 Weryfikacja: poprawne hasło → CredSSP NTLM Ok → "Client accepted" → stream; złe hasło →
