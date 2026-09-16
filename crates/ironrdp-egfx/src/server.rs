@@ -56,6 +56,7 @@
 //! ```
 
 use std::collections::{HashMap, VecDeque};
+use core::time::Duration;
 use std::time::Instant;
 
 use ironrdp_core::{Encode, EncodeResult, WriteCursor, decode, impl_as_any};
@@ -89,7 +90,22 @@ const SUSPEND_FRAME_ACK_QUEUE_DEPTH: u32 = 0xFFFFFFFF;
 /// Client decode-queue depth (bytes) at which the server starts skipping
 /// frames: above ~one 4K frame of pending content mstsc's software decoder
 /// is demonstrably behind, and pushing further kills it.
-const CLIENT_QUEUE_BACKOFF: u32 = 250_000;
+pub const CLIENT_QUEUE_BACKOFF: u32 = 250_000;
+
+/// How long a reported client queue depth stays evidence about *now*.
+///
+/// `client_queue_depth` is only ever refreshed by an RDPGFX_FRAME_ACKNOWLEDGE_PDU,
+/// and an ack only arrives in response to a frame we sent. So a depth at or above
+/// [`CLIENT_QUEUE_BACKOFF`] latches a deadlock: backpressure blocks every send, no
+/// send means no ack, and no ack means the value never decays. The session freezes
+/// on its last frame forever.
+///
+/// MS-RDPEGFX 3.2.5.13 says the server SHOULD use `queueDepth` "to determine how
+/// far the client is lagging" — a value from an ack seconds ago says nothing about
+/// how far it is lagging now, and sending one probe frame is the only way to find
+/// out. After this long the sample is ignored and the in-flight count (which does
+/// decay, because frames time out of `unacknowledged`) is the sole limiter.
+const CLIENT_QUEUE_DEPTH_STALE_AFTER: Duration = Duration::from_millis(1000);
 
 /// Pre-encoded ZGFX-wrapped bytes for DVC transmission.
 ///
@@ -383,7 +399,7 @@ impl QoeCollector {
     }
 
     /// Record a round-trip latency measurement from a frame acknowledgment.
-    fn record_rtt(&mut self, rtt: core::time::Duration) {
+    fn record_rtt(&mut self, rtt: Duration) {
         let rtt_ms = rtt.as_secs_f32() * 1000.0;
 
         self.min_rtt_ms = self.min_rtt_ms.min(rtt_ms);
@@ -500,6 +516,10 @@ pub struct FrameTracker {
     unacknowledged: HashMap<u32, FrameInfo>,
     /// Last reported client queue depth
     client_queue_depth: u32,
+    /// When `client_queue_depth` was last refreshed by an ack. `None` until the
+    /// first ack arrives. Past [`CLIENT_QUEUE_DEPTH_STALE_AFTER`] the sample no
+    /// longer gates sending — see that constant for why it must expire.
+    client_queue_depth_at: Option<Instant>,
     /// Whether client has suspended acknowledgments
     ack_suspended: bool,
     /// Next frame ID to assign
@@ -531,6 +551,7 @@ impl FrameTracker {
         Self {
             unacknowledged: HashMap::new(),
             client_queue_depth: 0,
+            client_queue_depth_at: None,
             ack_suspended: false,
             next_frame_id: 0,
             max_in_flight: DEFAULT_MAX_FRAMES_IN_FLIGHT,
@@ -629,6 +650,7 @@ impl FrameTracker {
             self.ack_suspended = false;
             self.client_queue_depth = queue_depth;
         }
+        self.client_queue_depth_at = Some(Instant::now());
 
         let info = self.unacknowledged.remove(&frame_id);
         if info.is_some() {
@@ -658,15 +680,43 @@ impl FrameTracker {
         // all-intra IDR frames runs the queue away until the decoder gives
         // up (the terminal mid-session CapsAdvertise). Skip frames until it
         // drains — the backpressure path repaints fully afterwards.
-        if self.client_queue_depth >= CLIENT_QUEUE_BACKOFF {
+        //
+        // Only while the sample is fresh: the depth is refreshed by acks alone,
+        // and acks only answer frames, so an expired high reading would block
+        // sending forever with nothing left to lift it. See
+        // CLIENT_QUEUE_DEPTH_STALE_AFTER.
+        if self.client_queue_depth >= CLIENT_QUEUE_BACKOFF && !self.queue_depth_is_stale() {
             return true;
         }
         !self.ack_suspended && self.in_flight() >= self.max_in_flight
     }
 
+    /// Whether the last reported queue depth is too old to gate sending.
+    ///
+    /// No ack yet (`None`) counts as stale: at session start there is nothing to
+    /// throttle against, and the in-flight count already bounds the first burst.
+    fn queue_depth_is_stale(&self) -> bool {
+        self.client_queue_depth_at
+            .is_none_or(|at| at.elapsed() >= CLIENT_QUEUE_DEPTH_STALE_AFTER)
+    }
+
     /// Get client queue depth
     pub fn client_queue_depth(&self) -> u32 {
         self.client_queue_depth
+    }
+
+    /// Client decode-queue depth in bytes, but only while the reading is recent
+    /// enough to describe the present ([`CLIENT_QUEUE_DEPTH_STALE_AFTER`]).
+    ///
+    /// `None` means "no usable measurement" — no ack has arrived yet, the client
+    /// suspended acknowledgements (MS-RDPEGFX 3.2.5.13: the server MUST NOT then
+    /// wait on unacknowledged frames), or the last sample has expired.
+    /// `Some(0)` is the client explicitly reporting an empty decode queue.
+    pub fn fresh_client_queue_depth(&self) -> Option<u32> {
+        if self.ack_suspended || self.queue_depth_is_stale() {
+            return None;
+        }
+        Some(self.client_queue_depth)
     }
 
     /// Check if acknowledgments are suspended
@@ -688,6 +738,7 @@ impl FrameTracker {
     pub fn clear(&mut self) {
         self.unacknowledged.clear();
         self.client_queue_depth = 0;
+        self.client_queue_depth_at = None;
         self.ack_suspended = false;
     }
 }
@@ -1362,6 +1413,16 @@ impl GraphicsPipelineServer {
         self.frames.client_queue_depth()
     }
 
+    /// Client decode-queue depth in bytes, only while the reading still
+    /// describes the present. See [`FrameTracker::fresh_client_queue_depth`].
+    ///
+    /// This is the throttling signal MS-RDPEGFX 3.2.5.13 names; prefer it over
+    /// [`Self::client_queue_depth`], which can hand back a stale sample.
+    #[must_use]
+    pub fn fresh_client_queue_depth(&self) -> Option<u32> {
+        self.frames.fresh_client_queue_depth()
+    }
+
     /// Set the maximum frames in flight before backpressure
     pub fn set_max_frames_in_flight(&mut self, max: u32) {
         self.frames.set_max_in_flight(max);
@@ -2018,7 +2079,7 @@ impl GraphicsPipelineServer {
         // significant for the per-frame budget. Always log at DEBUG so the
         // ZGFX ratio is visible during normal debug sessions.
         let elapsed = drain_start.elapsed();
-        if elapsed >= core::time::Duration::from_millis(10) {
+        if elapsed >= Duration::from_millis(10) {
             tracing::info!(
                 pdu_count,
                 total_uncompressed,
@@ -2444,6 +2505,69 @@ mod capability_negotiation_tests {
             assert_eq!(sanitize_capabilities_for_confirm(client.clone()), expected);
             assert_eq!(negotiate_capabilities(&[client], &[server]), Some(expected));
         }
+    }
+}
+
+#[cfg(test)]
+mod queue_depth_tests {
+    use super::{CLIENT_QUEUE_BACKOFF, CLIENT_QUEUE_DEPTH_STALE_AFTER, FrameTracker, Instant};
+
+    /// A client backlog above the cut-off stops the server sending — but only
+    /// for as long as that reading still describes the present.
+    ///
+    /// Regression (deadlock): `client_queue_depth` is refreshed only by an
+    /// RDPGFX_FRAME_ACKNOWLEDGE_PDU, and an ack only ever answers a frame we
+    /// sent. So a depth latched at or above the cut-off blocked every send,
+    /// which stopped every ack, which meant the value could never come back
+    /// down. The session froze on its last frame with no way out.
+    #[test]
+    fn a_stale_client_queue_depth_stops_gating_sends() {
+        let mut tracker = FrameTracker::new();
+        tracker.acknowledge(0, CLIENT_QUEUE_BACKOFF + 1);
+        assert!(
+            tracker.should_backpressure(),
+            "a fresh over-cut-off depth must hold frames back"
+        );
+        assert_eq!(tracker.fresh_client_queue_depth(), Some(CLIENT_QUEUE_BACKOFF + 1));
+
+        // Age the sample past its shelf life without sleeping.
+        tracker.client_queue_depth_at = Instant::now().checked_sub(CLIENT_QUEUE_DEPTH_STALE_AFTER);
+        assert!(
+            !tracker.should_backpressure(),
+            "an expired depth must not keep blocking — only a probe frame can refresh it"
+        );
+        assert_eq!(
+            tracker.fresh_client_queue_depth(),
+            None,
+            "an expired sample is not a measurement"
+        );
+    }
+
+    /// Zero is a measurement, not a missing one: MS-RDPEGFX 3.2.5.13 scopes
+    /// throttling to `queueDepth` in 1..=0xFFFFFFFE, so a client reporting an
+    /// empty decode queue must be distinguishable from having said nothing.
+    #[test]
+    fn a_zero_depth_is_a_real_measurement() {
+        let mut tracker = FrameTracker::new();
+        assert_eq!(
+            tracker.fresh_client_queue_depth(),
+            None,
+            "before the first ack there is no measurement"
+        );
+        tracker.acknowledge(0, 0);
+        assert_eq!(tracker.fresh_client_queue_depth(), Some(0));
+        assert!(!tracker.should_backpressure());
+    }
+
+    /// A client that suspended acknowledgements reports no depth at all —
+    /// MS-RDPEGFX 3.2.5.13: the server "MUST NOT wait or block on
+    /// unacknowledged frames" in that mode.
+    #[test]
+    fn suspended_acknowledgements_report_no_depth() {
+        let mut tracker = FrameTracker::new();
+        tracker.acknowledge(0, super::SUSPEND_FRAME_ACK_QUEUE_DEPTH);
+        assert_eq!(tracker.fresh_client_queue_depth(), None);
+        assert!(!tracker.should_backpressure());
     }
 }
 
