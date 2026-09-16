@@ -136,6 +136,19 @@ impl Setup {
         self
     }
 
+    /// Number of reference frames the encoder may keep (`i_frame_reference`).
+    ///
+    /// The fast presets pin this to 1, so a frame can only be predicted from
+    /// its immediate predecessor. That is wrong for any stream whose
+    /// consecutive frames alternate between two different images — such as
+    /// the AVC444v2 luma/chroma views, which MS-RDPEGFX 2.2.4.6 requires to
+    /// share one encoder. With 2 or more, the encoder can predict from the
+    /// previous frame of the SAME view instead.
+    pub fn frame_reference(mut self, frames: i32) -> Self {
+        self.raw.i_frame_reference = frames;
+        self
+    }
+
     /// Build the encoder.
     pub fn build<C>(mut self, csp: C, width: i32, height: i32) -> Result<Encoder>
     where

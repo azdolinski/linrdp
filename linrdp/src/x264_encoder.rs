@@ -51,6 +51,23 @@ impl X264Encoder {
             // pump on unchanged regions.
             .max_keyframe_interval(250)
             .min_keyframe_interval(250)
+            // Two reference frames, and no scene-cut detection.
+            //
+            // Both exist for AVC444v2: MS-RDPEGFX 2.2.4.6 requires one
+            // encoder for the luma and chroma views, so the stream alternates
+            // between two quite different images. With the preset's default
+            // ref=1 every frame could only predict from the other view, and
+            // with scene-cut detection on, every view switch looked like a
+            // cut. Measured on a nearly static desktop: P-frames of 74-109 KB
+            // with 90% of macroblocks coded intra and skip at 0.1%, more I
+            // frames than P frames, and 8-13 Mb/s for a screen doing nothing.
+            //
+            // ref=2 lets a frame predict from the previous frame of its OWN
+            // view; scenecut 0 stops the view switch from forcing I frames.
+            // Keyframes stay under our control (force_intra recreates the
+            // encoder), so nothing is lost for the plain 4:2:0 path either.
+            .frame_reference(2)
+            .scenecut_threshold(0)
             .annexb(true)
             .build(Colorspace::I420, i32::from(width), i32::from(height))
             .map_err(|e| anyhow::anyhow!("x264 setup: {e:?}"))
@@ -207,6 +224,55 @@ mod tests {
             last_idr < first_p,
             "every IDR slice belongs to the first picture; an IDR after P slices would \
              flush the single decoder's DPB mid-session, got {stream_types:?}"
+        );
+    }
+
+    /// A static desktop encoded as alternating AVC444v2 views must still
+    /// compress: once both views have been seen, every later frame predicts
+    /// from the previous frame of its OWN view and costs almost nothing.
+    ///
+    /// Regression: the preset pinned `ref` to 1, so each frame could only
+    /// predict from the other view, and scene-cut detection read every view
+    /// switch as a cut. Live result on a nearly idle screen: P-frames of
+    /// 74-109 KB, 90% of macroblocks intra, skip 0.1%, more I frames than P
+    /// frames, ~2 MB/s of traffic for a screen doing nothing.
+    #[test]
+    fn alternating_views_of_a_static_screen_compress() {
+        const W: usize = 640;
+        const H: usize = 480;
+
+        // Two distinct but individually static images, standing in for the
+        // luma and chroma views of one unchanging desktop. Detailed content,
+        // so a frame that fails to predict is unmistakably expensive.
+        let luma = pseudo_frame(1, W, H);
+        let chroma = pseudo_frame(2, W, H);
+
+        let mut enc = crate::gfx_display::make_h264_encoder(6_000_000, 30.0, W as u16, H as u16).unwrap();
+
+        let mut sizes = Vec::new();
+        for _ in 0..8 {
+            sizes.push(enc.encode_planes(&luma.0, &luma.1, &luma.2).len());
+            sizes.push(enc.encode_planes(&chroma.0, &chroma.1, &chroma.2).len());
+        }
+
+        // The first frames introduce both views and let the DPB fill; the
+        // tail is the steady state, and that is what a long idle session
+        // actually costs.
+        let settled = &sizes[sizes.len() - 8..];
+        let worst = settled.iter().copied().max().expect("frames encoded");
+        let first = sizes[0];
+
+        assert!(
+            worst * 50 < first,
+            "a static screen must collapse once both views are referenced: \
+             first frame {first} B, worst settled frame {worst} B, all sizes {sizes:?}"
+        );
+        // And it must stay collapsed rather than creeping back up — the live
+        // symptom was frame sizes climbing frame after frame.
+        let best = settled.iter().copied().min().expect("frames encoded");
+        assert!(
+            worst <= best * 2,
+            "steady-state frame sizes must be flat, got {settled:?}"
         );
     }
 }
