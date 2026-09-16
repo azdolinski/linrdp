@@ -231,3 +231,83 @@ Net effect once both were fixed, same desktop, same client:
     when the server refuses, with `IPC_RMID` as soon as both sides are
     attached — so the permissive window is closed and a crash cannot leak a
     20 MB segment.
+
+---
+
+# Learnings — "the first screen paints top-to-bottom over 30 s" (2026-09-16)
+
+Direct descendant of the section above. With the stream finally cheap and the
+session stable, connecting still felt like a 3G modem: the first full screen
+crawled down from the top over ~30 seconds on a 1 Gbit LAN, and on a screen
+nobody touched it never finished at all.
+
+| # | Defect | Symptom | Evidence that found it |
+|---|--------|---------|------------------------|
+| 1 | The lossless-debt repayment lives inside `egfx_frame`, which only runs when a poll returns a `Grab`. After the `PollOutcome::Idle` split (previous section, defect 2) an unchanged screen returns no grab at all, so the debt could only advance on somebody *else's* damage event | first paint ~30 s; a genuinely static screen never completes | `polls=292 damaged=8` per 5 s against `frames=16` per 10 s — damage events and sent frames were the same 1.6/s number, and `pending_full=true` persisted across 5 consecutive heartbeats |
+| 2 | `lossless_budget_px()` sized bands from a fixed H.264 bitrate anchor (2880x1800 → nearest anchor 2560x1440 → 6328 kbit/s → 98 877 px), and `CLEARCODEC_BYTES_PER_PX = 1` overstated the real cost ~5x | 53 bands of 34 rows for one screen | `EGFX ClearCodec frame sent seq=80..99 full=false w=2880 h=34` — 100 consecutive bands, every one exactly 34 rows, never `full=true` |
+| 3 | `client_queue_depth` gates sending at ≥250 KB but is refreshed only by an ack, and an ack only answers a frame we sent — a latched value can never decay | (latent) permanent freeze on the last frame | highest observed in a real session was 156 865 B, i.e. ~60% of the way to a deadlock nothing could clear |
+| 4 | `send_h264` returned `()`, so the caller entered motion mode even for a frame the pipeline rejected; motion mode then suppresses the lossless path | dropped pixels nothing later delivers — permanently when AVC is disabled | read while tracing why `in_motion` was true with `h264=0` in the stats |
+| 5 | `backpressure_events` counted only pre-encode `should_backpressure()` polls, never an actual rejected send; `producer_frames` counted deliveries, below the very window it sizes | quality loop blind to real drops; starved producer pinned the window at `MIN_IN_FLIGHT` | the comment on `update_in_flight_window` claims the rate is measured upstream of the window — it was not |
+
+## What the specification actually said
+
+Every fix here is anchored in a MUST/SHOULD we were contradicting or ignoring.
+
+- **MS-RDPEGFX 3.2.5.13**: the server SHOULD throttle on `queueDepth` *"in the
+  range 0x00000001 to 0xFFFFFFFE"*. That range is the whole mandate. Our client
+  reported `queue_depth=0` in **2256 of 2265** acks, `suspended=false` always,
+  `in_flight_after=0` in 2253 of 2263 — it was idle and waiting, and we throttled
+  it anyway against a number the protocol never asked us to invent.
+- **MS-RDPEGFX 2.2.2.13**: `queueDepth` is *"the number of unprocessed bytes
+  buffered at the client"* — a byte count, and one that only exists at the
+  moment an ack carries it.
+- **MS-RDPBCGR 3.2.5.14**: autodetected bandwidth is `(byteCount * 8) / timeDelta`
+  over *"the PDUs sent from server to client"* — on a quiet session it measures
+  our own output, so it must never steer our output. (`bandwidth_kbps=0` in the
+  log is this, not a broken link.)
+- **MS-RDPEGFX 3.2.5.21**: QoE timings *"SHOULD only be used for informational
+  and debugging purposes"* — not as a control input, however tempting.
+
+## Traps worth remembering
+
+- **A correct fix can starve the thing that was accidentally feeding it.** The
+  `Idle`/`Failed` split was right, measured, and shipped with an invariant. It
+  also removed the spurious full repaints that had been the debt's only source
+  of progress. Nothing in the old code said "the repaint depends on this
+  misbehaviour" — because nobody knew it did. After a fix lands, ask what was
+  *benefiting* from the bug.
+- **The type already described the case the code could not produce.** `Grab.damage`
+  was documented as "`None` when nothing changed", and `egfx_frame` already had a
+  branch repaying the debt from exactly that shape. `poll()` simply never built
+  one. The fix was a forcing flag, not new logic — when a handler for a state
+  exists but is unreachable, suspect the producer, not the consumer.
+- **A conservative constant is still a guess.** `CLEARCODEC_BYTES_PER_PX = 1` was
+  commented as "4x the measured rate" and treated as safe because it only ever
+  *under*-fills a band. Multiplied by a budget that was already 50x too small it
+  was a 5x error on top of a 50x one. The encoder knows the real ratio on every
+  frame; measure it instead.
+- **Check the justification, not just the number.** The 1/8-second band budget
+  existed so "audio never queues behind one". Measured on this path:
+  `SharedWriter` `lock_wait_ms` was **0 across 34 113 samples**, largest single
+  write 448 KB at `write_ms` ≤ 1. The hazard it was defending against was not
+  present, and the defence cost 30 seconds of every connect.
+- **A backpressure signal that only arrives in replies is a deadlock waiting to
+  latch.** Anything gated on a value refreshed solely by the traffic that value
+  gates needs an expiry. Ours had none.
+
+## Invariants now enforced (keep them)
+
+13. Throttling follows the client's own reported `queueDepth`, per MS-RDPEGFX
+    3.2.5.13, never a locally invented capacity figure. Autodetected bandwidth
+    and QoE timings are explicitly not control inputs.
+14. Any backpressure sample refreshed only by acks expires
+    (`CLIENT_QUEUE_DEPTH_STALE_AFTER`). A reading that can only be cleared by
+    traffic it is blocking must never be able to block forever.
+15. While the display owes the client pixels, the frame source hands back the
+    current screen with `damage: None` rather than reporting "nothing changed".
+    A repaint must never depend on unrelated damage to make progress.
+16. Every send path reports whether the frame reached the wire, and callers act
+    on it: motion mode only on a delivered H.264 frame, and a rejected send
+    counts as backpressure.
+17. Producer rate is counted on offer, above the in-flight window it sizes —
+    otherwise the window starves the producer whose rate sets the window.
