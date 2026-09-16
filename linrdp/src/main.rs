@@ -172,6 +172,9 @@ async fn serve() -> anyhow::Result<()> {
     if multi_session {
         session::runtime_dir::ensure_state_dir(std::path::Path::new(session::runtime_dir::STATE_DIR))
             .context("prepare the session state directory")?;
+        // From here on this process may not touch any display until a session
+        // is bound — there is no ambient fallback to fall back to.
+        session::gate::arm();
     }
 
     // NLA per MS-RDPBCGR 5.4.2: NTLM verifies the client's typed password
@@ -267,7 +270,14 @@ async fn serve() -> anyhow::Result<()> {
         }
     } else {
         (
-            AnyInput::X11(X11InputHandler::connect().expect("X11 unavailable for input")),
+            if multi_session {
+                // Deferred for the same reason as the display: connecting now
+                // would bind input to the shared desktop, and a worker that
+                // later failed to bind a session would be typing into it.
+                AnyInput::DeferredX11(None)
+            } else {
+                AnyInput::X11(X11InputHandler::connect().expect("X11 unavailable for input"))
+            },
             if serve_fd.is_some() && !console_mode {
                 // A worker must not bind to a display before it knows whose
                 // desktop it serves; the factory connects on the first frame,
@@ -471,24 +481,63 @@ async fn serve() -> anyhow::Result<()> {
 /// so the variants are dispatched through one implementing type.
 enum AnyInput {
     X11(X11InputHandler),
+    /// A multi-session worker that has not connected yet.
+    ///
+    /// Connecting at startup would bind input to the ambient display — the
+    /// shared desktop — and a worker whose session later failed to start
+    /// would be typing into it. Input only arrives after authentication, by
+    /// which time the session gate names the right display, so the
+    /// connection is made on the first event and never before.
+    DeferredX11(Option<X11InputHandler>),
     #[cfg(feature = "wayland")]
     Wayland(wayland::ei::EiInputHandler),
 }
 
+impl AnyInput {
+    /// The X11 handler, connecting on first use for a deferred worker.
+    /// `None` while no session is bound — input is dropped rather than sent
+    /// somewhere it does not belong.
+    fn x11(&mut self) -> Option<&mut X11InputHandler> {
+        match self {
+            Self::X11(handler) => Some(handler),
+            Self::DeferredX11(slot) => {
+                if slot.is_none() {
+                    match X11InputHandler::connect() {
+                        Ok(handler) => *slot = Some(handler),
+                        Err(error) => {
+                            tracing::warn!(%error, "input: no display bound yet — event dropped");
+                            return None;
+                        }
+                    }
+                }
+                slot.as_mut()
+            }
+            #[cfg(feature = "wayland")]
+            Self::Wayland(_) => None,
+        }
+    }
+}
+
 impl ironrdp_server::RdpServerInputHandler for AnyInput {
     fn keyboard(&mut self, event: ironrdp_server::KeyboardEvent) {
-        match self {
-            Self::X11(handler) => handler.keyboard(event),
-            #[cfg(feature = "wayland")]
-            Self::Wayland(handler) => handler.keyboard(event),
+        #[cfg(feature = "wayland")]
+        if let Self::Wayland(handler) = self {
+            handler.keyboard(event);
+            return;
+        }
+        if let Some(handler) = self.x11() {
+            handler.keyboard(event);
         }
     }
 
     fn mouse(&mut self, event: ironrdp_server::MouseEvent) {
-        match self {
-            Self::X11(handler) => handler.mouse(event),
-            #[cfg(feature = "wayland")]
-            Self::Wayland(handler) => handler.mouse(event),
+        #[cfg(feature = "wayland")]
+        if let Self::Wayland(handler) = self {
+            handler.mouse(event);
+            return;
+        }
+        if let Some(handler) = self.x11() {
+            handler.mouse(event);
         }
     }
 }

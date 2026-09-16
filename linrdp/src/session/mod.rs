@@ -3,6 +3,7 @@
 //! See `docs/superpowers/specs/2026-09-16-multi-session-design.md`.
 
 pub(crate) mod display_alloc;
+pub(crate) mod gate;
 pub(crate) mod keeper;
 pub(crate) mod pam_session;
 pub(crate) mod privilege;
@@ -75,7 +76,9 @@ pub(crate) fn resolve_display(
     }
     match attach_live(base, user, range) {
         Some(rec) => format!(":{}", rec.display),
-        None => ambient.to_owned(),
+        // No ambient fallback: a user whose session is gone must be refused,
+        // not quietly shown the shared desktop.
+        None => String::new(),
     }
 }
 
@@ -121,6 +124,12 @@ pub(crate) fn create(
     let env_pairs = keeper::session_env(&rec, &ids);
     keeper::spawn_detached(&cmd, &env_pairs, &ids)
         .with_context(|| format!("start the X server for {user} on :{}", rec.display))?;
+    // The desktop is detached, so its exec failure cannot be waited for.
+    // Without this check a failed start would be recorded as a healthy
+    // session and the connection would be routed to a display that does not
+    // exist — which is precisely how it first went wrong.
+    keeper::wait_for_display(rec.display, core::time::Duration::from_secs(5))
+        .with_context(|| format!("X server for {user} on :{}", rec.display))?;
 
     lease.record_owner(user)?;
     registry::write_record(base, &rec)?;

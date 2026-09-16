@@ -73,13 +73,10 @@ impl SessionRouter {
             self.range.clone(),
             self.desktop_size,
         )?;
-        // SAFETY: the display factory connects lazily, on the first frame
-        // after this point, so nothing is reading these yet.
-        unsafe {
-            std::env::set_var("DISPLAY", format!(":{}", rec.display));
-            std::env::set_var("XAUTHORITY", &rec.xauthority);
-            std::env::set_var("XDG_RUNTIME_DIR", &rec.runtime_dir);
-        }
+        // The gate, not the environment, is what the capture and input paths
+        // trust. Binding also sets the environment for the subsystems that
+        // start later and read it (clipboard, selection owner).
+        crate::session::gate::bind(rec.display, &rec.xauthority, &rec.runtime_dir)?;
         tracing::info!(user, display = rec.display, "routed to the user's desktop");
         Ok(())
     }

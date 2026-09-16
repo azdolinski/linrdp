@@ -59,6 +59,36 @@ pub(crate) fn session_env(rec: &SessionRecord, user: &UserIds) -> Vec<(String, S
 }
 
 
+/// Find `program` on PATH, or accept it as-is when it is already a path.
+fn resolve_program(program: &str) -> Option<String> {
+    if program.contains('/') {
+        return std::path::Path::new(program).is_file().then(|| program.to_owned());
+    }
+    std::env::var("PATH")
+        .unwrap_or_else(|_| "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned())
+        .split(':')
+        .map(|dir| std::path::Path::new(dir).join(program))
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+}
+
+/// Wait for an X server to publish its socket, so a failed start is reported
+/// here rather than as a session that routes nowhere.
+///
+/// The grandchild is detached, so its exec failure cannot be waited for; the
+/// socket appearing is the only evidence available that the desktop is real.
+pub(crate) fn wait_for_display(display: u16, timeout: core::time::Duration) -> anyhow::Result<()> {
+    let socket = std::path::PathBuf::from(format!("/tmp/.X11-unix/X{display}"));
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if socket.exists() {
+            return Ok(());
+        }
+        std::thread::sleep(core::time::Duration::from_millis(50));
+    }
+    anyhow::bail!("X server for :{display} did not start within {timeout:?}")
+}
+
 /// Start `cmd` as a detached child of init, running as `user`.
 ///
 /// Double-fork: the intermediate child exits immediately, so the grandchild
@@ -73,7 +103,12 @@ pub(crate) fn spawn_detached(
     env: &[(String, String)],
     user: &UserIds,
 ) -> anyhow::Result<()> {
-    let program = std::ffi::CString::new(cmd.program.as_str()).context("program name NUL")?;
+    // execve does NOT search PATH — a bare "Xvfb" fails with ENOENT in the
+    // grandchild, where nothing can report it. Resolve here, where the error
+    // still has somewhere to go.
+    let resolved = resolve_program(&cmd.program)
+        .with_context(|| format!("{} not found in PATH", cmd.program))?;
+    let program = std::ffi::CString::new(resolved.as_str()).context("program name NUL")?;
     let mut argv_owned = vec![program.clone()];
     for a in &cmd.args {
         argv_owned.push(std::ffi::CString::new(a.as_str()).context("argument NUL")?);

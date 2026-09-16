@@ -90,7 +90,9 @@ pub(crate) struct X11InputHandler {
 
 impl X11InputHandler {
     pub(crate) fn connect() -> anyhow::Result<Self> {
-        let display_name = std::env::var("DISPLAY").unwrap_or_else(|_| ":99".to_owned());
+        // Through the session gate: injecting input into the ambient display
+        // would type into another user's desktop.
+        let display_name = crate::session::gate::display_name()?;
         let (conn, screen_num) = x11rb::rust_connection::RustConnection::connect(Some(display_name.as_str()))
             .with_context(|| format!("connect to X display {display_name}"))?;
         let root = conn.setup().roots.get(screen_num).context("no X screen")?.root;
@@ -122,7 +124,12 @@ impl X11InputHandler {
             }
         }
         self.last_reconnect_attempt = Some(std::time::Instant::now());
-        let display_name = std::env::var("DISPLAY").unwrap_or_else(|_| ":99".to_owned());
+        // Through the session gate: injecting input into the ambient display
+        // would type into another user's desktop. An unbound worker simply
+        // fails to reconnect rather than reaching for the shared one.
+        let Ok(display_name) = crate::session::gate::display_name() else {
+            return false;
+        };
         match x11rb::rust_connection::RustConnection::connect(Some(display_name.as_str())) {
             Ok((conn, screen_num)) => {
                 let Some(screen) = conn.setup().roots.get(screen_num) else {

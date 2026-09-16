@@ -59,7 +59,10 @@ pub(crate) struct X11Display {
 impl X11Display {
     /// Connect to `$DISPLAY` (or `:99`) and take the root window geometry.
     pub(crate) fn connect(fixed_size: Option<(u16, u16)>) -> anyhow::Result<Self> {
-        let display_name = std::env::var("DISPLAY").unwrap_or_else(|_| ":99".to_owned());
+        // Through the gate, never straight from the environment: an armed
+        // worker with no bound session must be refused here rather than
+        // reaching the shared desktop.
+        let display_name = crate::session::gate::display_name()?;
         let (conn, screen_num) = x11rb::rust_connection::RustConnection::connect(Some(display_name.as_str()))
             .with_context(|| format!("connect to X display {display_name}"))?;
         let screen = conn.setup().roots.get(screen_num).context("no X screen")?;
@@ -1270,9 +1273,12 @@ impl crate::gfx_display::DisplaySourceFactory for X11DisplayFactory {
             display_name: display.display_name().to_owned(),
             fixed_size: display.fixed_size,
         });
+        // No display yet (unbound worker, or X unreachable): a source with no
+        // grabber produces no frames and, critically, names no display — it
+        // must never reconnect to whatever $DISPLAY happens to be.
         Box::new(built.unwrap_or_else(|| X11Source {
             grabber: None,
-            display_name: std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_owned()),
+            display_name: crate::session::gate::display_name().unwrap_or_default(),
             fixed_size: self.fixed_size,
         }))
     }
