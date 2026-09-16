@@ -161,37 +161,39 @@ async fn serve() -> anyhow::Result<()> {
     let identity = tls::load_or_generate_identity().context("failed to prepare TLS identity")?;
     let acceptor = identity.make_acceptor().context("failed to build TLS acceptor")?;
 
-    let mut validator: Arc<dyn ironrdp_server::CredentialValidator> = Arc::new(auth::ShadowValidator);
+    let validator: Arc<dyn ironrdp_server::CredentialValidator> = Arc::new(auth::ShadowValidator);
 
-    // Multi-session: a worker routes the connection to the authenticated
-    // user's own desktop. Wrapping the validator is what makes the decision
-    // follow the identity CredSSP verified rather than anything the client
-    // asked for, and it lands before the display is first used.
-    let multi_session = serve_fd.is_some();
+    // Multi-session: the worker binds itself to the authenticated user's
+    // desktop. The account is recorded by the credential resolver below
+    // (CredSSP's SAM lookup) and turned into a session in
+    // `on_connection_info`, which only runs once CredSSP has succeeded.
+    let multi_session = serve_fd.is_some() && !console_mode;
+    let pending_identity = Arc::new(session::router::PendingIdentity::default());
     if multi_session {
         session::runtime_dir::ensure_state_dir(std::path::Path::new(session::runtime_dir::STATE_DIR))
             .context("prepare the session state directory")?;
-        validator = Arc::new(session::router::SessionRouter::new(
-            Arc::clone(&validator),
-            std::path::PathBuf::from(session::runtime_dir::STATE_DIR),
-            display_range.clone(),
-            console_mode,
-            fixed_size.unwrap_or((1920, 1080)),
-        ));
     }
 
     // NLA per MS-RDPBCGR 5.4.2: NTLM verifies the client's typed password
     // against the account secret from our SAM (the Linux analogue of Windows
     // SAM). The ShadowValidator then re-checks the delegated credentials.
     let sam_resolver: std::sync::Arc<dyn Fn(&str) -> std::io::Result<ironrdp_server::Credentials> + Send + Sync> =
-        std::sync::Arc::new(move |account: &str| match sam::lookup(account)? {
-            Some(password) => Ok(ironrdp_server::Credentials {
+        std::sync::Arc::new({
+            let pending = Arc::clone(&pending_identity);
+            move |account: &str| match sam::lookup(account)? {
+            Some(password) => {
+                // Record, do not act: this is the account CredSSP is about to
+                // verify, not one it has verified. The session is created
+                // later, from on_connection_info, which only runs on success.
+                pending.record(account, &password);
+                Ok(ironrdp_server::Credentials {
                 username: account.to_owned(),
                 password,
                 domain: None,
-            }),
+            })
+            },
             None => Err(std::io::Error::other("invalid username")),
-        });
+        }});
 
     let cliprdr: Box<dyn CliprdrServerFactory> =
         Box::new(clipboard::X11CliprdrServerFactory::default());
@@ -369,10 +371,22 @@ async fn serve() -> anyhow::Result<()> {
         .with_cliprdr_factory(Some(cliprdr))
         .with_sound_factory(Some(Box::new(sound_real::SystemSoundFactory::default())))
         .with_credential_validator(Some(validator))
-        .with_connection_handler(Some(Box::new(session_ctl::SessionController::new(
-            lock_session,
-            switch_to_greeter,
-        ))))
+        .with_connection_handler(Some({
+            let lifecycle: Box<dyn ironrdp_server::ConnectionHandler> =
+                Box::new(session_ctl::SessionController::new(lock_session, switch_to_greeter));
+            if multi_session {
+                Box::new(session::router::SessionRouter::new(
+                    lifecycle,
+                    Arc::clone(&pending_identity),
+                    std::path::PathBuf::from(session::runtime_dir::STATE_DIR),
+                    display_range.clone(),
+                    console_mode,
+                    fixed_size.unwrap_or((1920, 1080)),
+                )) as Box<dyn ironrdp_server::ConnectionHandler>
+            } else {
+                lifecycle
+            }
+        }))
         .build();
 
     // Protocol-level network auto-detect (MS-RDPBCGR 2.2.14) and server

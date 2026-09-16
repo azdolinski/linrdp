@@ -1,24 +1,46 @@
 //! Routing an authenticated connection to its user's desktop.
 //!
-//! The decision is made from the identity CredSSP verified, never from the
-//! X.224 `mstshash` cookie the client supplies — that field is unauthenticated,
-//! so trusting it would let anyone choose whose desktop they land on.
+//! Where this hooks in matters, and the obvious place does not work.
 //!
-//! It happens inside credential validation because that is the first point
-//! where the username is known AND still earlier than any use of the display:
-//! the worker's display factory connects lazily, so setting `$DISPLAY` here
-//! decides which desktop the rest of the connection serves.
+//! `CredentialValidator` looks right, but the acceptor only fills
+//! `AcceptorResult.credentials` outside HYBRID/HYBRID_EX
+//! (`ironrdp-acceptor/src/connection.rs`, the `!protocol.intersects(HYBRID…)`
+//! guard): under NLA the credentials are consumed by CredSSP and never reach
+//! the validator, which is skipped with "no credentials in AcceptorResult".
+//!
+//! So routing happens in two steps instead. The credential resolver — the
+//! SAM lookup CredSSP performs — records the account being authenticated.
+//! Then `on_connection_info`, which only fires once the whole acceptor
+//! sequence including CredSSP has succeeded, turns that record into a
+//! session. The identity therefore comes from the account CredSSP actually
+//! verified, never from the X.224 `mstshash` cookie, which is unauthenticated.
 
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
-use ironrdp_pdu::rdp::client_info::Credentials;
-use ironrdp_server::{CredentialDecision, CredentialValidationError, CredentialValidator};
+/// The account CredSSP is authenticating, stashed by the credential resolver
+/// for `on_connection_info` to consume once authentication has succeeded.
+#[derive(Default)]
+pub(crate) struct PendingIdentity {
+    inner: Mutex<Option<(String, String)>>,
+}
 
-/// Wraps the real validator and, on success, binds this worker to the
-/// authenticated user's session.
+impl PendingIdentity {
+    pub(crate) fn record(&self, user: &str, password: &str) {
+        *self.inner.lock().unwrap_or_else(|p| p.into_inner()) = Some((user.to_owned(), password.to_owned()));
+    }
+
+    fn take(&self) -> Option<(String, String)> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).take()
+    }
+}
+
+/// Binds this worker to the authenticated user's desktop, then delegates to
+/// the session-lifecycle handler underneath.
 pub(crate) struct SessionRouter {
-    inner: std::sync::Arc<dyn CredentialValidator>,
+    inner: Box<dyn ironrdp_server::ConnectionHandler>,
+    pending: Arc<PendingIdentity>,
     state_dir: PathBuf,
     range: RangeInclusive<u16>,
     /// `--console`: serve the ambient `$DISPLAY` (the shared screen) and
@@ -29,66 +51,67 @@ pub(crate) struct SessionRouter {
 
 impl SessionRouter {
     pub(crate) fn new(
-        inner: std::sync::Arc<dyn CredentialValidator>,
+        inner: Box<dyn ironrdp_server::ConnectionHandler>,
+        pending: Arc<PendingIdentity>,
         state_dir: PathBuf,
         range: RangeInclusive<u16>,
         console: bool,
         desktop_size: (u16, u16),
     ) -> Self {
-        Self { inner, state_dir, range, console, desktop_size }
+        Self { inner, pending, state_dir, range, console, desktop_size }
+    }
+
+    /// Resolve or create the session and point this process at it.
+    fn bind_session(&self) -> anyhow::Result<()> {
+        let Some((user, password)) = self.pending.take() else {
+            anyhow::bail!("no authenticated identity recorded — cannot choose a desktop");
+        };
+        let rec = crate::session::attach_or_create(
+            &self.state_dir,
+            &user,
+            &password,
+            self.range.clone(),
+            self.desktop_size,
+        )?;
+        // SAFETY: the display factory connects lazily, on the first frame
+        // after this point, so nothing is reading these yet.
+        unsafe {
+            std::env::set_var("DISPLAY", format!(":{}", rec.display));
+            std::env::set_var("XAUTHORITY", &rec.xauthority);
+            std::env::set_var("XDG_RUNTIME_DIR", &rec.runtime_dir);
+        }
+        tracing::info!(user, display = rec.display, "routed to the user's desktop");
+        Ok(())
     }
 }
 
-#[async_trait::async_trait]
-impl CredentialValidator for SessionRouter {
-    async fn validate(&self, credentials: &Credentials) -> Result<CredentialDecision, CredentialValidationError> {
-        let decision = self.inner.validate(credentials).await?;
-        if !matches!(decision, CredentialDecision::Accept) {
-            return Ok(decision);
-        }
+impl ironrdp_server::ConnectionHandler for SessionRouter {
+    fn on_accept(&mut self, peer: core::net::SocketAddr) -> bool {
+        self.inner.on_accept(peer)
+    }
+
+    fn on_connection_info(&mut self, info: &ironrdp_server::ConnectionInfo) {
         if self.console {
             tracing::info!(
-                user = %credentials.username,
                 display = %std::env::var("DISPLAY").unwrap_or_default(),
                 "console mode — serving the shared display"
             );
-            return Ok(decision);
+        } else if let Err(error) = self.bind_session() {
+            // Refusing beats falling back: a user whose session cannot start
+            // must not silently land on the shared desktop. The worker exits,
+            // which drops the connection with the reason in the log.
+            tracing::error!(%error, "could not bind this connection to a desktop");
+            std::process::exit(1);
         }
+        self.inner.on_connection_info(info);
+    }
 
-        let user = credentials.username.clone();
-        let password = credentials.password.clone();
-        let state_dir = self.state_dir.clone();
-        let range = self.range.clone();
-        let size = self.desktop_size;
-
-        // Session setup forks, opens a PAM session and starts an X server —
-        // all blocking, none of it safe on the async executor.
-        let resolved = tokio::task::spawn_blocking(move || {
-            crate::session::attach_or_create(&state_dir, &user, &password, range, size)
-        })
-        .await
-        .map_err(|e| CredentialValidationError::new(std::io::Error::other(format!("session task: {e}"))))?;
-
-        match resolved {
-            Ok(rec) => {
-                // SAFETY: the worker is still single-threaded with respect to
-                // anything reading these — the display factory connects
-                // lazily, on the first frame after this point.
-                unsafe {
-                    std::env::set_var("DISPLAY", format!(":{}", rec.display));
-                    std::env::set_var("XAUTHORITY", &rec.xauthority);
-                    std::env::set_var("XDG_RUNTIME_DIR", &rec.runtime_dir);
-                }
-                tracing::info!(user = %credentials.username, display = rec.display, "routed to the user's desktop");
-                Ok(decision)
-            }
-            Err(error) => {
-                // Refusing beats falling back to the shared desktop: a user
-                // whose session cannot start must not silently land on
-                // someone else's screen.
-                tracing::error!(user = %credentials.username, %error, "could not start the user's session");
-                Err(CredentialValidationError::new(std::io::Error::other(format!("session setup: {error:#}"))))
-            }
-        }
+    fn on_disconnected(
+        &mut self,
+        peer: core::net::SocketAddr,
+        duration: core::time::Duration,
+        error: Option<&ironrdp_server::ServerError>,
+    ) -> ironrdp_server::PostConnectionAction {
+        self.inner.on_disconnected(peer, duration, error)
     }
 }
