@@ -59,34 +59,7 @@ impl CredentialValidator for ShadowValidator {
         // definitively, but an unreadable file, an unknown user (SSSD/LDAP
         // accounts live outside /etc/shadow) or an unsupported hash scheme
         // is exactly the case the system PAM stack handles for us.
-        let result = tokio::task::spawn_blocking(move || -> Result<bool, Option<String>> {
-            let shadow = match Self::load_shadow() {
-                Ok(s) => s,
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::PermissionDenied {
-                        tracing::error!(
-                            "cannot read /etc/shadow — run linrdp as root (or add CAP_DAC_READ_SEARCH)"
-                        );
-                    }
-                    return Err(Some(format!("read /etc/shadow: {e}")));
-                }
-            };
-            let Some(hash) = shadow.get(&username2) else {
-                return Err(None); // unknown here — maybe known to PAM
-            };
-            if hash.starts_with('!') || hash.starts_with('*') {
-                return Ok(false); // account locked / no password set
-            }
-            if !hash.contains('$') {
-                // Pre-crypt or exotic entry pam_unix understands better.
-                return Err(Some(format!("unparseable shadow hash: {hash:.8}...")));
-            }
-            let scheme = hash.trim_start_matches('$').split('$').next().unwrap_or_default();
-            if !matches!(scheme, "1" | "5" | "6" | "y") {
-                return Err(Some(format!("unsupported hash scheme ${scheme}$")));
-            }
-            Ok(verify_crypt(&password, hash))
-        })
+        let result = tokio::task::spawn_blocking(move || shadow_verdict(&username2, &password))
         .await
         .map_err(CredentialValidationError::new)?; // join error only
 
@@ -98,6 +71,20 @@ impl CredentialValidator for ShadowValidator {
             }
             Ok(false) => {
                 tracing::warn!(%username, "authentication rejected");
+                Ok(CredentialDecision::Reject)
+            }
+            Err(reason) if username.is_empty() => {
+                // No username at all: the client connected without sending
+                // credentials. That is what mstsc does on a non-NLA server —
+                // it waits for a logon screen linrdp does not draw. Say so,
+                // because "authentication rejected username=" reads like a
+                // wrong password.
+                let _ = reason;
+                tracing::warn!(
+                    "the client sent no credentials — without NLA it expects a server-drawn \
+                     logon screen, which linrdp does not have. Use --auth nla (the default) \
+                     for mstsc, or a client that sends credentials itself"
+                );
                 Ok(CredentialDecision::Reject)
             }
             Err(reason) => {
@@ -131,6 +118,55 @@ impl ShadowValidator {
             pending.record(username, password);
         }
     }
+}
+
+/// Verify `password` against the account's system password, blocking.
+///
+/// `/etc/shadow` first, then the system PAM stack for everything shadow
+/// cannot answer for: an unreadable file, an account that lives in LDAP or
+/// SSSD, or a hash scheme this build does not implement. `Err` means "no
+/// verdict", never "wrong password".
+///
+/// The same core the RDP credential validator runs on, exposed so
+/// provisioning can hold an NLA password to the system password it is
+/// supposed to mirror.
+pub(crate) fn verify_system_password(username: &str, password: &str) -> Result<bool, String> {
+    match shadow_verdict(username, password) {
+        Ok(verdict) => Ok(verdict),
+        Err(reason) => {
+            let reason = reason.unwrap_or_else(|| "user not in /etc/shadow".to_owned());
+            tracing::debug!(%username, %reason, "shadow lookup inconclusive - trying PAM");
+            crate::pam::authenticate(username, password).map_err(|e| format!("PAM: {e}"))
+        }
+    }
+}
+
+/// `/etc/shadow`'s verdict alone. `Err(reason)` = shadow cannot decide.
+fn shadow_verdict(username: &str, password: &str) -> Result<bool, Option<String>> {
+    let shadow = match ShadowValidator::load_shadow() {
+        Ok(s) => s,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                tracing::error!("cannot read /etc/shadow — run linrdp as root (or add CAP_DAC_READ_SEARCH)");
+            }
+            return Err(Some(format!("read /etc/shadow: {e}")));
+        }
+    };
+    let Some(hash) = shadow.get(username) else {
+        return Err(None); // unknown here — maybe known to PAM
+    };
+    if hash.starts_with('!') || hash.starts_with('*') {
+        return Ok(false); // account locked / no password set
+    }
+    if !hash.contains('$') {
+        // Pre-crypt or exotic entry pam_unix understands better.
+        return Err(Some(format!("unparseable shadow hash: {hash:.8}...")));
+    }
+    let scheme = hash.trim_start_matches('$').split('$').next().unwrap_or_default();
+    if !matches!(scheme, "1" | "5" | "6" | "y") {
+        return Err(Some(format!("unsupported hash scheme ${scheme}$")));
+    }
+    Ok(verify_crypt(password, hash))
 }
 
 /// Verify `password` against an `/etc/shadow` hash (`$id$salt$hash`).

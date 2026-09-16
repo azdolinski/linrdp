@@ -45,16 +45,20 @@ USAGE:
 
 Serves a real Linux desktop over RDP.
 
-Authentication (--auth, default `system`):
-  system  TLS, then the account's own system password, checked against
-          /etc/shadow with the system PAM stack behind it. Nothing to
-          provision — if the user can log in on the console, they can log in
-          here.
-  nla     CredSSP/NTLMv2. NTLM makes the server compute the expected response
-          from the account secret (MS-NLMP), which a one-way /etc/shadow hash
-          cannot produce — so this mode can only authenticate against a secret
-          linrdp stores itself (--set-password). Stronger pre-authentication,
-          at the cost of a second copy of every password.
+Authentication (--auth, default `nla`):
+  nla     CredSSP/NTLMv2 — what mstsc and FreeRDP use by default, and the only
+          mode where the client asks for the credentials itself. NTLM makes the
+          server compute the expected response from the account secret
+          (MS-NLMP), which a one-way /etc/shadow hash cannot produce, so the
+          password must also be stored by linrdp:
+            linrdp --set-password USER:PASSWORD
+          It must BE the account's system password — --set-password verifies
+          that and refuses anything else, so the two can never drift apart.
+  system  TLS, and the account's own system password straight from the Client
+          Info PDU to /etc/shadow + PAM. Nothing to provision, but only for
+          clients that send credentials without NLA (FreeRDP /u /p). mstsc
+          does not: without NLA it waits for a server-drawn logon screen,
+          which linrdp does not have yet, and arrives with no username.
 
 Commands:
   doctor                report what this machine is and what linrdp may do on
@@ -336,26 +340,50 @@ async fn serve() -> anyhow::Result<()> {
             Some((u, p)) => (u.to_owned(), p.to_owned()),
             None => anyhow::bail!("--set-password expects USER:PASSWORD"),
         };
+        // The SAM exists because NTLM needs the secret, not because linrdp
+        // wants a password of its own. A SAM entry that is not the account's
+        // system password is a second password by accident — it would pass
+        // CredSSP and then be refused by the shadow/PAM re-check, or, worse,
+        // quietly outlive a password change. Hold it to the real one here.
+        match auth::verify_system_password(&username, &password) {
+            Ok(true) => {}
+            Ok(false) => anyhow::bail!(
+                "that is not {username}'s system password.\n\
+                 NLA needs linrdp to store the account's real password (NTLM computes its\n\
+                 answer from it), so it must be the same one `su - {username}` accepts.\n\
+                 Change the system password first if you meant to change it."
+            ),
+            Err(reason) => anyhow::bail!(
+                "cannot check {username}'s system password ({reason}).\n\
+                 Run as root so /etc/shadow and PAM are readable."
+            ),
+        }
         sam::set_password(&username, &password).context("failed to write SAM")?;
-        println!("LinRDP account '{username}' provisioned for NLA login.");
+        println!("LinRDP account '{username}' provisioned for NLA login (matches the system password).");
         return Ok(());
     }
 
     // How a login is verified.
     //
-    // `system` (the default): TLS, then the client's credentials arrive in the
-    // Client Info PDU and are checked against `/etc/shadow` with the system
-    // PAM stack behind it — the account's real password, nothing to provision.
+    // `nla` (the default): CredSSP/NTLMv2. The client collects the credentials
+    // and proves them before the session exists. NTLM's own math (MS-NLMP)
+    // makes the server compute the expected response from the account secret,
+    // and a one-way `/etc/shadow` hash cannot produce it — so this mode can
+    // only authenticate against a secret linrdp stores itself
+    // (`--set-password`, which refuses a password that is not the account's
+    // real one). That is the protocol, not a design choice: the same reason
+    // xrdp offers no NLA for local accounts.
     //
-    // `nla`: CredSSP/NTLMv2. NTLM's own math (MS-NLMP) makes the server
-    // compute the expected response from the account secret, and a one-way
-    // `/etc/shadow` hash cannot produce it — so NLA can only ever authenticate
-    // against a secret linrdp itself stores (`--set-password`). That is a
-    // property of the protocol, not a design choice: it is the same reason
-    // xrdp does not offer NLA for local accounts.
+    // `system`: TLS, and the credentials arrive in the Client Info PDU, where
+    // they are checked against `/etc/shadow` and PAM — the account's own
+    // password, nothing to provision. It needs a client that SENDS them:
+    // FreeRDP with `/u` and `/p` does, mstsc does not. Without NLA mstsc
+    // expects the server to draw a logon screen (Winlogon's job on Windows,
+    // xrdp's own dialog on Linux); linrdp has none yet, so mstsc arrives with
+    // an empty username and is refused.
     let auth_mode = args
         .opt_value_from_str::<_, String>("--auth")?
-        .unwrap_or_else(|| "system".to_owned());
+        .unwrap_or_else(|| "nla".to_owned());
     let nla = match auth_mode.as_str() {
         "system" => false,
         "nla" => true,

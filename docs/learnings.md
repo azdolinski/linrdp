@@ -477,9 +477,22 @@ offer.
 - **Check which code the configuration actually reaches.** A whole validator,
   with a PAM fallback and hash-scheme handling, was dead because one builder
   call advertised a protocol that skipped it.
-- **Default to the mode that needs no provisioning.** `--auth system` now, with
-  `--auth nla` opt-in for anyone who wants pre-authentication and accepts a
-  second copy of every password.
+- **Default to the mode that needs no provisioning** — and then find out that
+  the client cannot use it. Making `--auth system` the default broke login for
+  mstsc completely: without NLA, mstsc does not collect credentials at all. It
+  connects and waits for the server to draw a logon screen, the way Winlogon
+  does on Windows and xrdp's own dialog does on Linux. The server saw
+  `username=` and refused. The default went back to `nla`, where the *client*
+  asks for the password.
+- **"Works with FreeRDP" is not "works".** Every test in this turn passed,
+  because `sdl-freerdp3 /u /p` sends credentials without NLA. The only client
+  that matters here does not, and I shipped a default I had not tested against
+  it. A protocol mode has to be judged by what the user's client does with it.
+- **When a constraint cannot be removed, remove its cost.** NLA needs a stored
+  secret, so the real harm was two passwords drifting apart. `--set-password`
+  now verifies against `/etc/shadow`/PAM and refuses anything that is not the
+  account's actual system password: still stored twice, but never two
+  different passwords, and never silently stale after a password change.
 
 ## Invariants now enforced (keep them)
 
@@ -493,6 +506,9 @@ offer.
     old desktop served at its own size beats no desktop at all.
 22. An empty NLA store is reported at startup and as a `doctor` blocker,
     because CredSSP's own message for it blames the username.
-23. The default authentication path verifies the account's own system
-    password (/etc/shadow + PAM). Any mode requiring a separately stored
-    secret is opt-in and says so where the operator will read it.
+23. A stored NLA secret is only ever the account's real system password:
+    `--set-password` verifies it against /etc/shadow/PAM and refuses anything
+    else, so the copy NTLM requires can never become a second password.
+24. An authentication mode is only "supported" once the user's own client has
+    been tested against it. FreeRDP sends credentials the server can check;
+    mstsc without NLA sends none at all.
