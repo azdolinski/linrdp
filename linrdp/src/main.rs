@@ -40,9 +40,21 @@ use crate::input::X11InputHandler;
 
 const HELP: &str = "\
 USAGE:
-  linrdp [--bind-addr <ADDR>] [--usb] [--log-file <PATH>] [--fixed-size <WxH>]
+  linrdp [--bind-addr <ADDR>] [--auth system|nla] [--usb] [--log-file <PATH>]
+         [--fixed-size <WxH>]
 
-Serves a real Linux desktop over RDP (auth: system accounts from /etc/shadow).
+Serves a real Linux desktop over RDP.
+
+Authentication (--auth, default `system`):
+  system  TLS, then the account's own system password, checked against
+          /etc/shadow with the system PAM stack behind it. Nothing to
+          provision — if the user can log in on the console, they can log in
+          here.
+  nla     CredSSP/NTLMv2. NTLM makes the server compute the expected response
+          from the account secret (MS-NLMP), which a one-way /etc/shadow hash
+          cannot produce — so this mode can only authenticate against a secret
+          linrdp stores itself (--set-password). Stronger pre-authentication,
+          at the cost of a second copy of every password.
 
 Commands:
   doctor                report what this machine is and what linrdp may do on
@@ -191,6 +203,9 @@ fn doctor() -> anyhow::Result<()> {
     );
     let accounts = sam::account_names();
     println!(
+        "  auth default : system password (/etc/shadow + PAM); `--auth nla` uses the SAM below"
+    );
+    println!(
         "  NLA accounts : {}",
         if accounts.is_empty() {
             format!("none provisioned in {}", sam::sam_path().display())
@@ -250,14 +265,13 @@ fn doctor() -> anyhow::Result<()> {
         }
     }
 
-    // Not part of `verdicts`, which reports what the *machine* can do: an
-    // empty account store is a provisioning state, and it blocks every login
-    // with a message that blames the username instead.
+    // Not part of `verdicts`, which reports what the *machine* can do. An
+    // empty store is only a problem under `--auth nla`, where CredSSP denies
+    // every login as "invalid username" without ever mentioning the store.
     if accounts.is_empty() {
-        blockers += 1;
         println!(
-            "  BLOCKER no NLA account is provisioned — every login is denied as \
-             'invalid username'; run: linrdp --set-password USER:PASSWORD"
+            "  warn    no NLA account is provisioned — only needed with `--auth nla`; \
+             the default `--auth system` uses the account's own system password"
         );
     }
 
@@ -327,6 +341,27 @@ async fn serve() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // How a login is verified.
+    //
+    // `system` (the default): TLS, then the client's credentials arrive in the
+    // Client Info PDU and are checked against `/etc/shadow` with the system
+    // PAM stack behind it — the account's real password, nothing to provision.
+    //
+    // `nla`: CredSSP/NTLMv2. NTLM's own math (MS-NLMP) makes the server
+    // compute the expected response from the account secret, and a one-way
+    // `/etc/shadow` hash cannot produce it — so NLA can only ever authenticate
+    // against a secret linrdp itself stores (`--set-password`). That is a
+    // property of the protocol, not a design choice: it is the same reason
+    // xrdp does not offer NLA for local accounts.
+    let auth_mode = args
+        .opt_value_from_str::<_, String>("--auth")?
+        .unwrap_or_else(|| "system".to_owned());
+    let nla = match auth_mode.as_str() {
+        "system" => false,
+        "nla" => true,
+        other => anyhow::bail!("--auth expects `system` or `nla`, got `{other}`"),
+    };
+
     let enable_usb = args.contains("--usb");
 
     // Multi-session wiring. `--serve-fd` marks a worker forked by the
@@ -367,13 +402,15 @@ async fn serve() -> anyhow::Result<()> {
 
     setup_logging(log_file.as_deref());
 
-    tracing::info!(%bind_addr, "LinRDP starting — auth: /etc/shadow accounts");
-    warn_if_no_accounts();
+    if nla {
+        tracing::info!(%bind_addr, "LinRDP starting — auth: NLA (CredSSP/NTLM) against the linrdp SAM");
+        warn_if_no_accounts();
+    } else {
+        tracing::info!(%bind_addr, "LinRDP starting — auth: system password (/etc/shadow, PAM)");
+    }
 
     let identity = tls::load_or_generate_identity().context("failed to prepare TLS identity")?;
     let acceptor = identity.make_acceptor().context("failed to build TLS acceptor")?;
-
-    let validator: Arc<dyn ironrdp_server::CredentialValidator> = Arc::new(auth::ShadowValidator);
 
     // Multi-session: the worker binds itself to the authenticated user's
     // desktop. The account is recorded by the credential resolver below
@@ -381,6 +418,13 @@ async fn serve() -> anyhow::Result<()> {
     // `on_connection_info`, which only runs once CredSSP has succeeded.
     let multi_session = serve_fd.is_some() && !console_mode;
     let pending_identity = Arc::new(session::router::PendingIdentity::default());
+
+    // The validator feeds the session router in `system` mode: there is no
+    // CredSSP resolver on that path, so the account it just verified is the
+    // only authenticated identity the connection will ever produce.
+    let validator: Arc<dyn ironrdp_server::CredentialValidator> =
+        Arc::new(auth::ShadowValidator::new(Some(Arc::clone(&pending_identity))));
+
     if multi_session {
         session::runtime_dir::ensure_state_dir(std::path::Path::new(session::runtime_dir::STATE_DIR))
             .context("prepare the session state directory")?;
@@ -503,9 +547,16 @@ async fn serve() -> anyhow::Result<()> {
         )
     };
 
-    let mut server = RdpServer::builder()
-        .with_addr(bind_addr)
-        .with_hybrid(acceptor, identity.pub_key.clone())
+    // Both arms land on the same builder state; only the advertised security
+    // protocol differs (MS-RDPBCGR 5.4.5.1 negotiation).
+    let secured = if nla {
+        RdpServer::builder()
+            .with_addr(bind_addr)
+            .with_hybrid(acceptor, identity.pub_key.clone())
+    } else {
+        RdpServer::builder().with_addr(bind_addr).with_tls(acceptor)
+    };
+    let mut server = secured
         .with_input_handler(input_handler)
         .with_display_handler(gfx_display::EgfxDisplay::new(
             display_factory,

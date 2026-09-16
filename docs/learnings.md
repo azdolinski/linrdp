@@ -456,6 +456,31 @@ the person typing their name.
   provisioned names, so "invalid username" can no longer mean "the store is
   empty" without saying so.
 
+### NLA cannot check a system password, and that was never stated
+
+linrdp advertised only `HYBRID | HYBRID_EX`, so every login went through
+CredSSP/NTLMv2. NTLM's own math (MS-NLMP) has the server compute the expected
+response from the account secret; a one-way `/etc/shadow` hash cannot produce
+it. So the SAM was not a design preference, it was forced — and nothing in the
+help text, the logs or the docs said so. The operator reasonably read
+`--set-password` as linrdp inventing a second password for no reason.
+
+The way to authenticate against the real system password is to not use NLA:
+with TLS the credentials arrive in the Client Info PDU after the channel is up,
+and go straight to `/etc/shadow` and PAM. `ShadowValidator` had been sitting in
+the tree doing exactly that, reachable only on a path the server refused to
+offer.
+
+- **A constraint the user cannot see looks like a bad decision.** The fix was
+  half code and half saying, in `--help` and at startup, which mode is running
+  and what it costs.
+- **Check which code the configuration actually reaches.** A whole validator,
+  with a PAM fallback and hash-scheme handling, was dead because one builder
+  call advertised a protocol that skipped it.
+- **Default to the mode that needs no provisioning.** `--auth system` now, with
+  `--auth nla` opt-in for anyone who wants pre-authentication and accepts a
+  second copy of every password.
+
 ## Invariants now enforced (keep them)
 
 19. Every X connection in a multi-session worker goes through `gate::connect`,
@@ -468,3 +493,6 @@ the person typing their name.
     old desktop served at its own size beats no desktop at all.
 22. An empty NLA store is reported at startup and as a `doctor` blocker,
     because CredSSP's own message for it blames the username.
+23. The default authentication path verifies the account's own system
+    password (/etc/shadow + PAM). Any mode requiring a separately stored
+    secret is opt-in and says so where the operator will read it.

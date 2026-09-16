@@ -8,8 +8,24 @@ use async_trait::async_trait;
 
 use ironrdp_server::{CredentialDecision, CredentialValidationError, CredentialValidator, Credentials};
 
-/// Validator backed by `/etc/shadow`.
-pub(crate) struct ShadowValidator;
+/// Validator backed by `/etc/shadow`, with the system PAM stack behind it.
+///
+/// This is the only authenticator that checks the account's **real** system
+/// password. It runs on the TLS path, where the client sends its credentials
+/// in the Client Info PDU after the channel is up, so the server never needs
+/// to know the secret in advance.
+pub(crate) struct ShadowValidator {
+    /// Filled with the account this validator accepted, so the session router
+    /// can create that user's desktop. Recorded only on success: the identity
+    /// a session is built from must be one that was actually verified.
+    pending: Option<std::sync::Arc<crate::session::router::PendingIdentity>>,
+}
+
+impl ShadowValidator {
+    pub(crate) fn new(pending: Option<std::sync::Arc<crate::session::router::PendingIdentity>>) -> Self {
+        Self { pending }
+    }
+}
 
 impl ShadowValidator {
     fn load_shadow() -> std::io::Result<HashMap<String, String>> {
@@ -77,6 +93,7 @@ impl CredentialValidator for ShadowValidator {
         match result {
             Ok(true) => {
                 tracing::info!(%username, "authentication accepted");
+                self.accepted(&username, &credentials.password);
                 Ok(CredentialDecision::Accept)
             }
             Ok(false) => {
@@ -96,12 +113,22 @@ impl CredentialValidator for ShadowValidator {
                     .map_err(|e| CredentialValidationError::new(std::io::Error::other(e)))?;
                 if pam {
                     tracing::info!(%username, "authentication accepted via PAM");
+                    self.accepted(&username, &credentials.password);
                     Ok(CredentialDecision::Accept)
                 } else {
                     tracing::warn!(%username, "authentication rejected (shadow+PAM)");
                     Ok(CredentialDecision::Reject)
                 }
             }
+        }
+    }
+}
+
+impl ShadowValidator {
+    /// Hand the verified account to the session router.
+    fn accepted(&self, username: &str, password: &str) {
+        if let Some(pending) = &self.pending {
+            pending.record(username, password);
         }
     }
 }
