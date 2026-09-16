@@ -21,6 +21,7 @@ mod tls;
 mod x264_encoder;
 mod udp;
 mod usb;
+mod session;
 mod session_ctl;
 #[cfg(feature = "wayland")]
 mod wayland;
