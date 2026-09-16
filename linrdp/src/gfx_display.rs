@@ -358,6 +358,7 @@ impl RdpServerDisplay for EgfxDisplay {
             avc_disabled: false,
             started: Instant::now(),
             avc444v2_enabled: false,
+            clear_seq: 0,
             stat_frames: 0,
             stat_h264: 0,
             stat_clear: 0,
@@ -453,6 +454,12 @@ struct EgfxUpdates {
     /// Client negotiated cap version >= 10.6: the AVC444v2 chroma layout may
     /// be used for motion frames.
     avc444v2_enabled: bool,
+    /// MS-RDPEGFX 2.2.4.1 ClearCodec `seqNumber` for this session: the first
+    /// message is 0 and every later one is the previous plus one (wrapping at
+    /// 0xFF). Owned here rather than inside `Encoders` because that struct is
+    /// rebuilt mid-session; a restarted counter is a protocol violation the
+    /// client answers with a pipeline reset and then a disconnect.
+    clear_seq: u8,
     started: Instant,
     stat_frames: u64,
     stat_h264: u64,
@@ -996,6 +1003,14 @@ impl EgfxUpdates {
                     "EGFX surface vanished (client re-advertised caps) — re-creating"
                 );
                 self.surface = None;
+                // MS-RDPEGFX 3.2.5.18 resets the client to its initial state,
+                // which includes the ClearCodec sequence and glyph cache: the
+                // next message must be seqNumber 0 and must not reference a
+                // cached glyph.
+                self.clear_seq = 0;
+                if let Some(encoders) = self.encoders.as_mut() {
+                    encoders.clear.reset_session();
+                }
                 if let Some(Encoders { h264: Some(enc), .. }) = self.encoders.as_mut() {
                     enc.force_intra();
                 }
@@ -1317,6 +1332,15 @@ impl EgfxUpdates {
         let Some(surface) = self.surface else { return };
         let Some(mut encoders) = self.take_encoders() else { return };
         let ts = self.timestamp_ms();
+        // MS-RDPEGFX 2.2.4.1: seqNumber is a SESSION counter — "the value of
+        // the seqNumber field MUST be equal to the value of the seqNumber
+        // field in the previous ClearCodec message plus one". The encoder
+        // object is rebuilt under us (adaptive bitrate, a lost blocking task),
+        // so the counter is owned here and stamped on every encode; it is
+        // committed further down only once the frame actually reaches the
+        // wire, because a frame dropped by backpressure must not burn a
+        // number the client will never see.
+        encoders.clear.set_sequence(self.clear_seq);
         // A full paint covers the real desktop rows. The encoder's 16-aligned
         // padding is never part of the surface any more, so there is nothing
         // below `frame_h` to keep painted.
@@ -1356,6 +1380,16 @@ impl EgfxUpdates {
         drop(server);
 
         if sent.is_some() {
+            // The message is on the wire: the session's next ClearCodec
+            // message carries this one plus one.
+            tracing::debug!(
+                seq = self.clear_seq,
+                full,
+                w,
+                h,
+                "EGFX ClearCodec frame sent"
+            );
+            self.clear_seq = self.clear_seq.wrapping_add(1);
             self.stat_clear += 1;
             self.producer_frames += 1;
             if full {
@@ -1411,6 +1445,7 @@ impl EgfxUpdates {
             _ => true,
         };
         if bitrate_stale {
+            let encoders_clear = self.encoders.take().map(|e| e.clear);
             match make_h264_encoder(
                 target_bitrate,
                 target_rate_fps,
@@ -1418,9 +1453,13 @@ impl EgfxUpdates {
                 surface.pad_height,
             ) {
                 Ok(enc) => {
+                    // Carry the ClearCodec encoder across the rebuild: its
+                    // sequence counter and glyph cache belong to the session,
+                    // not to the H.264 encoder's lifetime.
+                    let clear = encoders_clear.unwrap_or_default();
                     self.encoders = Some(Encoders {
                         h264: Some(enc),
-                        clear: ClearCodecEncoder::new(),
+                        clear,
                     });
                     self.enc_built = Some((target_bitrate, target_rate_fps));
                 }
