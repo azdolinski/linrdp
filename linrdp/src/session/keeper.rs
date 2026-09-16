@@ -47,8 +47,21 @@ pub(crate) fn xvfb_command(display: u16, xauthority: &str, size: (u16, u16)) -> 
 }
 
 /// Environment for the desktop and for the worker that serves it.
+///
+/// PATH is included because a session environment without one breaks
+/// anything that shells out, and a desktop shells out constantly.
+///
+/// It is NOT the cause of the "XKB: Failed to compile keymap" start failure
+/// seen once here: driving this exact spawn path with and without PATH, the
+/// X server came up either way. That cause is still unidentified, so do not
+/// read this line as having fixed it.
 pub(crate) fn session_env(rec: &SessionRecord, user: &UserIds) -> Vec<(String, String)> {
+    let path = std::env::var("PATH")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned());
     vec![
+        ("PATH".to_owned(), path),
         ("DISPLAY".to_owned(), format!(":{}", rec.display)),
         ("XAUTHORITY".to_owned(), rec.xauthority.clone()),
         ("XDG_RUNTIME_DIR".to_owned(), rec.runtime_dir.clone()),
@@ -296,6 +309,12 @@ mod tests {
         assert_eq!(get("XDG_RUNTIME_DIR"), Some("/run/user/1001"));
         assert_eq!(get("HOME"), Some("/home/alice"));
         assert_eq!(get("USER"), Some("alice"));
+        // Without PATH the X server cannot run xkbcomp and dies before the
+        // display exists.
+        assert!(
+            get("PATH").is_some_and(|p| p.contains("/usr/bin")),
+            "PATH must be present: the X server shells out to xkbcomp"
+        );
         assert!(
             get("XAUTHORITY").is_some_and(|p| p.starts_with("/run/user/")),
             "the cookie must never be pointed at /tmp or a home directory"

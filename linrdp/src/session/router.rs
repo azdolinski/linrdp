@@ -115,7 +115,9 @@ impl ironrdp_server::ConnectionHandler for SessionRouter {
             // Refusing beats falling back: a user whose session cannot start
             // must not silently land on the shared desktop. The worker exits,
             // which drops the connection with the reason in the log.
-            tracing::error!(%error, "could not bind this connection to a desktop");
+            // The whole chain, not just the outermost context: the cause is
+            // the only part that says what actually went wrong.
+            tracing::error!(error = format!("{error:#}"), "could not bind this connection to a desktop");
             std::process::exit(1);
         }
         self.inner.on_connection_info(info);
