@@ -1205,15 +1205,9 @@ impl EgfxUpdates {
         let (band, remainder) = split_debt_band((x, y, w, h), self.lossless_budget_px());
         let (bx, by, bw, bh) = band;
         if self.send_clear(handle, data, frame_w, frame_h, bx, by, bw, bh).await {
-            match remainder {
-                // More of the region still owes a lossless paint; the next
-                // frame continues where this band stopped.
-                Some(rest) => self.debt_rect = Some(rest),
-                None => {
-                    self.pending_full = false;
-                    self.debt_rect = None;
-                }
-            }
+            let (pending, rect) = settle_debt(remainder);
+            self.pending_full = pending;
+            self.debt_rect = rect;
         }
     }
 
@@ -1987,6 +1981,25 @@ fn split_debt_band(rect: (u16, u16, u16, u16), budget_px: u32) -> ((u16, u16, u1
     ((x, y, w, rows), Some((x, y + rows, w, h - rows)))
 }
 
+/// Debt bookkeeping after one band reached the wire: what the debt becomes.
+///
+/// `debt_rect: Some(_)` MUST imply `pending_full == true`. That pair is the
+/// only representation of "part of the screen still owes a lossless paint",
+/// and the repayment gates in `egfx_frame` read `pending_full` alone.
+///
+/// Setting the remainder without re-arming `pending_full` stranded it: the
+/// x264-init-failure path calls `repay_debt` directly, with no `pending_full`
+/// precondition, so a failed encoder build left almost the whole screen owing
+/// a paint that nothing would ever trigger — while the producer's own
+/// bookkeeping reported no debt at all. Deriving both fields from one place
+/// makes that state unrepresentable regardless of who calls in.
+fn settle_debt(remainder: Option<(u16, u16, u16, u16)>) -> (bool, Option<(u16, u16, u16, u16)>) {
+    match remainder {
+        Some(rest) => (true, Some(rest)),
+        None => (false, None),
+    }
+}
+
 /// Smallest rectangle containing both inputs, as (x, y, w, h).
 fn union_rect(a: (u16, u16, u16, u16), b: (u16, u16, u16, u16)) -> (u16, u16, u16, u16) {
     let left = a.0.min(b.0);
@@ -2118,7 +2131,7 @@ fn yo_of(j: usize) -> usize {
 
 #[cfg(test)]
 mod debt_region_tests {
-    use super::{MIN_BAND_ROWS, split_debt_band, union_rect};
+    use super::{MIN_BAND_ROWS, settle_debt, split_debt_band, union_rect};
 
     /// The lossless debt is repaid over the union of the regions that
     /// actually went stale, not the whole screen.
@@ -2154,6 +2167,27 @@ mod debt_region_tests {
         let outer = (10, 10, 500, 400);
         assert_eq!(union_rect(outer, (20, 20, 100, 100)), outer);
         assert_eq!(union_rect(outer, outer), outer);
+    }
+
+    /// `debt_rect: Some(_)` must always imply `pending_full == true`.
+    ///
+    /// Regression: `repay_debt` set only `debt_rect` when a band left a
+    /// remainder, relying on its caller having already armed `pending_full`.
+    /// Two call sites in `send_h264` do not — so a failed x264 build painted
+    /// one band and stranded the rest of the screen forever, with the
+    /// producer reporting no debt owed.
+    #[test]
+    fn a_remaining_band_keeps_the_debt_armed() {
+        let (pending, rect) = settle_debt(Some((0, 128, 2880, 1672)));
+        assert!(pending, "a remainder that does not re-arm pending_full is never painted");
+        assert_eq!(rect, Some((0, 128, 2880, 1672)));
+    }
+
+    #[test]
+    fn the_last_band_clears_the_debt() {
+        let (pending, rect) = settle_debt(None);
+        assert!(!pending);
+        assert_eq!(rect, None);
     }
 
     /// A repaint that fits the per-frame budget goes out whole.
