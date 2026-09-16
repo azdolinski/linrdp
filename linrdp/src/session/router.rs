@@ -47,6 +47,9 @@ pub(crate) struct SessionRouter {
     /// create no per-user session at all.
     console: bool,
     desktop_size: (u16, u16),
+    /// The display this worker bound, so the disconnect path can lock it.
+    /// A Cell because binding happens through `&self` inside the handler.
+    bound_display: std::cell::Cell<Option<u16>>,
 }
 
 impl SessionRouter {
@@ -58,7 +61,15 @@ impl SessionRouter {
         console: bool,
         desktop_size: (u16, u16),
     ) -> Self {
-        Self { inner, pending, state_dir, range, console, desktop_size }
+        Self {
+            inner,
+            pending,
+            state_dir,
+            range,
+            console,
+            desktop_size,
+            bound_display: std::cell::Cell::new(None),
+        }
     }
 
     /// Resolve or create the session and point this process at it.
@@ -77,6 +88,13 @@ impl SessionRouter {
         // trust. Binding also sets the environment for the subsystems that
         // start later and read it (clipboard, selection owner).
         crate::session::gate::bind(rec.display, &rec.xauthority, &rec.runtime_dir)?;
+        // The user just proved who they are, so the desktop is theirs to see.
+        // Unlocking is recorded rather than assumed, so a later disconnect —
+        // or a supervisor restart — can put it back.
+        if rec.locked {
+            crate::session::unlock(&self.state_dir, &rec)?;
+        }
+        self.bound_display.set(Some(rec.display));
         tracing::info!(user, display = rec.display, "routed to the user's desktop");
         Ok(())
     }
@@ -109,6 +127,16 @@ impl ironrdp_server::ConnectionHandler for SessionRouter {
         duration: core::time::Duration,
         error: Option<&ironrdp_server::ServerError>,
     ) -> ironrdp_server::PostConnectionAction {
+        // Lock on the way out. A desktop whose client is gone must not be
+        // walked into by the next connection, which is the whole point of
+        // sessions that outlive their connections.
+        if let Some(bound) = self.bound_display.get() {
+            if let Err(error) = crate::session::lock(&self.state_dir, bound) {
+                tracing::error!(display = bound, %error, "could not lock the session on disconnect");
+            } else {
+                tracing::info!(display = bound, "session locked on disconnect");
+            }
+        }
         self.inner.on_disconnected(peer, duration, error)
     }
 }

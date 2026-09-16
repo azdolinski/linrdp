@@ -119,6 +119,9 @@ pub(crate) fn create(
         display: lease.number,
         runtime_dir,
         xauthority: xauthority.to_string_lossy().into_owned(),
+        // A fresh session starts unlocked: the user who just authenticated
+        // is the one about to look at it.
+        locked: false,
     };
 
     let cmd = keeper::xvfb_command(rec.display, &rec.xauthority, size);
@@ -158,6 +161,47 @@ pub(crate) fn attach_or_create(
     create(base, user, password, range, size)
 }
 
+
+/// Lock a session: record it, and ask logind to tell the desktop.
+///
+/// The record is the part linrdp enforces. The logind signal is what a screen
+/// locker in the session listens for — without one installed the lock is
+/// bookkeeping only, which `linrdp doctor` warns about rather than letting
+/// anyone believe the desktop is protected.
+pub(crate) fn lock(base: &Path, display: u16) -> anyhow::Result<()> {
+    registry::set_locked(base, display, true)?;
+    signal_logind_lock(true);
+    Ok(())
+}
+
+/// Release the lock after the user has authenticated for this session.
+pub(crate) fn unlock(base: &Path, rec: &registry::SessionRecord) -> anyhow::Result<()> {
+    registry::set_locked(base, rec.display, false)?;
+    signal_logind_lock(false);
+    Ok(())
+}
+
+/// Best-effort `loginctl lock-session` / `unlock-session` for this process's
+/// own logind session.
+///
+/// Best-effort on purpose: the lock that matters for access control is the
+/// recorded one, which linrdp enforces itself. This only drives whatever
+/// locker the desktop happens to run, and desktops without one are common.
+fn signal_logind_lock(lock: bool) {
+    let verb = if lock { "lock-session" } else { "unlock-session" };
+    match std::process::Command::new("loginctl")
+        .arg(verb)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => tracing::debug!(%verb, ?status, "loginctl did not accept the lock signal"),
+        Err(error) => tracing::debug!(%verb, %error, "loginctl unavailable — lock is recorded only"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,6 +221,7 @@ mod tests {
                 display,
                 runtime_dir: "/run/user/1001".to_owned(),
                 xauthority: "/run/user/1001/linrdp/Xauthority".to_owned(),
+                locked: false,
             },
         )
         .expect("seed");

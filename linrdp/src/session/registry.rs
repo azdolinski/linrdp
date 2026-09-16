@@ -18,6 +18,12 @@ pub(crate) struct SessionRecord {
     pub(crate) display: u16,
     pub(crate) runtime_dir: String,
     pub(crate) xauthority: String,
+    /// Whether the desktop is locked.
+    ///
+    /// Set when the last client disconnects, and on every supervisor start —
+    /// a restart must never leave a desktop unlocked, because the process
+    /// that could have locked it is exactly the one that went away.
+    pub(crate) locked: bool,
 }
 
 pub(crate) fn record_path(base: &Path, display: u16) -> PathBuf {
@@ -27,8 +33,8 @@ pub(crate) fn record_path(base: &Path, display: u16) -> PathBuf {
 pub(crate) fn write_record(base: &Path, rec: &SessionRecord) -> anyhow::Result<()> {
     let path = record_path(base, rec.display);
     let body = format!(
-        "user={}\ndisplay={}\nruntime_dir={}\nxauthority={}\n",
-        rec.user, rec.display, rec.runtime_dir, rec.xauthority
+        "user={}\ndisplay={}\nruntime_dir={}\nxauthority={}\nlocked={}\n",
+        rec.user, rec.display, rec.runtime_dir, rec.xauthority, rec.locked
     );
     fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
@@ -47,7 +53,40 @@ fn read_record(base: &Path, display: u16) -> Option<SessionRecord> {
         display: field("display")?.parse().ok()?,
         runtime_dir: field("runtime_dir")?,
         xauthority: field("xauthority")?,
+        // A record without the field predates it; treat it as locked, because
+        // assuming unlocked is the unsafe direction.
+        locked: field("locked").is_none_or(|v| v == "true"),
     })
+}
+
+/// Mark every recorded session locked.
+///
+/// Run at supervisor start: whatever happened to the previous supervisor, the
+/// desktops it left behind must not be reachable unlocked.
+pub(crate) fn lock_all(base: &Path, range: RangeInclusive<u16>) -> usize {
+    let mut locked = 0;
+    for display in range {
+        let Some(mut rec) = read_record(base, display) else {
+            continue;
+        };
+        if rec.locked {
+            continue;
+        }
+        rec.locked = true;
+        if write_record(base, &rec).is_ok() {
+            locked += 1;
+        }
+    }
+    locked
+}
+
+/// Record a new lock state for one session.
+pub(crate) fn set_locked(base: &Path, display: u16, locked: bool) -> anyhow::Result<()> {
+    let Some(mut rec) = read_record(base, display) else {
+        anyhow::bail!("no session recorded for :{display}");
+    };
+    rec.locked = locked;
+    write_record(base, &rec)
 }
 
 /// The session belonging to `user`, if one is recorded in `range`.
@@ -75,7 +114,55 @@ mod tests {
             display,
             runtime_dir: format!("/run/user/{}", 1000 + u32::from(display)),
             xauthority: format!("/run/user/{}/linrdp/Xauthority", 1000 + u32::from(display)),
+            locked: false,
         }
+    }
+
+    /// A restart must never leave a desktop reachable unlocked.
+    #[test]
+    fn every_session_is_locked_at_startup() {
+        let base = temp_base("lockall");
+        write_record(&base, &sample("alice", 11)).expect("write");
+        write_record(&base, &sample("bob", 12)).expect("write");
+
+        assert_eq!(lock_all(&base, 10..=20), 2, "both were unlocked");
+        assert!(find(&base, "alice", 10..=20).expect("alice").locked);
+        assert!(find(&base, "bob", 10..=20).expect("bob").locked);
+
+        assert_eq!(lock_all(&base, 10..=20), 0, "already locked, nothing to do");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_lock_state_round_trips() {
+        let base = temp_base("lockstate");
+        write_record(&base, &sample("alice", 11)).expect("write");
+        assert!(!find(&base, "alice", 10..=20).expect("found").locked);
+
+        set_locked(&base, 11, true).expect("lock");
+        assert!(find(&base, "alice", 10..=20).expect("found").locked);
+
+        set_locked(&base, 11, false).expect("unlock");
+        assert!(!find(&base, "alice", 10..=20).expect("found").locked);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Records written before the field existed must read as locked — the
+    /// unsafe direction is to assume a desktop is free to walk into.
+    #[test]
+    fn a_record_without_the_field_reads_as_locked() {
+        let base = temp_base("legacy");
+        std::fs::write(
+            record_path(&base, 13),
+            "user=carol\ndisplay=13\nruntime_dir=/run/user/1013\nxauthority=/x\n",
+        )
+        .expect("legacy record");
+
+        assert!(
+            find(&base, "carol", 10..=20).expect("found").locked,
+            "an unknown lock state must be treated as locked"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

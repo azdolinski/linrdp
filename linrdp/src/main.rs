@@ -44,6 +44,11 @@ USAGE:
 
 Serves a real Linux desktop over RDP (auth: system accounts from /etc/shadow).
 
+Commands:
+  doctor                report what this machine is and what linrdp may do on
+                        it: X servers, desktop sessions (and whether their
+                        programs actually exist), PAM, logind, screen lockers
+
 Multi-session:
   --supervisor          accept on the bind address and fork one worker per
                         connection; each worker serves its user's own desktop
@@ -171,6 +176,24 @@ fn supervisor_main() -> anyhow::Result<()> {
 
     session::runtime_dir::ensure_state_dir(std::path::Path::new(session::runtime_dir::STATE_DIR))
         .context("prepare the supervisor state directory")?;
+
+    // Whatever happened to the previous supervisor, the desktops it left
+    // behind must not be reachable unlocked: the process that would have
+    // locked them on disconnect is precisely the one that went away.
+    let display_range = match std::env::args()
+        .position(|a| a == "--display-range")
+        .and_then(|i| std::env::args().nth(i + 1))
+    {
+        Some(spec) => supervisor::parse_display_range(&spec)?,
+        None => 10..=99,
+    };
+    let locked = session::registry::lock_all(
+        std::path::Path::new(session::runtime_dir::STATE_DIR),
+        display_range,
+    );
+    if locked > 0 {
+        tracing::info!(sessions = locked, "locked sessions inherited from a previous supervisor");
+    }
 
     // Everything except --supervisor is handed to each worker unchanged, so
     // the two roles share one command line.
