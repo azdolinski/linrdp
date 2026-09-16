@@ -59,6 +59,31 @@ pub(crate) fn session_env(rec: &SessionRecord, user: &UserIds) -> Vec<(String, S
 }
 
 
+/// Point the grandchild's stdin at /dev/null and its output at `log`.
+///
+/// Async-signal-safe: only open/dup2/close between fork and exec.
+fn redirect_stdio(log: &std::ffi::CStr) {
+    // SAFETY: plain open/dup2/close on descriptors this process owns; all are
+    // async-signal-safe and none allocate.
+    unsafe {
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+        if null >= 0 {
+            libc::dup2(null, 0);
+            if null > 2 {
+                libc::close(null);
+            }
+        }
+        let fd = libc::open(log.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND, 0o600);
+        if fd >= 0 {
+            libc::dup2(fd, 1);
+            libc::dup2(fd, 2);
+            if fd > 2 {
+                libc::close(fd);
+            }
+        }
+    }
+}
+
 /// Find `program` on PATH, or accept it as-is when it is already a path.
 fn resolve_program(program: &str) -> Option<String> {
     if program.contains('/') {
@@ -102,6 +127,7 @@ pub(crate) fn spawn_detached(
     cmd: &DesktopCommand,
     env: &[(String, String)],
     user: &UserIds,
+    log_path: &std::path::Path,
 ) -> anyhow::Result<()> {
     // execve does NOT search PATH — a bare "Xvfb" fails with ENOENT in the
     // grandchild, where nothing can report it. Resolve here, where the error
@@ -117,6 +143,7 @@ pub(crate) fn spawn_detached(
     for (k, v) in env {
         envp_owned.push(std::ffi::CString::new(format!("{k}={v}")).context("env NUL")?);
     }
+    let log_c = std::ffi::CString::new(log_path.as_os_str().as_encoded_bytes()).context("log path NUL")?;
 
     // SAFETY: fork from a context the caller guarantees is single-threaded
     // (the worker does this before starting its runtime).
@@ -135,7 +162,13 @@ pub(crate) fn spawn_detached(
                 // SAFETY: _exit is async-signal-safe and never returns.
                 -1 => unsafe { libc::_exit(1) },
                 0 => {
-                    // Grandchild: become the user, then become the desktop.
+                    // Grandchild. Give it somewhere to complain first: it is
+                    // detached, so without this its stdout and stderr die with
+                    // the worker and a desktop that fails to start does so in
+                    // complete silence — which is exactly how a failed Xvfb
+                    // first looked like a working session.
+                    redirect_stdio(&log_c);
+                    // Become the user, then become the desktop.
                     if crate::session::privilege::drop_to(user).is_err() {
                         // SAFETY: as above.
                         unsafe { libc::_exit(1) };

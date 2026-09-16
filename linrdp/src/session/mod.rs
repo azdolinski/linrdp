@@ -122,7 +122,8 @@ pub(crate) fn create(
 
     let cmd = keeper::xvfb_command(rec.display, &rec.xauthority, size);
     let env_pairs = keeper::session_env(&rec, &ids);
-    keeper::spawn_detached(&cmd, &env_pairs, &ids)
+    let desktop_log = base.join(format!("display-{}.log", rec.display));
+    keeper::spawn_detached(&cmd, &env_pairs, &ids, &desktop_log)
         .with_context(|| format!("start the X server for {user} on :{}", rec.display))?;
     // The desktop is detached, so its exec failure cannot be waited for.
     // Without this check a failed start would be recorded as a healthy
