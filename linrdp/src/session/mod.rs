@@ -3,6 +3,7 @@
 //! See `docs/superpowers/specs/2026-09-16-multi-session-design.md`.
 
 pub(crate) mod display_alloc;
+pub(crate) mod keeper;
 pub(crate) mod pam_session;
 pub(crate) mod privilege;
 pub(crate) mod registry;
