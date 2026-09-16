@@ -6,4 +6,5 @@ pub(crate) mod display_alloc;
 pub(crate) mod pam_session;
 pub(crate) mod privilege;
 pub(crate) mod registry;
+pub(crate) mod xauth;
 pub(crate) mod runtime_dir;
