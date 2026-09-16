@@ -532,7 +532,7 @@ pub(crate) trait PamSessionApi {
 }
 ```
 
-The libpam-backed implementation lands in Task 4 together with the keeper that owns it; this task delivers the contract and its order guarantees.
+The libpam-backed implementation lands in Task 9, together with `session::create` which owns the handle; this task delivers the contract and its order guarantees.
 
 Add `pub(crate) mod pam_session;` to `linrdp/src/session/mod.rs`.
 
@@ -1375,11 +1375,13 @@ git commit -m "session: desktop command and environment, never with -ac"
 
 **Files:**
 - Modify: `linrdp/src/main.rs` (serve one connection from `--serve-fd`, resolve the session after authentication)
-- Modify: `linrdp/src/session/mod.rs` (add `attach_or_create`)
+- Modify: `linrdp/src/session/mod.rs` (add `attach_existing` and `create`)
 
 **Interfaces:**
 - Consumes: everything above.
-- Produces: `pub(crate) fn attach_or_create(base: &Path, user: &str, range: RangeInclusive<u16>, size: (u16, u16)) -> anyhow::Result<registry::SessionRecord>`
+- Produces:
+  - `pub(crate) fn attach_existing(base: &Path, user: &str, range: RangeInclusive<u16>) -> Option<registry::SessionRecord>`
+  - `pub(crate) fn create(base: &Path, user: &str, range: RangeInclusive<u16>, size: (u16, u16)) -> anyhow::Result<registry::SessionRecord>`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1466,7 +1468,64 @@ Then wire the worker path in `linrdp/src/main.rs`. After the credential validato
     unsafe { std::env::set_var("XAUTHORITY", &session.xauthority) };
 ```
 
-`session::create` allocates a lease, writes the cookie, opens the PAM session, spawns the keeper, and writes the record — composing Tasks 2, 3, 4, 6 and 8.
+And `create`, which composes Tasks 2, 3, 4, 6 and 8:
+
+```rust
+/// Build a new session for `user`: claim a display, open a PAM session so
+/// logind creates the runtime dir, write the cookie there, start the X
+/// server, and record the result.
+///
+/// The `DisplayLease` is deliberately leaked into the keeper: the flock must
+/// outlive this function, because the session outlives the connection that
+/// created it. Every early return drops the lease, which releases the claim —
+/// that is what keeps a failed setup from stranding a display number.
+pub(crate) fn create(
+    base: &Path,
+    user: &str,
+    range: RangeInclusive<u16>,
+    size: (u16, u16),
+) -> anyhow::Result<registry::SessionRecord> {
+    let ids = privilege::lookup_user(user)?;
+    let lease = display_alloc::allocate(base, range)?;
+
+    // PAM first: pam_systemd creates /run/user/<uid> (0700, user-owned),
+    // and there is nowhere safe to put the cookie until it exists.
+    let mut pam = pam_session::libpam_session();
+    let env = pam
+        .open(user, "")
+        .map_err(|e| anyhow::anyhow!("pam_open_session for {user}: {e}"))?;
+    let runtime_dir = env
+        .runtime_dir()
+        .context("PAM did not provide XDG_RUNTIME_DIR — is pam_systemd.so in /etc/pam.d/linrdp?")?
+        .to_owned();
+
+    let xauthority = xauth::write_cookie(&runtime_dir, lease.number, &ids)?;
+    let rec = registry::SessionRecord {
+        user: user.to_owned(),
+        display: lease.number,
+        runtime_dir,
+        xauthority: xauthority.to_string_lossy().into_owned(),
+    };
+
+    let cmd = keeper::xvfb_command(rec.display, &rec.xauthority, size);
+    let env_pairs = keeper::session_env(&rec, &ids);
+    keeper::spawn_detached(&cmd, &env_pairs, &ids)
+        .with_context(|| format!("start X server for {user} on :{}", rec.display))?;
+
+    lease.record_owner(user)?;
+    registry::write_record(base, &rec)?;
+    // The keeper now owns the claim and the PAM handle for the session's life.
+    core::mem::forget(lease);
+    core::mem::forget(pam);
+    Ok(rec)
+}
+```
+
+`pam_session::libpam_session()` returns the libpam-backed `PamSessionApi`
+implementation (the dlopen'd calls from Task 3), and
+`keeper::spawn_detached(cmd, env, ids)` double-forks, applies `env`, drops
+privileges with `privilege::drop_to(ids)` and execs — both are added here
+alongside `create`.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1580,6 +1639,159 @@ Expected: PASS, no clippy errors.
 ```bash
 git add deploy/pam.d-linrdp deploy/linrdp.service linrdp/src/main.rs README.md
 git commit -m "session: console mode for the shared display, PAM stack, docs"
+```
+
+---
+
+### Task 11: Session teardown and stale-record reaping
+
+**Files:**
+- Modify: `linrdp/src/session/mod.rs`
+- Modify: `linrdp/src/session/registry.rs`
+
+**Interfaces:**
+- Consumes: `display_alloc::allocate`, `registry::{record_path, find}`.
+- Produces:
+  - `pub(crate) fn is_stale(base: &Path, display: u16, range: RangeInclusive<u16>) -> bool`
+  - `pub(crate) fn forget(base: &Path, display: u16) -> anyhow::Result<()>`
+
+The spec requires that a session whose X server died is torn down and the
+next connection gets a fresh one, and that a supervisor restart never
+orphans a display. Both reduce to one question: is this record backed by a
+live keeper? A free `flock` answers it — the kernel released the lock when
+the keeper died.
+
+- [ ] **Step 1: Write the failing test**
+
+```rust
+    /// A record whose display lock is free belongs to a dead keeper.
+    #[test]
+    fn a_record_without_a_live_lock_is_stale() {
+        let base = temp_base("stale");
+        registry::write_record(
+            &base,
+            &registry::SessionRecord {
+                user: "alice".to_owned(),
+                display: 11,
+                runtime_dir: "/run/user/1001".to_owned(),
+                xauthority: "/run/user/1001/linrdp/Xauthority".to_owned(),
+            },
+        )
+        .expect("seed");
+
+        assert!(is_stale(&base, 11, 11..=11), "nobody holds the lock, so the keeper is gone");
+
+        // While a lease is held, the same record is live.
+        let _held = display_alloc::allocate(&base, 11..=11).expect("hold the lock");
+        assert!(!is_stale(&base, 11, 11..=11), "a held lock means a live session");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Forgetting a dead session must free the number for reuse.
+    #[test]
+    fn forgetting_a_session_frees_the_display() {
+        let base = temp_base("forget");
+        registry::write_record(
+            &base,
+            &registry::SessionRecord {
+                user: "alice".to_owned(),
+                display: 11,
+                runtime_dir: "/run/user/1001".to_owned(),
+                xauthority: "/run/user/1001/linrdp/Xauthority".to_owned(),
+            },
+        )
+        .expect("seed");
+
+        forget(&base, 11).expect("forget");
+
+        assert!(attach_existing(&base, "alice", 10..=20).is_none(), "the record is gone");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A stale record must not send a reconnecting user to a dead desktop.
+    #[test]
+    fn attach_skips_a_stale_record() {
+        let base = temp_base("skipstale");
+        registry::write_record(
+            &base,
+            &registry::SessionRecord {
+                user: "alice".to_owned(),
+                display: 11,
+                runtime_dir: "/run/user/1001".to_owned(),
+                xauthority: "/run/user/1001/linrdp/Xauthority".to_owned(),
+            },
+        )
+        .expect("seed");
+
+        assert!(
+            attach_live(&base, "alice", 10..=20).is_none(),
+            "a record with no live keeper must not be attached to"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `cargo test -p linrdp session::tests`
+Expected: FAIL — `cannot find function is_stale`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+```rust
+/// Whether the record for `display` is backed by a live keeper.
+///
+/// A free `flock` is proof the keeper is gone: the kernel drops the lock
+/// when the holding process dies, so this survives crashes and a supervisor
+/// restart without any bookkeeping of our own.
+pub(crate) fn is_stale(base: &Path, display: u16, range: RangeInclusive<u16>) -> bool {
+    let _ = range;
+    match display_alloc::allocate(base, display..=display) {
+        // We got the lock, so nobody was holding it.
+        Ok(_lease) => true,
+        Err(_) => false,
+    }
+}
+
+/// Drop the record for a dead session so the number can be reused.
+pub(crate) fn forget(base: &Path, display: u16) -> anyhow::Result<()> {
+    let path = registry::record_path(base, display);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow::Error::from(e).context(format!("remove {}", path.display()))),
+    }
+}
+
+/// The user's session, but only if a keeper is still holding it.
+pub(crate) fn attach_live(
+    base: &Path,
+    user: &str,
+    range: RangeInclusive<u16>,
+) -> Option<registry::SessionRecord> {
+    let rec = attach_existing(base, user, range.clone())?;
+    if is_stale(base, rec.display, range) {
+        // The desktop died; clear the record so the next create() starts clean.
+        let _ = forget(base, rec.display);
+        return None;
+    }
+    Some(rec)
+}
+```
+
+Change the worker in `linrdp/src/main.rs` to call `attach_live` rather than
+`attach_existing`, so a reconnect never lands on a dead desktop.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `cargo test -p linrdp`
+Expected: PASS, whole suite.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add linrdp/src/session/mod.rs linrdp/src/session/registry.rs linrdp/src/main.rs
+git commit -m "session: reap dead sessions so a reconnect never lands on one"
 ```
 
 ---
