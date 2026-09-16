@@ -1533,16 +1533,24 @@ impl EgfxUpdates {
             return; // encoder skipped unchanged input
         }
 
-        // Region rects cover only the REAL desktop rows. The padded surface
-        // gives x264 the 16-aligned macroblock grid it needs, but the padding
-        // rows are fill, not content: a v2 region reaching into them paints
-        // a permanent band across the bottom of mstsc's desktop (the v1 path
-        // always used real dims and never showed one — verified live
-        // 2026-09-16: v1 clean, v2 banded, same padded surface).
-        let (region_right, region_bottom): (u16, u16) = (
-            w.try_into().unwrap_or(u16::MAX),
-            h.try_into().unwrap_or(u16::MAX),
-        );
+        // Region rects must equal the surface dims in the v2 envelope —
+        // mstsc rejects mismatched v2 regions (1800/1792 tripped 0xD06; the
+        // real-dims 1800 region on the padded 1808 surface fired its decoder
+        // recovery in every session). The bottom padding strip is kept
+        // invisible by the converters, which fill it with replicated edge
+        // content instead of black. v1 has no such constraint: its regions
+        // cover the real rows and the padding is never composited.
+        let (region_right, region_bottom): (u16, u16) = if avc444v2 {
+            (
+                pw.try_into().unwrap_or(u16::MAX),
+                ph.try_into().unwrap_or(u16::MAX),
+            )
+        } else {
+            (
+                w.try_into().unwrap_or(u16::MAX),
+                h.try_into().unwrap_or(u16::MAX),
+            )
+        };
         let region = Avc420Region {
             left: 0,
             top: 0,
@@ -1894,14 +1902,13 @@ fn convert_rows_v2(
 ) {
     let stride = w * 4;
     // Full-range BT.709 per component. Coordinates outside the real frame
-    // (the 16-macroblock padding) yield BLACK: the padding rows of the
-    // encoded frame are composited by mstsc into the visible bottom strip,
-    // and a constant black strip is invisible on the dark theme, while a
-    // replicated edge would visibly duplicate the last desktop row.
+    // (the 16-macroblock padding) replicate the nearest real pixel: mstsc
+    // composites the padded bottom strip (v2 regions must cover the whole
+    // surface), and a constant fill shows up as a colored band — replicated
+    // edge content blends into the wallpaper/panel instead.
     let yuv_at = |x: usize, y: usize| -> (u8, u8, u8) {
-        if x >= w || y >= h {
-            return (0, 128, 128);
-        }
+        let x = x.min(w - 1);
+        let y = y.min(h - 1);
         let off = y * stride + x * 4;
         let b = i32::from(src[off]);
         let g = i32::from(src[off + 1]);
