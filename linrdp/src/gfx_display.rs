@@ -1173,6 +1173,15 @@ impl EgfxUpdates {
         }
     }
 
+    /// How many pixels one lossless paint may cover, from the same measured
+    /// goodput that drives the H.264 bitrate. Budgeted at an eighth of a
+    /// second of link capacity: enough to repaint a full screen in a handful
+    /// of frames, small enough that audio never queues behind one.
+    fn lossless_budget_px(&self) -> u32 {
+        let bytes_per_eighth_second = self.h264_bitrate_bps() / 8 / 8;
+        (bytes_per_eighth_second / CLEARCODEC_BYTES_PER_PX).max(u32::from(MIN_BAND_ROWS) * 64)
+    }
+
     /// Pay off the outstanding lossless debt over `rect`. The debt is only
     /// cleared once the paint actually reached the wire — a frame dropped by
     /// backpressure leaves the pixels stale, so the debt must survive it.
@@ -1193,9 +1202,18 @@ impl EgfxUpdates {
             self.debt_rect = None;
             return;
         }
-        if self.send_clear(handle, data, frame_w, frame_h, x, y, w, h).await {
-            self.pending_full = false;
-            self.debt_rect = None;
+        let (band, remainder) = split_debt_band((x, y, w, h), self.lossless_budget_px());
+        let (bx, by, bw, bh) = band;
+        if self.send_clear(handle, data, frame_w, frame_h, bx, by, bw, bh).await {
+            match remainder {
+                // More of the region still owes a lossless paint; the next
+                // frame continues where this band stopped.
+                Some(rest) => self.debt_rect = Some(rest),
+                None => {
+                    self.pending_full = false;
+                    self.debt_rect = None;
+                }
+            }
         }
     }
 
@@ -1931,6 +1949,44 @@ fn bgrx_to_yuv444v2(
     )
 }
 
+/// ClearCodec residual-RLE output per source pixel, measured on real desktop
+/// content: a 2880x1800 full-screen paint encoded to 1,069,809 bytes, i.e.
+/// ~0.21 B/px. Rounded up, because undershooting the budget is harmless and
+/// overshooting it is what stalls the audio channel.
+const CLEARCODEC_BYTES_PER_PX: u32 = 1; // conservative: 4x the measured rate
+
+/// Minimum band height, so a tight budget cannot degenerate into hundreds of
+/// one-row PDUs whose headers cost more than their pixels.
+const MIN_BAND_ROWS: u16 = 16;
+
+/// Split `rect` into the slice that fits `budget_px` and the remainder still
+/// owed, as `(paint_now, still_owed)`.
+///
+/// A lossless repaint of a 2880x1800 desktop is ~1 MB in a single PDU. On a
+/// link that measures ~17 Mb/s that is most of a second on the wire, and
+/// every small packet behind it — audio above all — waits for it: a 24-byte
+/// write was measured taking 7 ms and a 5.6 KB write 25 ms, while a 2.25 MB
+/// write into a fresh socket buffer took 5. Painting in bands spreads the
+/// same pixels over consecutive frames and keeps the pipe available.
+fn split_debt_band(rect: (u16, u16, u16, u16), budget_px: u32) -> ((u16, u16, u16, u16), Option<(u16, u16, u16, u16)>) {
+    let (x, y, w, h) = rect;
+    if w == 0 || h == 0 {
+        return (rect, None);
+    }
+    let area = u32::from(w) * u32::from(h);
+    if area <= budget_px {
+        return (rect, None);
+    }
+    let rows = (budget_px / u32::from(w)).max(u32::from(MIN_BAND_ROWS));
+    let Ok(rows) = u16::try_from(rows) else {
+        return (rect, None); // budget wider than the rect can be split
+    };
+    if rows >= h {
+        return (rect, None);
+    }
+    ((x, y, w, rows), Some((x, y + rows, w, h - rows)))
+}
+
 /// Smallest rectangle containing both inputs, as (x, y, w, h).
 fn union_rect(a: (u16, u16, u16, u16), b: (u16, u16, u16, u16)) -> (u16, u16, u16, u16) {
     let left = a.0.min(b.0);
@@ -2062,7 +2118,7 @@ fn yo_of(j: usize) -> usize {
 
 #[cfg(test)]
 mod debt_region_tests {
-    use super::union_rect;
+    use super::{MIN_BAND_ROWS, split_debt_band, union_rect};
 
     /// The lossless debt is repaid over the union of the regions that
     /// actually went stale, not the whole screen.
@@ -2098,6 +2154,47 @@ mod debt_region_tests {
         let outer = (10, 10, 500, 400);
         assert_eq!(union_rect(outer, (20, 20, 100, 100)), outer);
         assert_eq!(union_rect(outer, outer), outer);
+    }
+
+    /// A repaint that fits the per-frame budget goes out whole.
+    #[test]
+    fn a_small_debt_is_painted_in_one_go() {
+        let rect = (0, 0, 400, 300);
+        let (band, rest) = split_debt_band(rect, 1_000_000);
+        assert_eq!(band, rect);
+        assert_eq!(rest, None);
+    }
+
+    /// A full-screen repaint is spread over consecutive frames instead of
+    /// going out as one multi-megabyte write that audio has to queue behind.
+    #[test]
+    fn a_full_screen_debt_is_painted_in_bands_covering_every_row() {
+        let full = (0u16, 0u16, 2880u16, 1800u16);
+        let budget = 265_000; // ~1/8 s of a 17 Mb/s link
+
+        let mut rect = Some(full);
+        let mut painted_rows = 0u32;
+        let mut bands = 0;
+        let mut next_y = 0u16;
+
+        while let Some(current) = rect {
+            let (band, rest) = split_debt_band(current, budget);
+            assert_eq!(band.0, 0, "bands keep the region's x");
+            assert_eq!(band.2, full.2, "bands span the region's width");
+            assert_eq!(band.1, next_y, "bands are contiguous, no gaps");
+            assert!(
+                u32::from(band.2) * u32::from(band.3) <= budget.max(u32::from(band.2) * u32::from(MIN_BAND_ROWS)),
+                "a band must fit the budget (or be the minimum height), got {band:?}"
+            );
+            painted_rows += u32::from(band.3);
+            next_y = band.1 + band.3;
+            bands += 1;
+            assert!(bands < 200, "banding must terminate");
+            rect = rest;
+        }
+
+        assert_eq!(painted_rows, u32::from(full.3), "every row must be repainted exactly once");
+        assert!(bands > 1, "a full screen must not go out as a single write");
     }
 }
 
