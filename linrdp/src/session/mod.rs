@@ -2,4 +2,5 @@
 //!
 //! See `docs/superpowers/specs/2026-09-16-multi-session-design.md`.
 
+pub(crate) mod display_alloc;
 pub(crate) mod runtime_dir;
