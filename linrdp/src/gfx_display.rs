@@ -345,6 +345,7 @@ impl RdpServerDisplay for EgfxDisplay {
             generation: None,
             last_h264: Instant::now() - H264_MIN_INTERVAL,
             pending_full: true,
+            debt_rect: None,
             in_motion: false,
             motion_until: Instant::now(),
             caps_reset_until: Instant::now(),
@@ -417,10 +418,16 @@ struct EgfxUpdates {
     /// means a new client attached and the surface must be re-created.
     generation: Option<GfxHandle>,
     last_h264: Instant,
-    /// A full-surface send is owed (first paint, resize, skipped frame) —
+    /// A lossless send is owed (first paint, resize, skipped frame) —
     /// partial lossless updates are blocked until it is cleared, or pixels
     /// from the skipped frame could stay stale forever.
     pending_full: bool,
+    /// Which region owes that lossless paint, as a union of the damage
+    /// rectangles that were skipped. `None` while `pending_full` means the
+    /// whole screen owes it (post-resize, surface rebuild, motion exit under
+    /// 4:2:0). Repaying only the region that actually went stale is the
+    /// difference between a 1.07 MB full-screen repaint and a few KB.
+    debt_rect: Option<(u16, u16, u16, u16)>,
     /// Motion-mode state: H.264 frames were sent recently. While active,
     /// lossless partials are suppressed (they make static UI alternate
     /// between exact and 4:2:0-lossy colors — the user-visible pulse).
@@ -583,7 +590,7 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
                 if self.session.ready()
                     && Self::lock_handle(&handle).should_backpressure()
                 {
-                    self.pending_full = true;
+                    self.owe_everything();
                     self.backpressure_events += 1;
                     tokio::time::sleep(POLL_INTERVAL).await;
                     continue;
@@ -697,7 +704,7 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
                 self.encoders = None;
                 self.enc_built = None;
                 self.in_motion = false;
-                self.pending_full = true;
+                self.owe_everything();
             }
 
             // Size the in-flight window from the bandwidth-delay product:
@@ -982,7 +989,7 @@ impl EgfxUpdates {
             if let Some(Encoders { h264: Some(enc), .. }) = self.encoders.as_mut() {
                 enc.force_intra();
             }
-            self.pending_full = true;
+            self.owe_everything();
         }
 
         // mstsc re-advertises capabilities right after connecting (decoder
@@ -1015,7 +1022,7 @@ impl EgfxUpdates {
                     enc.force_intra();
                 }
                 self.ensure_surface(handle, grab.width, grab.height);
-                self.pending_full = true;
+                self.owe_everything();
                 self.caps_reset_until = Instant::now() + CAPS_SETTLE;
                 // Frames pushed during the client's reset are what trip
                 // mstsc into "protocol error 0xD06" and an RST (observed: a
@@ -1027,7 +1034,7 @@ impl EgfxUpdates {
         // Backpressure (MS-RDPEGFX 2.2.4.3): the client is behind — skip the
         // frame entirely; the full-frame send that follows covers this grab.
         if handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).should_backpressure() {
-            self.pending_full = true;
+            self.owe_everything();
             self.backpressure_events += 1;
             return;
         }
@@ -1059,12 +1066,20 @@ impl EgfxUpdates {
             total_tiles,
         } = grab;
 
-        // Motion-mode exit: the linger window lapsed — snap the whole
-        // screen back to lossless with one full repaint (even with no new
-        // damage, the last H.264 frame left everything in 4:2:0 quality).
+        // Motion-mode exit: the linger window lapsed. Under 4:2:0 the last
+        // H.264 frame left the whole screen with half-resolution chroma, so
+        // a full lossless repaint is what makes text crisp again.
+        //
+        // Under AVC444v2 there is nothing to repair: the chroma is already
+        // full resolution, and the stream runs at QP 5-8. Snapping back
+        // anyway cost a 1.07 MB repaint of unchanged content roughly once a
+        // second — measured at 14 of them per 10 s, which was the entire
+        // bandwidth of an idle session.
         if self.in_motion && Instant::now() >= self.motion_until {
             self.in_motion = false;
-            self.pending_full = true;
+            if !self.avc444v2_enabled {
+                self.owe_everything();
+            }
         }
 
         let Some(damage) = damage else {
@@ -1072,8 +1087,8 @@ impl EgfxUpdates {
             // motion frame was skipped and the screen went static right
             // after), in which case paint everything now.
             if self.pending_full {
-                self.send_clear(handle, data, width, height, 0, 0, width, height)
-                    .await;
+                let (x, y, w, h) = self.debt_region(width, height);
+                self.repay_debt(handle, data, width, height, x, y, w, h).await;
             }
             return;
         };
@@ -1084,8 +1099,8 @@ impl EgfxUpdates {
         // alternates the whole screen between exact and 4:2:0 looks at the
         // H.264 cadence (~6.5 Hz), which is exactly the visible flicker.
         if self.pending_full && !self.in_motion {
-            self.send_clear(handle, data, width, height, 0, 0, width, height)
-                .await;
+            let (x, y, w, h) = self.debt_region(width, height);
+            self.repay_debt(handle, data, width, height, x, y, w, h).await;
             return;
         }
 
@@ -1107,7 +1122,7 @@ impl EgfxUpdates {
                 // Skip this encode to hold ~30 fps. The next H.264 frame is
                 // a FULL-frame encode, so this grab's content arrives with
                 // it — block lossless partials until then.
-                self.pending_full = true;
+                self.owe_region(dx, dy, dw, dh);
                 return;
             }
             self.send_h264(handle, data, width, height).await;
@@ -1119,10 +1134,68 @@ impl EgfxUpdates {
             // only for the next full-frame H.264 to re-lossy them — that
             // alternation is the visible pulse. The next motion frame (or
             // the linger-exit repaint) delivers these pixels consistently.
-            self.pending_full = true;
+            self.owe_region(dx, dy, dw, dh);
         } else {
-            self.send_clear(handle, data, width, height, dx, dy, dw, dh)
-                .await;
+            let _delivered = self.send_clear(handle, data, width, height, dx, dy, dw, dh).await;
+        }
+    }
+
+
+    /// Record that `rect` owes a lossless paint, merging it with whatever is
+    /// already owed. An existing whole-screen debt stays whole-screen.
+    fn owe_region(&mut self, x: u16, y: u16, w: u16, h: u16) {
+        if self.pending_full && self.debt_rect.is_none() {
+            return; // already owe everything
+        }
+        self.debt_rect = Some(match self.debt_rect {
+            None => (x, y, w, h),
+            Some(cur) => union_rect(cur, (x, y, w, h)),
+        });
+        self.pending_full = true;
+    }
+
+    /// Record that the whole screen owes a lossless paint (resize, surface
+    /// rebuild, a frame that never reached the wire).
+    fn owe_everything(&mut self) {
+        self.pending_full = true;
+        self.debt_rect = None;
+    }
+
+    /// The region to repaint for the outstanding debt, clamped to the frame.
+    fn debt_region(&self, width: u16, height: u16) -> (u16, u16, u16, u16) {
+        match self.debt_rect {
+            None => (0, 0, width, height),
+            Some((x, y, w, h)) => {
+                let x = x.min(width);
+                let y = y.min(height);
+                (x, y, w.min(width - x), h.min(height - y))
+            }
+        }
+    }
+
+    /// Pay off the outstanding lossless debt over `rect`. The debt is only
+    /// cleared once the paint actually reached the wire — a frame dropped by
+    /// backpressure leaves the pixels stale, so the debt must survive it.
+    #[expect(clippy::too_many_arguments, reason = "mirrors send_clear's frame + rect signature")]
+    async fn repay_debt(
+        &mut self,
+        handle: &GfxHandle,
+        data: Vec<u8>,
+        frame_w: u16,
+        frame_h: u16,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+    ) {
+        if w == 0 || h == 0 {
+            self.pending_full = false;
+            self.debt_rect = None;
+            return;
+        }
+        if self.send_clear(handle, data, frame_w, frame_h, x, y, w, h).await {
+            self.pending_full = false;
+            self.debt_rect = None;
         }
     }
 
@@ -1337,9 +1410,9 @@ impl EgfxUpdates {
         y: u16,
         w: u16,
         h: u16,
-    ) {
-        let Some(surface) = self.surface else { return };
-        let Some(mut encoders) = self.take_encoders() else { return };
+    ) -> bool {
+        let Some(surface) = self.surface else { return false };
+        let Some(mut encoders) = self.take_encoders() else { return false };
         let ts = self.timestamp_ms();
         // MS-RDPEGFX 2.2.4.1: seqNumber is a SESSION counter — "the value of
         // the seqNumber field MUST be equal to the value of the seqNumber
@@ -1374,7 +1447,7 @@ impl EgfxUpdates {
         let Ok((encoders, stream)) = joined else {
             // Join failure: the encoders were lost with the task — rebuilt
             // on the next take_encoders() call.
-            return;
+            return false;
         };
         self.encoders = Some(encoders);
 
@@ -1388,7 +1461,8 @@ impl EgfxUpdates {
         let sent = server.send_clearcodec_frame(surface.id, dest, stream, ts);
         drop(server);
 
-        if sent.is_some() {
+        let delivered = sent.is_some();
+        if delivered {
             // The message is on the wire: the session's next ClearCodec
             // message carries this one plus one.
             tracing::debug!(
@@ -1401,18 +1475,14 @@ impl EgfxUpdates {
             self.clear_seq = self.clear_seq.wrapping_add(1);
             self.stat_clear += 1;
             self.producer_frames += 1;
-            if full {
-                // A delivered full-surface paint clears the debt; a delivered
-                // partial rect does not (older debt may still be outstanding).
-                self.pending_full = false;
-            }
         } else {
             // Dropped (backpressure): this grab's pixels are already consumed
-            // from the damage tracker, so only a later full paint can deliver
-            // them — keep the debt flagged.
-            self.pending_full = true;
+            // from the damage tracker, so only a later lossless paint can
+            // deliver them — the region stays owed.
+            self.owe_region(x, y, w, h);
         }
         self.record_drained(self.session.drain_and_send(handle));
+        delivered
     }
 
     /// Full-frame H.264 encode for motion.
@@ -1420,7 +1490,7 @@ impl EgfxUpdates {
         let Some(surface) = self.surface else { return };
 
         if self.avc_disabled {
-            self.send_clear(handle, data, w, h, 0, 0, w, h).await;
+            self.repay_debt(handle, data, w, h, 0, 0, w, h).await;
             return;
         }
 
@@ -1475,7 +1545,7 @@ impl EgfxUpdates {
                 Err(e) => {
                     tracing::warn!(error = %e, "EGFX: x264 init failed — ClearCodec only");
                     self.avc_disabled = true;
-                    self.send_clear(handle, data, w, h, 0, 0, w, h).await;
+                    self.repay_debt(handle, data, w, h, 0, 0, w, h).await;
                     return;
                 }
             }
@@ -1529,7 +1599,7 @@ impl EgfxUpdates {
 
         let Some(luma_bitstream) = luma_bs else {
             // No encoder: recover with a lossless full paint.
-            self.pending_full = true;
+            self.owe_everything();
             return;
         };
         if luma_bitstream.is_empty() {
@@ -1592,6 +1662,7 @@ impl EgfxUpdates {
             self.last_sent += 1;
             self.last_h264 = Instant::now();
             self.pending_full = false;
+            self.debt_rect = None;
         } else {
             // A frame that never reached the wire breaks the P-frame
             // reference chain: the encoder counts it as history the client's
@@ -1603,7 +1674,7 @@ impl EgfxUpdates {
             if let Some(Encoders { h264: Some(enc), .. }) = self.encoders.as_mut() {
                 enc.force_intra();
             }
-            self.pending_full = true;
+            self.owe_everything();
         }
         self.record_drained(self.session.drain_and_send(handle));
     }
@@ -1860,6 +1931,15 @@ fn bgrx_to_yuv444v2(
     )
 }
 
+/// Smallest rectangle containing both inputs, as (x, y, w, h).
+fn union_rect(a: (u16, u16, u16, u16), b: (u16, u16, u16, u16)) -> (u16, u16, u16, u16) {
+    let left = a.0.min(b.0);
+    let top = a.1.min(b.1);
+    let right = (a.0 + a.2).max(b.0 + b.2);
+    let bottom = (a.1 + a.3).max(b.1 + b.3);
+    (left, top, right - left, bottom - top)
+}
+
 fn half_of(pw: usize) -> usize {
     pw / 2
 }
@@ -1978,6 +2058,47 @@ fn convert_rows_v2(
 /// The odd source row of the row-pair `j`.
 fn yo_of(j: usize) -> usize {
     2 * j + 1
+}
+
+#[cfg(test)]
+mod debt_region_tests {
+    use super::union_rect;
+
+    /// The lossless debt is repaid over the union of the regions that
+    /// actually went stale, not the whole screen.
+    ///
+    /// Regression: every debt was repaid with a full-surface ClearCodec
+    /// paint. On a 2880x1800 desktop that is 1.07 MB, and an idle AVC444v2
+    /// session emitted 14 of them per 10 s — identical bytes each time,
+    /// because the screen was not changing at all.
+    #[test]
+    fn debt_regions_merge_into_their_bounding_box() {
+        // Two small, far-apart rects (a blinking caret and a clock) must not
+        // become the whole screen unless they really span it.
+        let caret = (100, 200, 8, 16);
+        let clock = (2700, 40, 120, 24);
+
+        let merged = union_rect(caret, clock);
+        assert_eq!(merged, (100, 40, 2720, 176));
+
+        // Merging is idempotent and order-independent.
+        assert_eq!(union_rect(clock, caret), merged);
+        assert_eq!(union_rect(merged, caret), merged);
+        assert_eq!(union_rect(merged, clock), merged);
+
+        // And still far smaller than a full-screen repaint.
+        let full_px = 2880u32 * 1800;
+        let merged_px = u32::from(merged.2) * u32::from(merged.3);
+        assert!(merged_px * 3 < full_px, "merged {merged_px} px vs full {full_px} px");
+    }
+
+    /// A rect fully inside another leaves it unchanged.
+    #[test]
+    fn a_contained_rect_does_not_grow_the_debt() {
+        let outer = (10, 10, 500, 400);
+        assert_eq!(union_rect(outer, (20, 20, 100, 100)), outer);
+        assert_eq!(union_rect(outer, outer), outer);
+    }
 }
 
 #[cfg(test)]
