@@ -171,3 +171,63 @@ the encoder, and a region may end on an unaligned row.
 10. ClearCodec `seqNumber` is session state: stamped per encode, committed
     only when the frame reaches the wire, carried across encoder rebuilds,
     reset to 0 (with the glyph cache) only on a client pipeline reset.
+
+---
+
+# Learnings — "high bandwidth, low FPS" and the two false X deaths (2026-09-16)
+
+The tail of the disconnect saga above. With the session finally staying up,
+what was left was a stream that cost ~1.7 MB/s for a desktop doing almost
+nothing, at 4 fps. Two defects, and a third suspect that turned out innocent.
+
+| # | Defect | Symptom | Evidence that found it |
+|---|--------|---------|------------------------|
+| 1 | The MIT-SHM segment was created mode 0600. linrdp runs as root, the desktop's X server as the user, so `ShmAttach` returned `BadAccess` every time and every grab fell back to a core-protocol `GetImage` of the whole screen (~20 MB at 2880x1800) | grabs cost 4-6 ms and the X socket carried ~1 GB/s | `examples/shm_probe.rs` against the live display: 0600 FAILED (X11Error Access), 0666 OK |
+| 2 | `poll_inner()` returned a bare `None` both for "the damage gate saw no change" and for "the grab failed"; `poll()` counted every `None` as a failure | 30 undamaged polls (~0.5 s of a static screen) tripped "X server connection was dead", which drops the diff baseline and forces a full-screen lossless repaint — 32 spurious reconnects and 37 repaints of ~1.2 MB in one quiet session | reconnects exactly 0.72 s apart (30 polls x 17 ms), and `grab_ms=0` — no grab is even attempted when the damage gate says idle |
+| — | UDP (MS-RDPEMT) — **not guilty** | had been disabled with a code comment blaming it for mstsc's CapsAdvertise | with the graphics faults fixed, UDP ran a 100 s session with no recovery and no reset; mstsc reported "transport protocol: UDP" |
+
+## What this cost, and why it hid so long
+
+Defect 2 is invisible in an *active* session: with damage on nearly every
+poll the counter never reaches 30. The test that looked perfect
+(`damaged=256/292 polls`, 0 reconnects) and the test that looked broken
+(`damaged=21/290`, 32 reconnects) ran the same binary minutes apart. The
+difference was whether the user happened to be moving the mouse.
+
+Net effect once both were fixed, same desktop, same client:
+27x less bandwidth at 5x the frame rate (42 frames / 16.9 MB per 10 s ->
+230 frames / 0.63 MB per 10 s), and the session stopped repainting itself.
+
+## Traps worth remembering
+
+- **`None` is not a diagnosis.** Two callers of one `Option` meant "nothing
+  to do" and "something is broken", and the bug lived in the gap. The fix
+  put the distinction in the type system (`PollOutcome::{Idle, Frame,
+  Failed}` plus `GrabFailures`) rather than in a convention, because a
+  convention is exactly what got lost.
+- **A wrong fix can still be a real improvement.** The SHM fix was measured
+  and large (636 KB/s -> 41 KB/s, 20 MB per grab gone), but the reconnect
+  churn it was credited with had a different cause entirely. Re-check the
+  attribution after the numbers move, not just the numbers.
+- **Run the experiment instead of reasoning about permissions.** "root
+  process, user-owned X server, 0600 segment" is an obvious story once
+  written down, but it took a 60-line probe to turn it into a fact. Keep the
+  probe (`examples/shm_probe.rs`); it is cheaper than the next argument.
+- **Suspect the component that was disabled during an earlier hunt.** UDP
+  had been switched off to bisect the disconnects and then stayed off, with
+  a comment that hardened the guess into documentation. When the real cause
+  is found, go back and re-test everything that was disabled along the way.
+- **mstsc's connection-info dialog is a free measurement**: transport
+  protocol, RTT, estimated bandwidth and the refresh rate the client is
+  actually achieving. "6 FPS" there against `frames=289` in our stats is a
+  sentence-long diagnosis.
+
+## Invariants now enforced (keep them)
+
+11. An idle poll is not a grab failure. Only a failed grab counts toward the
+    reconnect threshold; a genuinely dead connection still surfaces because
+    `damage_pending()` returns true on a connection error.
+12. The MIT-SHM segment uses the strict mode where it works and widens only
+    when the server refuses, with `IPC_RMID` as soon as both sides are
+    attached — so the permissive window is closed and a crash cannot leak a
+    20 MB segment.

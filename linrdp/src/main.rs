@@ -328,10 +328,17 @@ async fn main() -> anyhow::Result<()> {
     // the TCP bootstrap PDU and the UDP accept loop, binding the two
     // transports to one session via the security cookie. The event channel
     // connects the tunnel to the session (Soft-Sync + DVC data pump).
-    // LINRDP_NO_UDP=1 skips the listener entirely — TCP-only sessions, used
-    // to bisect transport bugs (a corrupted big frame over the fresh UDP
-    // tunnel makes mstsc fire its CapsAdvertise decoder recovery, which the
-    // session never survives).
+    // LINRDP_NO_UDP=1 skips the listener entirely — TCP-only sessions, kept
+    // as a bisect switch for transport bugs.
+    //
+    // It once carried a note blaming UDP for mstsc's CapsAdvertise decoder
+    // recovery ("a corrupted big frame over the fresh UDP tunnel"). That was
+    // a misattribution: the recovery came from the ClearCodec seqNumber
+    // restarting on every encoder rebuild (MS-RDPEGFX 2.2.4.1) and from two
+    // H.264 encoders feeding the client's single AVC444v2 decoder (2.2.4.6).
+    // With those fixed, UDP was verified working end to end — mstsc reports
+    // "transport protocol: UDP" over a 100 s session with no recovery and no
+    // reset. Do not disable UDP to chase a graphics fault.
     let multitransport = if std::env::var("LINRDP_NO_UDP").as_deref() == Ok("1") {
         tracing::warn!("LINRDP_NO_UDP=1 — UDP disabled, serving TCP-only");
         None

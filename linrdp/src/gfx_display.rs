@@ -1168,7 +1168,16 @@ impl EgfxUpdates {
             pad_height,
         });
 
-        tracing::info!(surface = id, width, height, pad_width, pad_height, "EGFX surface created");
+        tracing::info!(
+            surface = id,
+            width,
+            height,
+            pad_width,
+            pad_height,
+            avc444v2 = self.avc444v2_enabled,
+            avc_disabled = self.avc_disabled,
+            "EGFX surface created"
+        );
         drop(server);
         self.session.drain_and_send(handle);
     }
