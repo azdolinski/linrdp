@@ -1132,7 +1132,15 @@ impl EgfxUpdates {
         let avc444v2_requested = std::env::var("LINRDP_AVC444V2").as_deref() == Ok("1");
         self.avc444v2_enabled = server.supports_avc444v2() && avc444v2_requested;
 
-        let Some(id) = server.create_surface_with_format(pad_width, pad_height, PixelFormat::XRgb) else {
+        // The surface is the REAL desktop, never the 16-aligned encoder size.
+        // MS-RDPEGFX 3.3.8.3.3: "Color conversion MUST be performed for the
+        // entire macroblock, after which the region mask in regionRects MUST
+        // be applied" — the 16-alignment belongs to the encoder, and a region
+        // is free to end at 1800. Sizing the surface to the padding instead
+        // is what put an 8-row strip on screen below a 1800 px desktop,
+        // flipping between black (full ClearCodec paint) and replicated edge
+        // content (motion frames).
+        let Some(id) = server.create_surface_with_format(width, height, PixelFormat::XRgb) else {
             tracing::warn!("EGFX: surface creation failed — legacy path resumes next frame");
             return;
         };
@@ -1309,35 +1317,13 @@ impl EgfxUpdates {
         let Some(surface) = self.surface else { return };
         let Some(mut encoders) = self.take_encoders() else { return };
         let ts = self.timestamp_ms();
-        // A full paint covers the 16-padded surface, not just the real
-        // rows: v2 motion frames paint the padding too (16-aligned region
-        // rects), so an unpainted padding strip would flicker between
-        // stale-surface black and content on every motion/idle transition.
+        // A full paint covers the real desktop rows. The encoder's 16-aligned
+        // padding is never part of the surface any more, so there is nothing
+        // below `frame_h` to keep painted.
         let full = x == 0 && y == 0 && w == frame_w && h == frame_h;
-        let (x, y, w, h) = if full {
-            (0u16, 0u16, surface.pad_width, surface.pad_height)
-        } else {
-            (x, y, w, h)
-        };
 
         let joined = tokio::task::spawn_blocking(move || {
-            let bgra = if full && (w != frame_w || h != frame_h) {
-                // Full paint of the padded surface: the padding rows are
-                // BLACK — constant in every frame (no flicker), and reads
-                // as part of the dark theme rather than a duplicated edge.
-                let mut padded = vec![0u8; usize::from(w) * usize::from(h) * 4];
-                for row in 0..usize::from(h) {
-                    let src_row = row.min(usize::from(frame_h) - 1);
-                    let start = src_row * usize::from(frame_w) * 4;
-                    let copy_w = (usize::from(frame_w) * 4).min(usize::from(w) * 4);
-                    padded[row * usize::from(w) * 4..row * usize::from(w) * 4 + copy_w]
-                        .copy_from_slice(&data[start..start + copy_w]);
-                }
-                for px in padded.chunks_exact_mut(4) {
-                    px[3] = 0xFF;
-                }
-                padded
-            } else if full {
+            let bgra = if full {
                 // Whole frame: just force the alpha byte opaque in place.
                 let mut bgra = data;
                 for px in bgra.chunks_exact_mut(4) {
@@ -1502,24 +1488,12 @@ impl EgfxUpdates {
             return; // encoder skipped unchanged input
         }
 
-        // Region rects must equal the surface dims in the v2 envelope —
-        // mstsc rejects mismatched v2 regions (1800/1792 tripped 0xD06; the
-        // real-dims 1800 region on the padded 1808 surface fired its decoder
-        // recovery in every session). The bottom padding strip is kept
-        // invisible by the converters, which fill it with replicated edge
-        // content instead of black. v1 has no such constraint: its regions
-        // cover the real rows and the padding is never composited.
-        let (region_right, region_bottom): (u16, u16) = if avc444v2 {
-            (
-                pw.try_into().unwrap_or(u16::MAX),
-                ph.try_into().unwrap_or(u16::MAX),
-            )
-        } else {
-            (
-                w.try_into().unwrap_or(u16::MAX),
-                h.try_into().unwrap_or(u16::MAX),
-            )
-        };
+        // Region rects cover the real desktop, for both v1 and v2. The
+        // encoder works on the 16-aligned buffer, but MS-RDPEGFX 3.3.8.3.3
+        // applies regionRects as a mask AFTER whole-macroblock conversion, so
+        // a region ending on an unaligned row is exactly what the spec
+        // intends — and the padding never reaches the screen.
+        let (region_right, region_bottom): (u16, u16) = (w, h);
         let region = Avc420Region {
             left: 0,
             top: 0,
