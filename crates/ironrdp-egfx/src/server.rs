@@ -89,7 +89,7 @@ const SUSPEND_FRAME_ACK_QUEUE_DEPTH: u32 = 0xFFFFFFFF;
 /// Client decode-queue depth (bytes) at which the server starts skipping
 /// frames: above ~one 4K frame of pending content mstsc's software decoder
 /// is demonstrably behind, and pushing further kills it.
-const CLIENT_QUEUE_BACKOFF: u32 = 800_000;
+const CLIENT_QUEUE_BACKOFF: u32 = 250_000;
 
 /// Pre-encoded ZGFX-wrapped bytes for DVC transmission.
 ///

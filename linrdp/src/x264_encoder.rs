@@ -42,13 +42,15 @@ impl X264Encoder {
             // ABR at the adaptive bitrate target; VBV bounds bursts.
             .bitrate(kbps)
             .vbv(kbps * 2, kbps * 4)
-            // All-intra: every frame is an independent IDR. Temporal
-            // prediction across screen frames makes static dark areas pump
-            // (per-frame requantization of unchanged pixels, the flicker
-            // the user sees on panels/black backgrounds); with all-intra
-            // identical content encodes to identical output every frame.
-            .max_keyframe_interval(1)
-            .min_keyframe_interval(1)
+            // Normal GOP: IDR every ~250 frames, P-frames in between.
+            // With the per-substream encoders each stream restarts cleanly
+            // from its own IDR, and P-frames keep the busy-desktop bitrate
+            // inside mstsc's software decode budget (all-intra pushed
+            // 27 full SPS+PPS+IDR stream restarts per second at ~36 Mbps).
+            // Static content P-frames are skip-coded — near-zero bits, no
+            // pump on unchanged regions.
+            .max_keyframe_interval(250)
+            .min_keyframe_interval(250)
             .annexb(true)
             .build(Colorspace::I420, i32::from(width), i32::from(height))
             .map_err(|e| anyhow::anyhow!("x264 setup: {e:?}"))
@@ -108,5 +110,87 @@ impl X264Encoder {
     /// Request a keyframe on the next encode (encoder recreation).
     pub fn force_intra(&mut self) {
         self.needs_recreate = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Annex-B NAL unit types in stream order (start-code prefixed).
+    fn nal_types(stream: &[u8]) -> Vec<u8> {
+        let mut types = Vec::new();
+        let mut i = 0;
+        while i + 3 <= stream.len() {
+            let sc = if stream[i..].starts_with(&[0, 0, 0, 1]) {
+                4
+            } else if stream[i..].starts_with(&[0, 0, 1]) {
+                3
+            } else {
+                i += 1;
+                continue;
+            };
+            i += sc;
+            if i < stream.len() {
+                types.push(stream[i] & 0x1F);
+            }
+        }
+        types
+    }
+
+    fn pseudo_frame(seed: u32, w: usize, h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let mut s = seed | 1;
+        let mut next = move || {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (s >> 16) as u8
+        };
+        let y: Vec<u8> = (0..w * h).map(|_| next()).collect();
+        let u: Vec<u8> = (0..w * h / 4).map(|_| next()).collect();
+        let v: Vec<u8> = (0..w * h / 4).map(|_| next()).collect();
+        (y, u, v)
+    }
+
+    /// [MS-RDPEGFX 2.2.4.6]: each substream is decoded by its own decoder,
+    /// so BOTH streams must start with SPS/PPS + IDR. This simulates the
+    /// session flow: 30 luma-only lead frames, then the first dual-view
+    /// frame — the chroma encoder's first-ever use. Its first output MUST
+    /// be an IDR even though the encoder was created long before.
+    #[test]
+    fn chroma_substream_starts_with_idr_after_luma_lead() {
+        const W: usize = 320;
+        const H: usize = 320;
+        let (mut luma, mut chroma) =
+            crate::gfx_display::make_h264_encoder(6_000_000, 30.0, W as u16, H as u16).unwrap();
+
+        // Luma-only lead: chroma encoder receives nothing yet.
+        let mut first_luma_types = Vec::new();
+        for i in 0..30 {
+            let (y, u, v) = pseudo_frame(i + 1, W, H);
+            let bs = luma.encode_planes(&y, &u, &v);
+            assert!(!bs.is_empty(), "luma frame {i}");
+            if i == 0 {
+                first_luma_types = nal_types(&bs);
+                assert!(first_luma_types.contains(&7) && first_luma_types.contains(&8),
+                    "luma stream must start with SPS+PPS, got {first_luma_types:?}");
+                assert!(first_luma_types.contains(&5),
+                    "luma stream must start with IDR, got {first_luma_types:?}");
+            }
+        }
+
+        // First dual-view frame: chroma encoder's first use.
+        let (y, u, v) = pseudo_frame(31, W, H);
+        let _lbs = luma.encode_planes(&y, &u, &v);
+        let cbs = chroma.encode_planes(&y, &u, &v);
+        assert!(!cbs.is_empty(), "chroma bitstream empty on first use");
+        let types = nal_types(&cbs);
+        assert!(types.contains(&7) && types.contains(&8),
+                "chroma stream must start with SPS+PPS, got {types:?}");
+        assert!(types.contains(&5), "chroma stream must start with IDR, got {types:?}");
+
+        // Subsequent chroma frames are P-frames (no IDR churn).
+        let (y, u, v) = pseudo_frame(32, W, H);
+        let cbs2 = chroma.encode_planes(&y, &u, &v);
+        let types2 = nal_types(&cbs2);
+        assert!(!types2.contains(&5), "second chroma frame must not be IDR, got {types2:?}");
     }
 }

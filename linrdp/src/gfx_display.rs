@@ -205,7 +205,15 @@ const MAX_VALID_RTT_MS: f64 = 60_000.0;
 
 /// CPU-heavy encoders, moved in and out of `spawn_blocking` per frame.
 struct Encoders {
-    h264: Option<X264Encoder>,
+    /// Luma-view H.264 stream (the main YUV420 view, bitstream 1).
+    luma: Option<X264Encoder>,
+    /// Chroma-view H.264 stream (the auxiliary view, bitstream 2).
+    /// [MS-RDPEGFX 2.2.4.6]: the client feeds each substream to its own
+    /// decoder instance, so every substream must be independently decodable
+    /// from its first frame — a fresh encoder emits an IDR first, which is
+    /// exactly the guarantee this needs (the chroma view starts mid-session,
+    /// after the luma-only lead).
+    chroma: Option<X264Encoder>,
     clear: ClearCodecEncoder,
 }
 
@@ -256,14 +264,22 @@ pub(crate) trait DisplaySourceFactory: Send + Sync + 'static {
 /// with zero-latency tuning (no B-frames, no lookahead — interactive), full
 /// multithreading. Annex-B output with in-band SPS/PPS at each IDR.
 #[must_use]
-fn make_h264_encoder(
+pub(crate) fn make_h264_encoder(
     target_bitrate: u32,
     rc_fps: f32,
     pw: u16,
     ph: u16,
-) -> anyhow::Result<crate::x264_encoder::X264Encoder> {
-    crate::x264_encoder::X264Encoder::new(target_bitrate, rc_fps, pw, ph)
-        .context("x264 encoder init")
+) -> anyhow::Result<(crate::x264_encoder::X264Encoder, crate::x264_encoder::X264Encoder)> {
+    // One encoder per substream ([MS-RDPEGFX 2.2.4.6]): the luma and chroma
+    // views are unrelated images — feeding them alternately through a single
+    // encoder corrupts the P-frame references of both, and leaves the chroma
+    // decoder starting on a non-IDR frame (a fresh encoder's first frame is
+    // an IDR, which is the start-of-stream guarantee the spec requires).
+    let luma = crate::x264_encoder::X264Encoder::new(target_bitrate, rc_fps, pw, ph)
+        .context("x264 luma encoder init")?;
+    let chroma = crate::x264_encoder::X264Encoder::new(target_bitrate, rc_fps, pw, ph)
+        .context("x264 chroma encoder init")?;
+    Ok((luma, chroma))
 }
 
 /// Display backend that routes frames over EGFX when available.
@@ -958,11 +974,13 @@ impl EgfxUpdates {
         // encoder re-create) to resync against.
         if self.session.take_force_idr() {
             tracing::info!("caps re-advertised — forcing an IDR, surface untouched");
-            if let Some(Encoders {
-                h264: Some(h264), ..
-            }) = self.encoders.as_mut()
-            {
-                h264.force_intra();
+            if let Some(Encoders { luma, chroma, .. }) = self.encoders.as_mut() {
+                if let Some(enc) = luma {
+                    enc.force_intra();
+                }
+                if let Some(enc) = chroma {
+                    enc.force_intra();
+                }
             }
             self.pending_full = true;
         }
@@ -987,11 +1005,13 @@ impl EgfxUpdates {
         if generation_changed || size_changed {
             self.ensure_surface(handle, grab.width, grab.height);
             self.generation = Some(Arc::clone(handle));
-            if let Some(Encoders {
-                h264: Some(h264), ..
-            }) = self.encoders.as_mut()
-            {
-                h264.force_intra();
+            if let Some(Encoders { luma, chroma, .. }) = self.encoders.as_mut() {
+                if let Some(enc) = luma {
+                    enc.force_intra();
+                }
+                if let Some(enc) = chroma {
+                    enc.force_intra();
+                }
             }
             self.pending_full = true;
         }
@@ -1014,11 +1034,13 @@ impl EgfxUpdates {
                     "EGFX surface vanished (client re-advertised caps) — re-creating"
                 );
                 self.surface = None;
-                if let Some(Encoders {
-                    h264: Some(h264), ..
-                }) = self.encoders.as_mut()
-                {
-                    h264.force_intra();
+                if let Some(Encoders { luma, chroma, .. }) = self.encoders.as_mut() {
+                    if let Some(enc) = luma {
+                        enc.force_intra();
+                    }
+                    if let Some(enc) = chroma {
+                        enc.force_intra();
+                    }
                 }
                 self.ensure_surface(handle, grab.width, grab.height);
                 self.pending_full = true;
@@ -1441,7 +1463,7 @@ impl EgfxUpdates {
         // entirely (first motion frame, post-stall reset), or built at a
         // config that drifted from the current adaptive target.
         let bitrate_stale = match (
-            self.encoders.as_ref().is_some_and(|e| e.h264.is_some()),
+            self.encoders.as_ref().is_some_and(|e| e.luma.is_some()),
             self.enc_built,
         ) {
             (true, Some((built_bitrate, built_rate_fps))) => {
@@ -1463,9 +1485,10 @@ impl EgfxUpdates {
                 surface.pad_width,
                 surface.pad_height,
             ) {
-                Ok(h264) => {
+                Ok((luma, chroma)) => {
                     self.encoders = Some(Encoders {
-                        h264: Some(h264),
+                        luma: Some(luma),
+                        chroma: Some(chroma),
                         clear: ClearCodecEncoder::new(),
                     });
                     self.enc_built = Some((target_bitrate, target_rate_fps));
@@ -1497,26 +1520,22 @@ impl EgfxUpdates {
                     usize::from(ph),
                     luma_only,
                 );
-                // [MS-RDPEGFX 2.2.4.6]: the two substreams are parts of ONE
-                // H.264 stream — encode both views through the single encoder
-                // as consecutive frames. Two independent encoders would emit
-                // interleaved SPS/PPS/IDRs that reset mstsc's decoder every
-                // frame (observed: flickering garbage with periodic correct
-                // ClearCodec repaints).
+                // [MS-RDPEGFX 2.2.4.6]: each substream is decoded by its own
+                // decoder instance and must be independently decodable from
+                // its first frame. Separate encoders keep both P-frame
+                // reference chains clean, and a fresh encoder's first frame
+                // is an IDR — so the chroma view starts with an IDR whenever
+                // it begins (after the luma-only lead, after a rebuild, or
+                // after recovery).
                 let luma_bs = encoders
-                    .h264
+                    .luma
                     .as_mut()
                     .map(|enc| enc.encode_planes(luma.y(), luma.u(), luma.v()));
-                // Chroma rides EVERY v2 frame (LC=0 always): alternating
-                // LC=0/LC=1 made mstsc flip between two chroma renditions
-                // (fresh subframe vs held previous) — the visible flicker of
-                // the bottom line. Deterministic all-intra + CRF keeps the
-                // cost acceptable; drop LINRDP_AVC444V2 to go back to 420.
                 let chroma_bs = if luma_only {
                     None
                 } else {
                     encoders
-                        .h264
+                        .chroma
                         .as_mut()
                         .map(|enc| enc.encode_planes(chroma.y(), chroma.u(), chroma.v()))
                 };
@@ -1524,7 +1543,7 @@ impl EgfxUpdates {
             } else {
                 let yuv = bgrx_to_yuv420(&data, usize::from(w), usize::from(h), usize::from(pw), usize::from(ph));
                 let luma_bs = encoders
-                    .h264
+                    .luma
                     .as_mut()
                     .map(|enc| enc.encode_planes(yuv.y(), yuv.u(), yuv.v()));
                 (encoders, luma_bs, None)
@@ -1635,7 +1654,8 @@ impl EgfxUpdates {
     fn take_encoders(&mut self) -> Option<Encoders> {
         if self.encoders.is_none() {
             self.encoders = Some(Encoders {
-                h264: None,
+                luma: None,
+                chroma: None,
                 clear: ClearCodecEncoder::new(),
             });
         }
