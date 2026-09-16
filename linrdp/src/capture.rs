@@ -410,10 +410,6 @@ struct ShmCapture {
     conn: Arc<x11rb::rust_connection::RustConnection>,
     /// X resource id of the segment on `conn`.
     seg: u32,
-    /// SysV shared memory id. Deliberately NOT RMID'd after attach, so the
-    /// segment can be re-attached on a fresh X connection after a reconnect
-    /// (freed in `Drop` via RMID once both mappings are gone).
-    shmid: i32,
     /// Our mapping of the segment, `size` bytes of ZPixmap data.
     addr: *mut u8,
     size: usize,
@@ -427,14 +423,38 @@ unsafe impl Send for ShmCapture {}
 impl ShmCapture {
     /// Allocate a SysV segment for one `width`×`height` 32-bpp frame and
     /// attach it to the X server. `None` = MIT-SHM unusable right now.
+    ///
+    /// The segment mode matters: linrdp usually runs as root while the X
+    /// server runs as the desktop user, and a root-owned 0600 segment is
+    /// un-attachable by that server — `ShmAttach` fails with `BadAccess`, SHM
+    /// is written off, and every grab falls back to a core-protocol GetImage
+    /// of the whole screen (~20 MB at 2880x1800, ~50x a second). That flood
+    /// wedges the X connection every few seconds, and each recovery forces a
+    /// full lossless repaint. So: try the strict mode first and only widen it
+    /// when the server actually refuses.
     fn create(conn: &Arc<x11rb::rust_connection::RustConnection>, width: u16, height: u16) -> Option<Self> {
         let size = usize::from(width) * usize::from(height) * 4;
         // Extension present at all? (Missing MIT-SHM makes every request fail.)
         shm::query_version(conn).ok()?.reply().ok()?;
 
+        // 0600 keeps the framebuffer private when the X server shares our uid.
+        // 0666 is the fallback for a cross-uid server; the window in which it
+        // is world-attachable is closed immediately below by IPC_RMID, which
+        // makes the segment unreachable to any process not already attached.
+        for mode in [0o600, 0o666] {
+            if let Some(capture) = Self::try_attach(conn, size, mode) {
+                return Some(capture);
+            }
+        }
+        None
+    }
+
+    /// One shmget/shmat/ShmAttach attempt at `mode`. Cleans up fully on any
+    /// failure so the caller can retry with different permissions.
+    fn try_attach(conn: &Arc<x11rb::rust_connection::RustConnection>, size: usize, mode: i32) -> Option<Self> {
         // SAFETY: plain SysV shmget with a private key; no invariants beyond
         // the size, and failures are reported by the negative return value.
-        let shmid = unsafe { libc::shmget(libc::IPC_PRIVATE, size, 0o600 | libc::IPC_CREAT) };
+        let shmid = unsafe { libc::shmget(libc::IPC_PRIVATE, size, mode | libc::IPC_CREAT) };
         if shmid < 0 {
             return None;
         }
@@ -481,10 +501,16 @@ impl ShmCapture {
             }
         }
 
+        // Both sides are attached: destroy the name now (the standard MIT-SHM
+        // contract). The memory lives until the last attachment drops, but no
+        // further process can reach it, and a crash can no longer leak the
+        // segment — a reconnect always builds a fresh one anyway.
+        // SAFETY: `shmid` is valid and attached by us and by the X server.
+        unsafe { libc::shmctl(shmid, libc::IPC_RMID, core::ptr::null_mut()) };
+
         Some(Self {
             conn: Arc::clone(conn),
             seg,
-            shmid,
             addr: addr.cast(),
             size,
         })
@@ -502,11 +528,9 @@ impl Drop for ShmCapture {
     fn drop(&mut self) {
         // SAFETY: `addr` came from shmat and is detached exactly once here.
         unsafe { libc::shmdt(self.addr.cast()) };
-        // Mark the segment for destruction: with our mapping gone and the X
-        // server's attachment dying with the connection, the kernel frees it.
-        // Best effort — a dead connection releases its attachment anyway.
-        // SAFETY: `shmid` is our still-valid SysV id (never RMID'd before).
-        unsafe { libc::shmctl(self.shmid, libc::IPC_RMID, core::ptr::null_mut()) };
+        // No IPC_RMID here: `try_attach` already destroyed the name once both
+        // sides were attached. Dropping our mapping and the server's
+        // attachment is what actually frees the memory.
         let _ = shm::detach(&*self.conn, self.seg);
     }
 }
