@@ -8,6 +8,8 @@
 //! `x-special/gnome-copied-files`, `image/png`, `UTF8_STRING`, …), which is
 //! what makes file and image paste into Linux applications work.
 
+use std::time::{Duration, Instant};
+
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
     Atom, AtomEnum, CreateWindowAux, EventMask, PropMode, SelectionNotifyEvent, SelectionRequestEvent,
@@ -21,6 +23,60 @@ use x11rb::CURRENT_TIME;
 
 /// One offered clipboard target: X11 atom name → payload bytes.
 pub(crate) type SelectionTarget = (String, Vec<u8>);
+
+/// Emit at most one selection-request summary per this interval.
+const REQUEST_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Rate limiter for the selection-request log.
+///
+/// Desktop clipboard managers poll the selection owner continuously — a real
+/// session produced ~3 requests every 0.7 s, non-stop, even with no RDP client
+/// connected: 390k lines and 1.5 GB of log in five days, which buried every
+/// WARN that mattered. `docs/learnings.md`: rate-limit every periodic debug
+/// line.
+#[derive(Default)]
+struct RequestLog {
+    served: u64,
+    refused: u64,
+    /// Target names seen since the last summary (bounded; diagnostics only).
+    targets: Vec<String>,
+    last: Option<Instant>,
+}
+
+impl RequestLog {
+    fn record(&mut self, target: &str, served: bool) {
+        if served {
+            self.served += 1;
+        } else {
+            self.refused += 1;
+        }
+        if self.targets.len() < 16 && !self.targets.iter().any(|t| t == target) {
+            self.targets.push(target.to_owned());
+        }
+
+        let now = Instant::now();
+        let due = self.last.is_none_or(|last| now.duration_since(last) >= REQUEST_LOG_INTERVAL);
+        if due {
+            self.last = Some(now);
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.served == 0 && self.refused == 0 {
+            return;
+        }
+        tracing::debug!(
+            served = self.served,
+            refused = self.refused,
+            targets = ?self.targets,
+            "clipboard: X11 selection requests"
+        );
+        self.served = 0;
+        self.refused = 0;
+        self.targets.clear();
+    }
+}
 
 /// Resolve an atom back to the name we interned for it (diagnostics only).
 fn atom_name(atoms: &[(Atom, String, Vec<u8>)], atom: Atom) -> String {
@@ -162,6 +218,7 @@ fn run(display: &str, targets: Vec<SelectionTarget>) {
     }
     tracing::debug!(count = atoms.len(), "clipboard: owning X11 CLIPBOARD selection");
 
+    let mut request_log = RequestLog::default();
     loop {
         let event = match conn.wait_for_event() {
             Ok(event) => event,
@@ -172,7 +229,7 @@ fn run(display: &str, targets: Vec<SelectionTarget>) {
         };
         match event {
             Event::SelectionRequest(request) => {
-                handle_request(&conn, clipboard, targets_atom, &atoms, request);
+                handle_request(&conn, clipboard, targets_atom, &atoms, request, &mut request_log);
             }
             Event::SelectionClear(_) => {
                 tracing::debug!("clipboard: X11 CLIPBOARD ownership lost (new copy elsewhere)");
@@ -181,6 +238,7 @@ fn run(display: &str, targets: Vec<SelectionTarget>) {
             _ => {}
         }
     }
+    request_log.flush();
 }
 
 fn intern(conn: &RustConnection, name: &[u8]) -> Atom {
@@ -197,6 +255,7 @@ fn handle_request(
     targets_atom: Atom,
     atoms: &[(Atom, String, Vec<u8>)],
     request: SelectionRequestEvent,
+    log: &mut RequestLog,
 ) {
     // ICCCM 2.3.1: a property of None means the requestor supports only the
     // (obsolete) pre-ICCCM protocol — answer on the target atom instead.
@@ -219,7 +278,7 @@ fn handle_request(
                 .is_ok();
         }
     }
-    tracing::debug!(target = %atom_name(atoms, request.target), served, "clipboard: X11 selection request");
+    log.record(&atom_name(atoms, request.target), served);
 
     let notify = SelectionNotifyEvent {
         response_type: SELECTION_NOTIFY_EVENT,

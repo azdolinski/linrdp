@@ -205,15 +205,14 @@ const MAX_VALID_RTT_MS: f64 = 60_000.0;
 
 /// CPU-heavy encoders, moved in and out of `spawn_blocking` per frame.
 struct Encoders {
-    /// Luma-view H.264 stream (the main YUV420 view, bitstream 1).
-    luma: Option<X264Encoder>,
-    /// Chroma-view H.264 stream (the auxiliary view, bitstream 2).
-    /// [MS-RDPEGFX 2.2.4.6]: the client feeds each substream to its own
-    /// decoder instance, so every substream must be independently decodable
-    /// from its first frame — a fresh encoder emits an IDR first, which is
-    /// exactly the guarantee this needs (the chroma view starts mid-session,
-    /// after the luma-only lead).
-    chroma: Option<X264Encoder>,
+    /// The single H.264 stream.
+    ///
+    /// [MS-RDPEGFX 2.2.4.5/2.2.4.6]: the two AVC444 subframes "MUST be
+    /// encoded using the same MPEG-4 AVC/H.264 encoder and decoded by a
+    /// single MPEG-4 AVC/H.264 decoder as one stream". For a v2 frame the
+    /// luma view and the chroma view are therefore two consecutive frames of
+    /// THIS stream — never two streams.
+    h264: Option<X264Encoder>,
     clear: ClearCodecEncoder,
 }
 
@@ -269,17 +268,14 @@ pub(crate) fn make_h264_encoder(
     rc_fps: f32,
     pw: u16,
     ph: u16,
-) -> anyhow::Result<(crate::x264_encoder::X264Encoder, crate::x264_encoder::X264Encoder)> {
-    // One encoder per substream ([MS-RDPEGFX 2.2.4.6]): the luma and chroma
-    // views are unrelated images — feeding them alternately through a single
-    // encoder corrupts the P-frame references of both, and leaves the chroma
-    // decoder starting on a non-IDR frame (a fresh encoder's first frame is
-    // an IDR, which is the start-of-stream guarantee the spec requires).
-    let luma = crate::x264_encoder::X264Encoder::new(target_bitrate, rc_fps, pw, ph)
-        .context("x264 luma encoder init")?;
-    let chroma = crate::x264_encoder::X264Encoder::new(target_bitrate, rc_fps, pw, ph)
-        .context("x264 chroma encoder init")?;
-    Ok((luma, chroma))
+) -> anyhow::Result<crate::x264_encoder::X264Encoder> {
+    // ONE encoder for the whole session ([MS-RDPEGFX 2.2.4.5/2.2.4.6]): both
+    // AVC444 subframes must come from the same encoder because the client
+    // feeds them to a single decoder. Two encoders each emit their own
+    // SPS/PPS/IDR and their own frame_num sequence; interleaved into one
+    // decoder the second IDR flushes the DPB and the next P-frame of the
+    // other view references a picture that is gone.
+    crate::x264_encoder::X264Encoder::new(target_bitrate, rc_fps, pw, ph).context("x264 encoder init")
 }
 
 /// Display backend that routes frames over EGFX when available.
@@ -362,9 +358,7 @@ impl RdpServerDisplay for EgfxDisplay {
             avc_disabled: false,
             started: Instant::now(),
             avc444v2_enabled: false,
-            avc444v2_luma_only: false,
-            v2_start_luma: 0,
-            v2_luma_lead: 0,
+            clear_seq: 0,
             stat_frames: 0,
             stat_h264: 0,
             stat_clear: 0,
@@ -460,16 +454,12 @@ struct EgfxUpdates {
     /// Client negotiated cap version >= 10.6: the AVC444v2 chroma layout may
     /// be used for motion frames.
     avc444v2_enabled: bool,
-    /// When set, v2 frames carry the luma substream only (LC=1) — bisect
-    /// mode for the v2 envelope vs chroma packing.
-    avc444v2_luma_only: bool,
-    /// LINRDP_V2_START_LUMA=N: send N luma-only (LC=1) v2 frames of a fresh
-    /// surface before the first dual-view (LC=0) frame. mstsc's v2 decoder
-    /// bootstrap: every session whose FIRST frame was dual-view died in its
-    /// CapsAdvertise recovery; healthy sessions started luma-only.
-    v2_start_luma: u32,
-    /// Remaining luma-only lead frames for the current surface.
-    v2_luma_lead: u32,
+    /// MS-RDPEGFX 2.2.4.1 ClearCodec `seqNumber` for this session: the first
+    /// message is 0 and every later one is the previous plus one (wrapping at
+    /// 0xFF). Owned here rather than inside `Encoders` because that struct is
+    /// rebuilt mid-session; a restarted counter is a protocol violation the
+    /// client answers with a pipeline reset and then a disconnect.
+    clear_seq: u8,
     started: Instant,
     stat_frames: u64,
     stat_h264: u64,
@@ -969,22 +959,6 @@ impl EgfxUpdates {
 
     /// Process one grab through the graphics pipeline.
     async fn egfx_frame(&mut self, handle: &GfxHandle, grab: Grab) {
-        // The client re-advertised caps mid-session (decoder recovery): the
-        // surface stays, but the decoder gets a fresh IDR (new SPS/PPS via an
-        // encoder re-create) to resync against.
-        if self.session.take_force_idr() {
-            tracing::info!("caps re-advertised — forcing an IDR, surface untouched");
-            if let Some(Encoders { luma, chroma, .. }) = self.encoders.as_mut() {
-                if let Some(enc) = luma {
-                    enc.force_intra();
-                }
-                if let Some(enc) = chroma {
-                    enc.force_intra();
-                }
-            }
-            self.pending_full = true;
-        }
-
         // New connection or screen resize: re-create the surface.
         let generation_changed = !self.generation.as_ref().is_some_and(|g| Arc::ptr_eq(g, handle));
         let size_changed = !self
@@ -1005,13 +979,8 @@ impl EgfxUpdates {
         if generation_changed || size_changed {
             self.ensure_surface(handle, grab.width, grab.height);
             self.generation = Some(Arc::clone(handle));
-            if let Some(Encoders { luma, chroma, .. }) = self.encoders.as_mut() {
-                if let Some(enc) = luma {
-                    enc.force_intra();
-                }
-                if let Some(enc) = chroma {
-                    enc.force_intra();
-                }
+            if let Some(Encoders { h264: Some(enc), .. }) = self.encoders.as_mut() {
+                enc.force_intra();
             }
             self.pending_full = true;
         }
@@ -1034,13 +1003,16 @@ impl EgfxUpdates {
                     "EGFX surface vanished (client re-advertised caps) — re-creating"
                 );
                 self.surface = None;
-                if let Some(Encoders { luma, chroma, .. }) = self.encoders.as_mut() {
-                    if let Some(enc) = luma {
-                        enc.force_intra();
-                    }
-                    if let Some(enc) = chroma {
-                        enc.force_intra();
-                    }
+                // MS-RDPEGFX 3.2.5.18 resets the client to its initial state,
+                // which includes the ClearCodec sequence and glyph cache: the
+                // next message must be seqNumber 0 and must not reference a
+                // cached glyph.
+                self.clear_seq = 0;
+                if let Some(encoders) = self.encoders.as_mut() {
+                    encoders.clear.reset_session();
+                }
+                if let Some(Encoders { h264: Some(enc), .. }) = self.encoders.as_mut() {
+                    enc.force_intra();
                 }
                 self.ensure_surface(handle, grab.width, grab.height);
                 self.pending_full = true;
@@ -1170,23 +1142,20 @@ impl EgfxUpdates {
         if self.avc_disabled {
             tracing::warn!("EGFX: client has AVC disabled — using lossless ClearCodec only");
         }
-        // AVC444v2 is opt-in while the v2 stream is being validated against
-        // mstsc's strict decoder: LINRDP_AVC444V2=1 enables it, and
-        // LINRDP_AVC444V2_LUMA_ONLY=1 narrows it to luma-only subframes
-        // (LC=1) — the bisect switch separating the v2 PDU envelope from the
-        // chroma-view packing.
+        // AVC444v2 (4:4:4 color) is opt-in while the v2 stream is validated
+        // against mstsc's decoder: LINRDP_AVC444V2=1 enables it.
         let avc444v2_requested = std::env::var("LINRDP_AVC444V2").as_deref() == Ok("1");
-        let luma_only = std::env::var("LINRDP_AVC444V2_LUMA_ONLY").as_deref() == Ok("1");
-        let v2_start_luma = std::env::var("LINRDP_V2_START_LUMA")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(30);
         self.avc444v2_enabled = server.supports_avc444v2() && avc444v2_requested;
-        self.avc444v2_luma_only = luma_only;
-        self.v2_start_luma = v2_start_luma;
-        self.v2_luma_lead = v2_start_luma;
 
-        let Some(id) = server.create_surface_with_format(pad_width, pad_height, PixelFormat::XRgb) else {
+        // The surface is the REAL desktop, never the 16-aligned encoder size.
+        // MS-RDPEGFX 3.3.8.3.3: "Color conversion MUST be performed for the
+        // entire macroblock, after which the region mask in regionRects MUST
+        // be applied" — the 16-alignment belongs to the encoder, and a region
+        // is free to end at 1800. Sizing the surface to the padding instead
+        // is what put an 8-row strip on screen below a 1800 px desktop,
+        // flipping between black (full ClearCodec paint) and replicated edge
+        // content (motion frames).
+        let Some(id) = server.create_surface_with_format(width, height, PixelFormat::XRgb) else {
             tracing::warn!("EGFX: surface creation failed — legacy path resumes next frame");
             return;
         };
@@ -1363,35 +1332,22 @@ impl EgfxUpdates {
         let Some(surface) = self.surface else { return };
         let Some(mut encoders) = self.take_encoders() else { return };
         let ts = self.timestamp_ms();
-        // A full paint covers the 16-padded surface, not just the real
-        // rows: v2 motion frames paint the padding too (16-aligned region
-        // rects), so an unpainted padding strip would flicker between
-        // stale-surface black and content on every motion/idle transition.
+        // MS-RDPEGFX 2.2.4.1: seqNumber is a SESSION counter — "the value of
+        // the seqNumber field MUST be equal to the value of the seqNumber
+        // field in the previous ClearCodec message plus one". The encoder
+        // object is rebuilt under us (adaptive bitrate, a lost blocking task),
+        // so the counter is owned here and stamped on every encode; it is
+        // committed further down only once the frame actually reaches the
+        // wire, because a frame dropped by backpressure must not burn a
+        // number the client will never see.
+        encoders.clear.set_sequence(self.clear_seq);
+        // A full paint covers the real desktop rows. The encoder's 16-aligned
+        // padding is never part of the surface any more, so there is nothing
+        // below `frame_h` to keep painted.
         let full = x == 0 && y == 0 && w == frame_w && h == frame_h;
-        let (x, y, w, h) = if full {
-            (0u16, 0u16, surface.pad_width, surface.pad_height)
-        } else {
-            (x, y, w, h)
-        };
 
         let joined = tokio::task::spawn_blocking(move || {
-            let bgra = if full && (w != frame_w || h != frame_h) {
-                // Full paint of the padded surface: the padding rows are
-                // BLACK — constant in every frame (no flicker), and reads
-                // as part of the dark theme rather than a duplicated edge.
-                let mut padded = vec![0u8; usize::from(w) * usize::from(h) * 4];
-                for row in 0..usize::from(h) {
-                    let src_row = row.min(usize::from(frame_h) - 1);
-                    let start = src_row * usize::from(frame_w) * 4;
-                    let copy_w = (usize::from(frame_w) * 4).min(usize::from(w) * 4);
-                    padded[row * usize::from(w) * 4..row * usize::from(w) * 4 + copy_w]
-                        .copy_from_slice(&data[start..start + copy_w]);
-                }
-                for px in padded.chunks_exact_mut(4) {
-                    px[3] = 0xFF;
-                }
-                padded
-            } else if full {
+            let bgra = if full {
                 // Whole frame: just force the alpha byte opaque in place.
                 let mut bgra = data;
                 for px in bgra.chunks_exact_mut(4) {
@@ -1424,6 +1380,16 @@ impl EgfxUpdates {
         drop(server);
 
         if sent.is_some() {
+            // The message is on the wire: the session's next ClearCodec
+            // message carries this one plus one.
+            tracing::debug!(
+                seq = self.clear_seq,
+                full,
+                w,
+                h,
+                "EGFX ClearCodec frame sent"
+            );
+            self.clear_seq = self.clear_seq.wrapping_add(1);
             self.stat_clear += 1;
             self.producer_frames += 1;
             if full {
@@ -1463,7 +1429,7 @@ impl EgfxUpdates {
         // entirely (first motion frame, post-stall reset), or built at a
         // config that drifted from the current adaptive target.
         let bitrate_stale = match (
-            self.encoders.as_ref().is_some_and(|e| e.luma.is_some()),
+            self.encoders.as_ref().is_some_and(|e| e.h264.is_some()),
             self.enc_built,
         ) {
             (true, Some((built_bitrate, built_rate_fps))) => {
@@ -1479,17 +1445,21 @@ impl EgfxUpdates {
             _ => true,
         };
         if bitrate_stale {
+            let encoders_clear = self.encoders.take().map(|e| e.clear);
             match make_h264_encoder(
                 target_bitrate,
                 target_rate_fps,
                 surface.pad_width,
                 surface.pad_height,
             ) {
-                Ok((luma, chroma)) => {
+                Ok(enc) => {
+                    // Carry the ClearCodec encoder across the rebuild: its
+                    // sequence counter and glyph cache belong to the session,
+                    // not to the H.264 encoder's lifetime.
+                    let clear = encoders_clear.unwrap_or_default();
                     self.encoders = Some(Encoders {
-                        luma: Some(luma),
-                        chroma: Some(chroma),
-                        clear: ClearCodecEncoder::new(),
+                        h264: Some(enc),
+                        clear,
                     });
                     self.enc_built = Some((target_bitrate, target_rate_fps));
                 }
@@ -1506,7 +1476,6 @@ impl EgfxUpdates {
         let (pw, ph) = (surface.pad_width, surface.pad_height);
         let ts = self.timestamp_ms();
         let avc444v2 = self.avc444v2_enabled;
-        let luma_only = self.avc444v2_luma_only;
 
         let joined = tokio::task::spawn_blocking(move || {
             // Materialize the bitstreams inside the closure: EncodedBitStream
@@ -1518,32 +1487,24 @@ impl EgfxUpdates {
                     usize::from(h),
                     usize::from(pw),
                     usize::from(ph),
-                    luma_only,
                 );
-                // [MS-RDPEGFX 2.2.4.6]: each substream is decoded by its own
-                // decoder instance and must be independently decodable from
-                // its first frame. Separate encoders keep both P-frame
-                // reference chains clean, and a fresh encoder's first frame
-                // is an IDR — so the chroma view starts with an IDR whenever
-                // it begins (after the luma-only lead, after a rebuild, or
-                // after recovery).
-                let luma_bs = encoders
-                    .luma
-                    .as_mut()
-                    .map(|enc| enc.encode_planes(luma.y(), luma.u(), luma.v()));
-                let chroma_bs = if luma_only {
-                    None
-                } else {
-                    encoders
-                        .chroma
-                        .as_mut()
-                        .map(|enc| enc.encode_planes(chroma.y(), chroma.u(), chroma.v()))
+                // [MS-RDPEGFX 2.2.4.6]: both subframes "MUST be encoded using
+                // the same MPEG-4 AVC/H.264 encoder and decoded by a single
+                // MPEG-4 AVC/H.264 decoder as one stream" — so the luma view
+                // and the chroma view go through THIS encoder back to back,
+                // as two consecutive frames of one stream. The client's single
+                // decoder sees them in the same order, so both sides agree on
+                // the reference chain.
+                let Some(enc) = encoders.h264.as_mut() else {
+                    return (encoders, None, None);
                 };
-                (encoders, luma_bs, chroma_bs)
+                let luma_bs = enc.encode_planes(luma.y(), luma.u(), luma.v());
+                let chroma_bs = enc.encode_planes(chroma.y(), chroma.u(), chroma.v());
+                (encoders, Some(luma_bs), Some(chroma_bs))
             } else {
                 let yuv = bgrx_to_yuv420(&data, usize::from(w), usize::from(h), usize::from(pw), usize::from(ph));
                 let luma_bs = encoders
-                    .luma
+                    .h264
                     .as_mut()
                     .map(|enc| enc.encode_planes(yuv.y(), yuv.u(), yuv.v()));
                 (encoders, luma_bs, None)
@@ -1566,24 +1527,12 @@ impl EgfxUpdates {
             return; // encoder skipped unchanged input
         }
 
-        // Region rects must equal the surface dims in the v2 envelope —
-        // mstsc rejects mismatched v2 regions (1800/1792 tripped 0xD06; the
-        // real-dims 1800 region on the padded 1808 surface fired its decoder
-        // recovery in every session). The bottom padding strip is kept
-        // invisible by the converters, which fill it with replicated edge
-        // content instead of black. v1 has no such constraint: its regions
-        // cover the real rows and the padding is never composited.
-        let (region_right, region_bottom): (u16, u16) = if avc444v2 {
-            (
-                pw.try_into().unwrap_or(u16::MAX),
-                ph.try_into().unwrap_or(u16::MAX),
-            )
-        } else {
-            (
-                w.try_into().unwrap_or(u16::MAX),
-                h.try_into().unwrap_or(u16::MAX),
-            )
-        };
+        // Region rects cover the real desktop, for both v1 and v2. The
+        // encoder works on the 16-aligned buffer, but MS-RDPEGFX 3.3.8.3.3
+        // applies regionRects as a mask AFTER whole-macroblock conversion, so
+        // a region ending on an unaligned row is exactly what the spec
+        // intends — and the padding never reaches the screen.
+        let (region_right, region_bottom): (u16, u16) = (w, h);
         let region = Avc420Region {
             left: 0,
             top: 0,
@@ -1596,17 +1545,11 @@ impl EgfxUpdates {
         let mut server = handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let sent = if avc444v2 {
-            // Fresh-surface luma-only lead (see `v2_start_luma`): mstsc's v2
-            // decoder must see the luma view before the first dual-view frame.
-            let luma_lead_active = self.v2_luma_lead > 0;
-            let chroma_bitstream = if luma_only || luma_lead_active {
-                Vec::new() // luma substream only (LC=1)
-            } else {
-                chroma_bs.unwrap_or_default()
-            };
-            // LC=1 fallback when the chroma encoder produced nothing: the
-            // client keeps waiting for the chroma view of these updates and
-            // the next v2 frame delivers it.
+            let chroma_bitstream = chroma_bs.unwrap_or_default();
+            // LC=1 fallback when the encoder produced nothing for the chroma
+            // view (MS-RDPEGFX 2.2.4.6, LC value 0x1): the client keeps the
+            // luma update and waits for the matching chroma view in a later
+            // v2 frame.
             if chroma_bitstream.is_empty() {
                 server.send_avc444v2_frame(
                     surface.id,
@@ -1640,9 +1583,6 @@ impl EgfxUpdates {
             self.last_sent += 1;
             self.last_h264 = Instant::now();
             self.pending_full = false;
-            if self.v2_luma_lead > 0 {
-                self.v2_luma_lead -= 1;
-            }
         } else {
             // A frame that never reached the wire breaks the P-frame
             // reference chain: the encoder counts it as history the client's
@@ -1651,13 +1591,8 @@ impl EgfxUpdates {
             // decays, then nothing). The next frame must restart both
             // streams from a clean IDR.
             tracing::warn!("H.264 frame send failed — forcing an IDR on both substreams");
-            if let Some(Encoders { luma, chroma, .. }) = self.encoders.as_mut() {
-                if let Some(enc) = luma {
-                    enc.force_intra();
-                }
-                if let Some(enc) = chroma {
-                    enc.force_intra();
-                }
+            if let Some(Encoders { h264: Some(enc), .. }) = self.encoders.as_mut() {
+                enc.force_intra();
             }
             self.pending_full = true;
         }
@@ -1669,8 +1604,7 @@ impl EgfxUpdates {
     fn take_encoders(&mut self) -> Option<Encoders> {
         if self.encoders.is_none() {
             self.encoders = Some(Encoders {
-                luma: None,
-                chroma: None,
+                h264: None,
                 clear: ClearCodecEncoder::new(),
             });
         }
@@ -1869,10 +1803,9 @@ fn bgrx_to_yuv444v2(
     h: usize,
     pw: usize,
     ph: usize,
-    luma_only: bool,
 ) -> (openh264::formats::YUVBuffer, openh264::formats::YUVBuffer) {
     let mut luma = vec![0u8; 3 * (pw * ph) / 2];
-    let mut chroma = vec![0u8; if luma_only { 0 } else { 3 * (pw * ph) / 2 }];
+    let mut chroma = vec![0u8; 3 * (pw * ph) / 2];
     let (ly, rest) = luma.split_at_mut(pw * ph);
     let (lu, lv) = rest.split_at_mut(pw * ph / 4);
     let (cy, rest2) = chroma.split_at_mut(pw * ph);
@@ -1907,11 +1840,7 @@ fn bgrx_to_yuv444v2(
         {
             let j1 = (j0 + pairs_per_worker).min(pairs);
             scope.spawn(move || {
-                if luma_only {
-                    convert_rows_v2(src, w, h, pw, ly, lu, lv, &mut [], &mut [], &mut [], j0, j1);
-                } else {
-                    convert_rows_v2(src, w, h, pw, ly, lu, lv, cy, cu, cv, j0, j1);
-                }
+                convert_rows_v2(src, w, h, pw, ly, lu, lv, cy, cu, cv, j0, j1);
             });
         }
     });
@@ -2015,9 +1944,6 @@ fn convert_rows_v2(
             luma_u[j_local * half + x2] = u8::try_from(u_sum / 4).unwrap_or(u8::MAX);
             luma_v[j_local * half + x2] = v8_mean(v_sum);
 
-            if chroma_y.is_empty() {
-                continue; // luma-only mode (LC=1 bisect): no chroma view
-            }
             // Chroma view Y, even source row [B4, B5]: odd source columns.
             chroma_y[ye * pw + x2] = u01;
             chroma_y[ye * pw + x2 + half] = v01;
@@ -2067,7 +1993,7 @@ mod avc444v2_tests {
             px[3] = 0xFF;
         }
 
-        let (luma, chroma) = bgrx_to_yuv444v2(&src, w, h, pw, ph, false);
+        let (luma, chroma) = bgrx_to_yuv444v2(&src, w, h, pw, ph);
 
         let (b, g, r) = (i32::from(30), i32::from(160), i32::from(240));
         let y_c = ((54 * r + 183 * g + 18 * b) >> 8).clamp(0, 255) as u8;
@@ -2194,10 +2120,13 @@ mod v2_roundtrip_tests {
     use super::{bgrx_to_yuv444v2, make_h264_encoder};
     use openh264::formats::YUVSource as _;
 
-    /// End-to-end wire-format round trip: source BGRX -> per-view encoders
-    /// -> Annex-B streams on disk, for the ffmpeg-decode + FreeRDP-algorithm
-    /// recombine check (scripts/v2_roundtrip_check.sh). Session flow mirrors
-    /// the live path: luma-only lead frames, then dual-view.
+    /// End-to-end wire-format round trip: source BGRX -> ONE H.264 stream
+    /// carrying both views -> Annex-B on disk, for the ffmpeg-decode +
+    /// FreeRDP-algorithm recombine check (scripts/v2_roundtrip_check.sh).
+    ///
+    /// Mirrors the live path exactly: per MS-RDPEGFX 2.2.4.6 both subframes
+    /// come from the same encoder, so the stream is luma, chroma, luma,
+    /// chroma, … and decodes as one sequence.
     #[test]
     fn v2_roundtrip_writes_artifacts() {
         let (w, h) = (640usize, 480usize);
@@ -2225,11 +2154,10 @@ mod v2_roundtrip_tests {
             }
         }
 
-        let (mut luma_enc, mut chroma_enc) =
-            make_h264_encoder(12_000_000, 30.0, pw as u16, ph as u16).expect("encoders");
+        let mut enc = make_h264_encoder(12_000_000, 30.0, pw as u16, ph as u16).expect("encoder");
 
-        let mut luma_stream: Vec<u8> = Vec::new();
-        let mut chroma_stream: Vec<u8> = Vec::new();
+        // One stream, both views: luma, chroma, luma, chroma, …
+        let mut stream: Vec<u8> = Vec::new();
         for i in 0..8 {
             let mut f = src.clone();
             if i % 2 == 1 {
@@ -2237,15 +2165,11 @@ mod v2_roundtrip_tests {
                     px[0] = px[0].wrapping_add(7);
                 }
             }
-            let (luma, chroma) = bgrx_to_yuv444v2(&f, w, h, pw, ph, false);
-            luma_stream.extend_from_slice(&luma_enc.encode_planes(luma.y(), luma.u(), luma.v()));
-            if i >= 5 {
-                chroma_stream
-                    .extend_from_slice(&chroma_enc.encode_planes(chroma.y(), chroma.u(), chroma.v()));
-            }
+            let (luma, chroma) = bgrx_to_yuv444v2(&f, w, h, pw, ph);
+            stream.extend_from_slice(&enc.encode_planes(luma.y(), luma.u(), luma.v()));
+            stream.extend_from_slice(&enc.encode_planes(chroma.y(), chroma.u(), chroma.v()));
         }
-        std::fs::write("/tmp/v2_luma.h264", &luma_stream).unwrap();
-        std::fs::write("/tmp/v2_chroma.h264", &chroma_stream).unwrap();
+        std::fs::write("/tmp/v2_stream.h264", &stream).unwrap();
 
         let mut ref_planes = Vec::with_capacity(3 * pw * ph);
         for y in 0..h {
@@ -2269,6 +2193,6 @@ mod v2_roundtrip_tests {
             }
         }
         std::fs::write("/tmp/v2_ref.y444", ref_planes).unwrap();
-        assert!(!luma_stream.is_empty() && !chroma_stream.is_empty());
+        assert!(!stream.is_empty());
     }
 }

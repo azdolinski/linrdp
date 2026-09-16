@@ -102,3 +102,72 @@ diagnostics).
 5. Clipboard payload is never fetched eagerly in the session-start window.
 6. XTEST release-all runs at startup, X reconnect, and every client
    Synchronize — held keys from dead sessions must not leak into X.
+
+---
+
+# Learnings — "mstsc disconnects 1-3 s after connect" (2026-09-16)
+
+A second onion, same shape as the black-screen saga: one symptom, three
+independent spec violations stacked on the same trigger. Each fix let the
+session live longer and exposed the next. All three were found by reading
+[MS-RDPEGFX] properly — every one of them is an explicit MUST that the code
+contradicted, twice with a comment asserting the opposite of the spec.
+
+| # | Defect | Spec | Symptom |
+|---|--------|------|---------|
+| 1 | Two x264 encoders, one per AVC444v2 subframe | 2.2.4.5/2.2.4.6: both bitstreams "MUST be encoded using the same MPEG-4 AVC/H.264 encoder and decoded by a single MPEG-4 AVC/H.264 decoder as one stream" | The chroma IDR flushed the client's single decoder DPB; the next luma P-frame referenced a picture that was gone -> decoder fault |
+| 2 | Mid-session CapsAdvertise answered with CapsConfirm and nothing else | 3.2.5.18: the server "MUST also reset the protocol to the initial state and assume that the client has disregarded all the messages sent by the server prior to RDPGFX_CAPS_CONFIRM_PDU" | Frames kept addressing a surface the client had dropped; `unacknowledged` stayed pinned so backpressure wedged. RST ~70 ms after the re-advertise |
+| 3 | ClearCodec `seqNumber` restarted whenever the encoder was rebuilt | 2.2.4.1: "the value of the seqNumber field MUST be equal to the value of the seqNumber field in the previous ClearCodec message plus one" | Adaptive bitrate rebuilt the encoder 7x in 26 s; each rebuild reset the counter to 0, so the next full repaint carried an impossible number -> decoder fault -> (2) -> RST |
+
+Plus the bottom band at 1800 px: the 16-macroblock padding was baked into the
+*surface* and into the region rects, so 8 rows of padding were composited and
+flipped between black and replicated edge content. 3.3.8.3.3 says regionRects
+are a mask applied *after* whole-macroblock conversion — alignment belongs to
+the encoder, and a region may end on an unaligned row.
+
+## What made this take so long
+
+- **A comment in the code asserted the opposite of the spec.**
+  `gfx_display.rs` claimed "[MS-RDPEGFX 2.2.4.6]: each substream is decoded by
+  its own decoder instance", and a unit test *asserted that behavior*. Both
+  had to be deleted before the real fix could compile. A confident citation in
+  a comment is not evidence — open the spec file and read the sentence.
+- **"MS-RDPEGFX does not document the recovery flow explicitly"** was written
+  next to the caps-re-advertise handler. It does, in 3.2.5.18. Grep the spec
+  before concluding it is silent.
+- **390k lines of clipboard polling buried the diagnostics** (1.5 GB of log in
+  five days). The one WARN that mattered was unfindable. Rate-limit really
+  does mean every periodic line.
+
+## Techniques that cracked it
+
+- **Read the live log, not the code's story about itself.** Every fix was
+  pinned to a timestamp: the client's CapsAdvertise 36 ms after a specific
+  frame, the RST 16 ms after the next one.
+- **`queueDepth` in FrameAcknowledge is the client's real health.** A healthy
+  session runs at `queue_depth=0` and ~17 ms ack latency. The dying one showed
+  1.18 MB queued and 650 ms latency.
+- **Correlate the journal with the app log.** x264 prints on every encoder
+  creation, which is how "7 rebuilds in 26 s" — the smoking gun for defect 3 —
+  became visible at all.
+- **Let the fix prove itself in the log.** One `debug!` line per ClearCodec
+  frame carrying its seqNumber turned "is it fixed?" into a glance:
+  `seq=0,1,2,...,36`, no CapsAdvertise, `had_error=false` after 46 s.
+- **Session state vs. object lifetime.** Defect 3 is the general trap: a
+  protocol counter (or cache) that the spec scopes to the *session* must not
+  live inside an object the implementation rebuilds for unrelated reasons. The
+  same rule caught two more instances — a frame dropped by backpressure must
+  not consume a sequence number, and a caps reset must restart it at 0.
+
+## Invariants now enforced (keep them)
+
+7. Both AVC444/AVC444v2 subframes come from ONE H.264 encoder, as consecutive
+   frames of one stream.
+8. A mid-session CapsAdvertise resets the pipeline to its initial state:
+   queued output dropped, surfaces and frame tracker cleared, ResetGraphics
+   forced before the next CreateSurface — and no DeleteSurface on the wire.
+9. The EGFX surface is the real desktop size. Codec alignment padding never
+   leaves the encoder and never appears in a regionRect.
+10. ClearCodec `seqNumber` is session state: stamped per encode, committed
+    only when the frame reaches the wire, carried across encoder rebuilds,
+    reset to 0 (with the glyph cache) only on a client pipeline reset.

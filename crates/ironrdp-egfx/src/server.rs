@@ -2053,32 +2053,46 @@ impl GraphicsPipelineServer {
     // ========================================================================
 
     fn handle_capabilities_advertise(&mut self, pdu: CapabilitiesAdvertisePdu) {
-        // Detect mid-session re-advertise. mstsc (and likely other clients)
-        // emits a fresh CapsAdvertise as a decoder-recovery sequence under
-        // load, typically when its EGFX decoder loses sync after a long
-        // P-slice chain. Before sending CapsAdvertise the client has cleared
-        // its surface/frame/cache state, so the server must mirror that
-        // silently (no DeleteSurface PDUs, the client doesn't have those
-        // surfaces anymore and treats a stray DeleteSurface as a protocol
-        // violation, leading to TCP RST within milliseconds).
+        // Mid-session re-advertise: the client (mstsc, macOS Windows App)
+        // restarts its graphics pipeline this way after a decoder error.
         //
-        // Observed: macOS Windows App and mstsc on Windows 11 both initiate
-        // this sequence. MS-RDPEGFX does not document the recovery flow
-        // explicitly, but the empirical pattern is CapsAdvertise ->
-        // CacheImportOffer -> expect server to emit CapsConfirm +
-        // ResetGraphics + CreateSurface(id=0) + MapSurfaceToOutput + IDR.
+        // MS-RDPEGFX 3.2.5.18: "If the RDPGFX_CAPS_ADVERTISE_PDU is received
+        // again during the session after the initial RDPGFX_CAPS_CONFIRM_PDU
+        // message has been sent with the version field set to
+        // RDPGFX_CAPSET_VERSION103 or later, the server MUST resend the
+        // RDPGFX_CAPS_CONFIRM_PDU message to the client. The server MUST also
+        // reset the protocol to the initial state and assume that the client
+        // has disregarded all the messages sent by the server prior to
+        // RDPGFX_CAPS_CONFIRM_PDU in this channel."
+        //
+        // So everything queued before the confirm is void, every surface is
+        // gone on the client, and no frame we sent will ever be acknowledged.
+        // Leaving that state in place is what killed the session: further
+        // WireToSurface1 commands addressed a surface the client no longer
+        // had, and `unacknowledged` stayed pinned at max_in_flight so
+        // backpressure blocked every frame after it.
         let is_readvertise = self.state == ServerState::Ready;
         if is_readvertise {
-            // Mid-session CapsAdvertise: reply with CapabilitiesConfirm
-            // (sent below) and change NOTHING else. Every flavor of surface
-            // teardown/re-create after it — silent state clear with a
-            // duplicate CreateSurface(0), and the KRdp-style
-            // DeleteSurface+fresh-id sequence alike — ended in an mstsc RST
-            // or a zombie (frames acked, picture frozen). Keeping the
-            // surface and letting the pipeline's forced IDR resync the
-            // decoder is the only behavior mstsc has tolerated. MS-RDPEGFX
-            // 3.3.5: the server MUST resend CapsConfirm on a re-advertise.
-            debug!("EGFX: mid-session CapsAdvertise observed — CapsConfirm only, state untouched");
+            debug!("EGFX: mid-session CapsAdvertise — resetting pipeline state (MS-RDPEGFX 3.2.5.18)");
+
+            // Drop everything queued before the confirm; the client discards
+            // it anyway, and surface commands for surfaces it no longer has
+            // are exactly what trips protocol error 0xD06. Must happen before
+            // CapabilitiesConfirm is pushed below.
+            self.output_queue.clear();
+            // No DeleteSurface on the wire: the client already dropped these
+            // and treats a stray delete as a protocol violation. Surface ids
+            // restart from 0, matching a fresh channel.
+            self.surfaces.reset_for_reinit();
+            self.frames.clear();
+            // Force ResetGraphics ahead of the next CreateSurface.
+            self.reset_graphics_sent = false;
+            if self.compression_mode != CompressionMode::Never {
+                // The client resets its ZGFX decompression history too; a
+                // back-reference into our pre-reset history would decode to
+                // garbage on its side.
+                self.zgfx_compressor = Compressor::new();
+            }
         }
 
         self.handler.capabilities_advertise(&pdu);
@@ -2436,6 +2450,7 @@ mod capability_negotiation_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pdu::{CapabilityVersion, RawCapabilitySet};
 
     struct DefaultsHandler;
 
@@ -2476,6 +2491,88 @@ mod tests {
         let negotiated = negotiate_capabilities(&client_caps, &server_caps).expect("negotiates");
 
         assert!(matches!(negotiated, CapabilitySet::V10_6 { .. }));
+    }
+
+    /// A V10.6 client advertising capabilities, as a raw PDU.
+    fn v10_6_advertise() -> CapabilitiesAdvertisePdu {
+        CapabilitiesAdvertisePdu(vec![RawCapabilitySet::new(
+            CapabilityVersion::V10_6,
+            0u32.to_le_bytes().to_vec(),
+        )])
+    }
+
+    /// MS-RDPEGFX 3.2.5.18: a CapsAdvertise received again mid-session (with
+    /// V10.3 or later confirmed) means the client has disregarded everything
+    /// sent before the confirm. The server must resend CapsConfirm AND reset
+    /// to the initial state.
+    ///
+    /// Regression: the server used to reply with CapsConfirm and keep its
+    /// surfaces and frame tracker. Frames then addressed a surface the client
+    /// no longer had, `in_flight` never drained, and mstsc dropped the
+    /// connection within ~70 ms.
+    #[test]
+    fn mid_session_caps_advertise_resets_pipeline_state() {
+        let mut server = GraphicsPipelineServer::new(Box::new(DefaultsHandler));
+
+        // Initial negotiation, then a surface with a frame in flight.
+        server.handle_capabilities_advertise(v10_6_advertise());
+        server.set_output_dimensions(1920, 1080);
+        let surface_id = server.create_surface(1920, 1080).expect("surface created");
+        assert_eq!(surface_id, 0);
+        server.send_clearcodec_frame(
+            surface_id,
+            ExclusiveRectangle {
+                left: 0,
+                top: 0,
+                right: 16,
+                bottom: 16,
+            },
+            vec![0u8; 8],
+            0,
+        );
+        assert!(server.get_surface(surface_id).is_some());
+        assert!(server.frames.in_flight() > 0, "a frame must be in flight");
+        server.output_queue.clear();
+
+        // Mid-session re-advertise.
+        server.handle_capabilities_advertise(v10_6_advertise());
+
+        assert!(
+            server.get_surface(surface_id).is_none(),
+            "surfaces must be dropped: the client already discarded them"
+        );
+        assert_eq!(
+            server.frames.in_flight(),
+            0,
+            "unacknowledged frames must be cleared, else backpressure wedges forever"
+        );
+
+        let queued: Vec<_> = server.output_queue.drain(..).collect();
+        assert!(
+            matches!(queued.first(), Some(GfxPdu::CapabilitiesConfirm(_))),
+            "CapsConfirm must be the first PDU after the reset, got {:?}",
+            queued.first()
+        );
+        assert!(
+            !queued.iter().any(|pdu| matches!(pdu, GfxPdu::DeleteSurface(_))),
+            "a stray DeleteSurface for a surface the client dropped is a protocol violation"
+        );
+
+        // The rebuild must start from ResetGraphics and surface id 0 again.
+        server.set_output_dimensions(1920, 1080);
+        let rebuilt = server.create_surface(1920, 1080).expect("surface re-created");
+        assert_eq!(rebuilt, 0, "surface ids restart from 0, as on a fresh channel");
+
+        let queued: Vec<_> = server.output_queue.drain(..).collect();
+        let reset_at = queued
+            .iter()
+            .position(|pdu| matches!(pdu, GfxPdu::ResetGraphics(_)))
+            .expect("ResetGraphics must be re-sent before the new surface");
+        let create_at = queued
+            .iter()
+            .position(|pdu| matches!(pdu, GfxPdu::CreateSurface(_)))
+            .expect("CreateSurface queued");
+        assert!(reset_at < create_at, "ResetGraphics must precede CreateSurface");
     }
 
     #[test]

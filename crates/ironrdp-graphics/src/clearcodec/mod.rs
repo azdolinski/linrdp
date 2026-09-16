@@ -523,6 +523,42 @@ impl ClearCodecEncoder {
         out.extend_from_slice(&index.to_le_bytes());
         out
     }
+
+    /// The sequence number the next encoded message will carry.
+    ///
+    /// MS-RDPEGFX 2.2.4.1: "For the first ClearCodec message in the remote
+    /// session, this value MUST be 0x00. In subsequent messages, the value of
+    /// the seqNumber field MUST be equal to the value of the seqNumber field
+    /// in the previous ClearCodec message plus one."
+    ///
+    /// The counter therefore belongs to the SESSION, not to this object. An
+    /// encoder that is rebuilt mid-session (adaptive bitrate, a lost blocking
+    /// task) must carry the sequence over with [`Self::set_sequence`],
+    /// and a message that never reaches the wire must not consume a number.
+    #[must_use]
+    pub fn sequence(&self) -> u8 {
+        self.seq_number
+    }
+
+    /// Restore the session's sequence counter — see [`Self::sequence`].
+    pub fn set_sequence(&mut self, seq: u8) {
+        self.seq_number = seq;
+    }
+
+    /// Return to the state of a brand-new session: sequence at 0 and an empty
+    /// glyph cache.
+    ///
+    /// Required when the client resets the graphics pipeline (MS-RDPEGFX
+    /// 3.2.5.18 — a mid-session CapsAdvertise), because the client discards
+    /// its ClearCodec sequence state and glyph cache along with everything
+    /// else. Keeping our counter running would make the next message violate
+    /// the "previous plus one" rule, and a glyph hit would reference a slot
+    /// the client no longer has.
+    pub fn reset_session(&mut self) {
+        self.seq_number = 0;
+        self.glyph_cache = GlyphCache::new();
+        self.next_glyph_index = 0;
+    }
 }
 
 impl Default for ClearCodecEncoder {
@@ -891,5 +927,81 @@ mod tests {
         for seg in &segments {
             assert_eq!(seg.run_length, 1);
         }
+    }
+
+    /// MS-RDPEGFX 2.2.4.1: seqNumber is a SESSION counter — each ClearCodec
+    /// message carries the previous one plus one, wrapping at 0xFF.
+    ///
+    /// Regression: the encoder lived inside a struct that the display loop
+    /// rebuilt whenever the adaptive bitrate drifted (7 rebuilds in 26 s of a
+    /// real session). Each rebuild restarted the counter at 0, so the next
+    /// full-surface repaint carried a seqNumber the client could not accept —
+    /// mstsc faulted its ClearCodec decoder, reset the graphics pipeline and
+    /// dropped the connection ~20 ms later.
+    #[test]
+    fn sequence_number_survives_an_encoder_rebuild() {
+        let px = vec![0u8; 64 * 64 * 4];
+
+        let mut enc = ClearCodecEncoder::new();
+        for expected in 0..5u8 {
+            let stream = enc.encode(&px, 64, 64);
+            assert_eq!(stream[1], expected, "seqNumber is the second byte");
+        }
+
+        // The display loop rebuilds its encoders; the session counter must be
+        // carried across, not restarted.
+        let carried = enc.sequence();
+        let mut rebuilt = ClearCodecEncoder::new();
+        rebuilt.set_sequence(carried);
+
+        let stream = rebuilt.encode(&px, 64, 64);
+        assert_eq!(stream[1], 5, "a rebuilt encoder must continue the session sequence");
+    }
+
+    /// A message that never reaches the wire (EGFX backpressure drops the
+    /// frame) must not consume a sequence number — the client would see a gap.
+    #[test]
+    fn a_dropped_message_can_replay_its_sequence_number() {
+        let px = vec![0u8; 64 * 64 * 4];
+        let mut enc = ClearCodecEncoder::new();
+
+        let sent = enc.encode(&px, 64, 64);
+        assert_eq!(sent[1], 0);
+
+        // This one is dropped by backpressure: rewind and re-encode.
+        let dropped_at = enc.sequence();
+        let _dropped = enc.encode(&px, 64, 64);
+        enc.set_sequence(dropped_at);
+
+        let next = enc.encode(&px, 64, 64);
+        assert_eq!(next[1], 1, "the dropped number must be reused, not skipped");
+    }
+
+    /// After a client-driven pipeline reset the client is back to its initial
+    /// state (MS-RDPEGFX 3.2.5.18), so the next message must be seqNumber 0
+    /// and must not reference a cached glyph.
+    #[test]
+    fn reset_session_restarts_the_sequence_and_empties_the_glyph_cache() {
+        let px = vec![7u8; 16 * 16 * 4];
+        let mut enc = ClearCodecEncoder::new();
+
+        let first = enc.encode(&px, 16, 16);
+        assert_eq!(first[0] & FLAG_GLYPH_INDEX, FLAG_GLYPH_INDEX, "small bitmaps are cached");
+        let hit = enc.encode(&px, 16, 16);
+        assert_eq!(
+            hit[0] & ironrdp_pdu::codecs::clearcodec::FLAG_GLYPH_HIT,
+            ironrdp_pdu::codecs::clearcodec::FLAG_GLYPH_HIT,
+            "identical bitmap is sent as a glyph hit"
+        );
+
+        enc.reset_session();
+
+        let after = enc.encode(&px, 16, 16);
+        assert_eq!(after[1], 0, "sequence restarts at 0");
+        assert_eq!(
+            after[0] & ironrdp_pdu::codecs::clearcodec::FLAG_GLYPH_HIT,
+            0,
+            "the client dropped its glyph cache, so a hit would dangle"
+        );
     }
 }

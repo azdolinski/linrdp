@@ -109,7 +109,19 @@ impl ConnectionHandler for SessionController {
         duration: Duration,
         error: Option<&ServerError>,
     ) -> PostConnectionAction {
-        let after = self.inner.active.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
+        // `on_connection_info` only counts connections that reached the
+        // ConnectionInfo stage, but `on_disconnected` fires for every
+        // connection — including mstsc's probe, which dies mid-CredSSP with a
+        // BrokenPipe on every single attempt. A plain `fetch_sub` wrapped the
+        // counter (observed: remaining=18446744073709551614), after which
+        // `after == 0` was never true again and `--lock-session` would leave
+        // the desktop unlocked forever. Saturate at zero instead.
+        let after = self
+            .inner
+            .active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| Some(n.saturating_sub(1)))
+            .unwrap_or(0)
+            .saturating_sub(1);
         tracing::info!(
             %peer,
             ?duration,
@@ -168,4 +180,55 @@ async fn call_system_dbus(service: &str, path: &str, iface: &str, method: &str) 
     })
     .await
     .map_err(|_| format!("D-Bus call {timeout_label} timed out"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer() -> SocketAddr {
+        "192.168.1.1:49386".parse().expect("valid addr")
+    }
+
+    /// mstsc opens a probe connection that dies mid-CredSSP on every attempt,
+    /// so `on_disconnected` runs without a matching `on_connection_info`.
+    /// A plain `fetch_sub` wrapped the counter to u64::MAX-ish, after which
+    /// the "last client left" transition never fired again and
+    /// `--lock-session` left the desktop unlocked.
+    #[test]
+    fn disconnect_without_a_counted_connect_keeps_the_counter_at_zero() {
+        let mut ctl = SessionController::new(false, false);
+
+        ctl.on_disconnected(peer(), Duration::from_secs(3), None);
+
+        assert_eq!(
+            ctl.inner.active.load(Ordering::Acquire),
+            0,
+            "the counter must not underflow"
+        );
+    }
+
+    /// And a real session still drives the 0 -> 1 -> 0 transition, even after
+    /// the probe connections above have churned through.
+    #[test]
+    fn counter_still_tracks_real_sessions_after_probe_churn() {
+        let mut ctl = SessionController::new(false, false);
+
+        for _ in 0..3 {
+            ctl.on_disconnected(peer(), Duration::from_secs(3), None);
+        }
+        ctl.on_connection_info(&ConnectionInfo::new(
+            0x0415,
+            ironrdp_pdu::gcc::KeyboardType::IBM_ENHANCED,
+            String::new(),
+        ));
+        assert_eq!(ctl.inner.active.load(Ordering::Acquire), 1);
+
+        ctl.on_disconnected(peer(), Duration::from_secs(60), None);
+        assert_eq!(
+            ctl.inner.active.load(Ordering::Acquire),
+            0,
+            "the last real client must bring the counter back to zero"
+        );
+    }
 }

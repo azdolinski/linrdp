@@ -28,10 +28,6 @@ pub(crate) struct GfxSession {
     /// Set once capability negotiation completes; the display loop switches
     /// from the legacy bitmap path to EGFX frames when this is true.
     ready: AtomicBool,
-    /// Set when the client re-advertises caps mid-session (decoder recovery):
-    /// the display loop's next frame must be a forced IDR so the confused
-    /// decoder can resync. The surface itself is never touched.
-    force_idr: AtomicBool,
     /// Server event channel (set via [`ServerEventSender`]), used to ship
     /// drained EGFX PDUs to the wire.
     sender: Mutex<Option<mpsc::UnboundedSender<ServerEvent>>>,
@@ -42,7 +38,6 @@ impl GfxSession {
         Self {
             handle: Mutex::new(None),
             ready: AtomicBool::new(false),
-            force_idr: AtomicBool::new(false),
             sender: Mutex::new(None),
         }
     }
@@ -54,12 +49,6 @@ impl GfxSession {
 
     pub(crate) fn ready(&self) -> bool {
         self.ready.load(Ordering::Relaxed)
-    }
-
-    /// Take the pending decoder-resync request (set by a mid-session caps
-    /// re-advertise), if any.
-    pub(crate) fn take_force_idr(&self) -> bool {
-        self.force_idr.swap(false, Ordering::Relaxed)
     }
 
     /// Drain the pipeline server's output queue and ship it to the wire via
@@ -95,11 +84,14 @@ impl GraphicsPipelineHandler for LinrdpGfxHandler {
 
     fn on_ready(&mut self, negotiated: &ironrdp_egfx::pdu::CapabilitySet) {
         tracing::info!(?negotiated, "EGFX ready — display switches to the graphics pipeline");
-        // Already ready = mid-session re-advertise (mstsc decoder recovery):
-        // request a forced IDR on the next frame so the decoder can resync.
+        // Already ready = mid-session re-advertise (client decoder recovery).
+        // The pipeline server has already reset itself per MS-RDPEGFX
+        // 3.2.5.18, so our surface is gone: the display loop notices that on
+        // its next tick (`get_surface` returns None) and rebuilds the whole
+        // sequence — ResetGraphics, CreateSurface, MapSurfaceToOutput, full
+        // repaint. Nothing to do here beyond the log.
         if self.session.ready.swap(true, Ordering::Relaxed) {
-            tracing::info!("EGFX re-advertised mid-session — forcing an IDR on the next frame");
-            self.session.force_idr.store(true, Ordering::Relaxed);
+            tracing::info!("EGFX re-advertised mid-session — pipeline state reset, surface will be rebuilt");
         }
     }
 
