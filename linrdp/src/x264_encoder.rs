@@ -42,15 +42,13 @@ impl X264Encoder {
             // ABR at the adaptive bitrate target; VBV bounds bursts.
             .bitrate(kbps)
             .vbv(kbps * 2, kbps * 4)
-            // Normal GOP: IDR every ~10 s of video, P-frames in between.
-            // All-intra (keyint=1) made EVERY frame a full SPS+PPS+IDR
-            // stream restart — mstsc's decoder processed 27 of those per
-            // second on a busy desktop and gave up within seconds (the
-            // terminal mid-session CapsAdvertise). Windows servers do the
-            // same: rare IDRs, skip-coded P-frames of static content are
-            // near-zero bits, so unchanged regions stay flicker-free.
-            .max_keyframe_interval(250)
-            .min_keyframe_interval(250)
+            // All-intra: every frame is an independent IDR. Temporal
+            // prediction across screen frames makes static dark areas pump
+            // (per-frame requantization of unchanged pixels, the flicker
+            // the user sees on panels/black backgrounds); with all-intra
+            // identical content encodes to identical output every frame.
+            .max_keyframe_interval(1)
+            .min_keyframe_interval(1)
             .annexb(true)
             .build(Colorspace::I420, i32::from(width), i32::from(height))
             .map_err(|e| anyhow::anyhow!("x264 setup: {e:?}"))
