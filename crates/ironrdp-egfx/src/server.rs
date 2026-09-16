@@ -86,6 +86,11 @@ const DEFAULT_MAX_FRAMES_IN_FLIGHT: u32 = 3;
 /// Special queue depth value indicating client has disabled acknowledgments
 const SUSPEND_FRAME_ACK_QUEUE_DEPTH: u32 = 0xFFFFFFFF;
 
+/// Client decode-queue depth (bytes) at which the server starts skipping
+/// frames: above ~one 4K frame of pending content mstsc's software decoder
+/// is demonstrably behind, and pushing further kills it.
+const CLIENT_QUEUE_BACKOFF: u32 = 800_000;
+
 /// Pre-encoded ZGFX-wrapped bytes for DVC transmission.
 ///
 /// `Encode::encode()` takes `&self`, but ZGFX wrapping is done in `drain_output()`
@@ -646,6 +651,16 @@ impl FrameTracker {
 
     /// Check if backpressure should be applied
     pub fn should_backpressure(&self) -> bool {
+        // The client's reported decode-queue depth (MS-RDPEGFX 2.2.2.13,
+        // bytes of pending compressed content) is the decoder falling
+        // behind: mstsc's software H.264 decode of dual-stream 4:4:4 is the
+        // bottleneck on a busy desktop, and an unchecked 20+ fps of
+        // all-intra IDR frames runs the queue away until the decoder gives
+        // up (the terminal mid-session CapsAdvertise). Skip frames until it
+        // drains — the backpressure path repaints fully afterwards.
+        if self.client_queue_depth >= CLIENT_QUEUE_BACKOFF {
+            return true;
+        }
         !self.ack_suspended && self.in_flight() >= self.max_in_flight
     }
 
