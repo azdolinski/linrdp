@@ -1144,7 +1144,7 @@ impl EgfxUpdates {
         let v2_start_luma = std::env::var("LINRDP_V2_START_LUMA")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(0);
+            .unwrap_or(30);
         self.avc444v2_enabled = server.supports_avc444v2() && avc444v2_requested;
         self.avc444v2_luma_only = luma_only;
         self.v2_start_luma = v2_start_luma;
@@ -1533,18 +1533,16 @@ impl EgfxUpdates {
             return; // encoder skipped unchanged input
         }
 
-        // AVC444v2 region rects must align to the 16x16 macroblock grid the
-        // decoder works on (an unaligned bottom tripped mstsc into protocol
-        // error 0xD06 + disconnect); the padded surface covers exactly that
-        // grid and the converter fills the padding with replicated edges.
-        let (region_right, region_bottom): (u16, u16) = if avc444v2 {
-            (
-                pw.try_into().unwrap_or(u16::MAX),
-                ph.try_into().unwrap_or(u16::MAX),
-            )
-        } else {
-            (w, h)
-        };
+        // Region rects cover only the REAL desktop rows. The padded surface
+        // gives x264 the 16-aligned macroblock grid it needs, but the padding
+        // rows are fill, not content: a v2 region reaching into them paints
+        // a permanent band across the bottom of mstsc's desktop (the v1 path
+        // always used real dims and never showed one — verified live
+        // 2026-09-16: v1 clean, v2 banded, same padded surface).
+        let (region_right, region_bottom): (u16, u16) = (
+            w.try_into().unwrap_or(u16::MAX),
+            h.try_into().unwrap_or(u16::MAX),
+        );
         let region = Avc420Region {
             left: 0,
             top: 0,
