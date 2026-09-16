@@ -827,8 +827,11 @@ impl ScreenGrabber {
 
     /// Grab the current screen contents and diff them against the previous
     /// grab. Returns `None` on a transient X11 failure (retry next tick).
-    pub(crate) fn poll(&mut self) -> Option<Grab> {
-        let outcome = self.poll_inner();
+    ///
+    /// `debt_due` tells the grabber the display still owes the client pixels,
+    /// which forces a grab even on a static screen — see [`Self::poll_inner`].
+    pub(crate) fn poll(&mut self, debt_due: bool) -> Option<Grab> {
+        let outcome = self.poll_inner(debt_due);
         if let Some(failures) = self.failures.record(outcome.kind()) {
             if self.reconnect() {
                 tracing::warn!(
@@ -857,9 +860,13 @@ impl ScreenGrabber {
     /// the real session cursor shape — only their client's default arrow.
     /// XFixes `GetCursorImage` returns the current sprite as ARGB, which the
     /// display backend ships to the client as RDP pointer updates.
-    pub(crate) fn poll_and_cursor(&mut self, cursor_due: bool) -> (Option<Grab>, Option<CursorImage>) {
+    pub(crate) fn poll_and_cursor(
+        &mut self,
+        cursor_due: bool,
+        debt_due: bool,
+    ) -> (Option<Grab>, Option<CursorImage>) {
         let cursor = if cursor_due { self.cursor_image() } else { None };
-        (self.poll(), cursor)
+        (self.poll(debt_due), cursor)
     }
 
     /// Current cursor sprite via XFixes, converted to the RDP xor-mask byte
@@ -894,11 +901,18 @@ impl ScreenGrabber {
         })
     }
 
-    fn poll_inner(&mut self) -> PollOutcome {
+    fn poll_inner(&mut self, debt_due: bool) -> PollOutcome {
         // Damage gate: skip the whole GetImage + diff when the root window has
         // not changed since the previous grab. The first grab (and the first
         // after a reconnect) is forced so the diff baseline exists.
-        let force = std::mem::take(&mut self.force_grab);
+        //
+        // `debt_due` forces it too: the display owes the client pixels it has
+        // never seen, and those pixels are not going to announce themselves —
+        // the screen holding still is exactly the case where nothing ever
+        // re-triggers the paint. The grab then finds no change and returns a
+        // `damage: None` frame, which is precisely the shape the display's
+        // debt-repayment branch already expects.
+        let force = std::mem::take(&mut self.force_grab) || debt_due;
         if !force && !self.damage_pending() {
             return PollOutcome::Idle; // static screen: healthy, not a failure
         }
@@ -1104,7 +1118,9 @@ impl RdpServerDisplayUpdates for Updates {
             let interval = if self.first { Duration::ZERO } else { POLL_INTERVAL };
             tokio::time::sleep(interval).await;
 
-            if let Some(grab) = self.grabber.poll() {
+            // No debt to force a grab for: the legacy bitmap path carries no
+            // partial-paint state — each update it emits is self-contained.
+            if let Some(grab) = self.grabber.poll(false) {
                 if self.first && grab.damage.is_some() {
                     tracing::info!(w = grab.width, h = grab.height, "first real frame captured");
                 }
@@ -1230,11 +1246,11 @@ struct X11Source {
 }
 
 impl crate::gfx_display::FrameSource for X11Source {
-    fn poll_and_cursor(&mut self, cursor_due: bool) -> Option<(Grab, Option<CursorImage>)> {
+    fn poll_and_cursor(&mut self, cursor_due: bool, debt_due: bool) -> Option<(Grab, Option<CursorImage>)> {
         let Some(grabber) = self.grabber.as_mut() else {
             return None;
         };
-        let (grab, cursor) = grabber.poll_and_cursor(cursor_due);
+        let (grab, cursor) = grabber.poll_and_cursor(cursor_due, debt_due);
         grab.map(|g| (g, cursor))
     }
 

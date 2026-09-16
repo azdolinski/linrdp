@@ -741,12 +741,19 @@ impl FrameSource for PwFrameSource {
     fn poll_and_cursor(
         &mut self,
         _cursor_due: bool,
+        debt_due: bool,
     ) -> Option<(Grab, Option<crate::capture::CursorImage>)> {
         if !self.shared.stream_ready.load(Ordering::Relaxed) || self.shared.failed.load(Ordering::Relaxed) {
             return None;
         }
         let slot = self.shared.frame.lock().ok()?;
-        if slot.seq == self.last_seq || slot.width == 0 || slot.height == 0 {
+        if slot.width == 0 || slot.height == 0 {
+            return None; // no usable frame yet
+        }
+        // A stale sequence normally means "nothing to do". While the display
+        // owes pixels it must still get them: the diff below then reports
+        // `damage: None` and the debt is repaid from the current contents.
+        if slot.seq == self.last_seq && !debt_due {
             return None; // no new frame this tick
         }
         let (Ok(width), Ok(height)) = (u16::try_from(slot.width), u16::try_from(slot.height)) else {

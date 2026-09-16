@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ironrdp_egfx::pdu::{Avc420Region, Encoding, PixelFormat};
-use ironrdp_egfx::server::GraphicsPipelineServer;
+use ironrdp_egfx::server::{CLIENT_QUEUE_BACKOFF, GraphicsPipelineServer};
 use ironrdp_graphics::clearcodec::ClearCodecEncoder;
 use ironrdp_pdu::geometry::ExclusiveRectangle;
 use ironrdp_server::{
@@ -233,7 +233,15 @@ struct SurfaceState {
 /// (`try_attach` / [`DisplaySourceFactory::updates_source`]).
 pub(crate) trait FrameSource: Send + 'static {    /// Poll for a frame (plus the cursor sprite when `cursor_due`).
     /// `None` = nothing this tick — the caller retries.
-    fn poll_and_cursor(&mut self, cursor_due: bool) -> Option<(Grab, Option<CursorImage>)>;
+    ///
+    /// `debt_due` means the display still owes the client pixels it has never
+    /// seen. A source that would otherwise report "nothing changed" MUST then
+    /// hand back the current screen contents with `damage: None`: an unchanged
+    /// screen is exactly the case where no later event will deliver those
+    /// pixels, so a source that stays silent leaves the paint unfinished
+    /// forever. It is not a fresh-frame signal — `damage` still says what
+    /// actually changed.
+    fn poll_and_cursor(&mut self, cursor_due: bool, debt_due: bool) -> Option<(Grab, Option<CursorImage>)>;
     /// Best-effort (re)attach attempt when detached; throttled by the caller.
     fn try_attach(&mut self) {}
     /// Whether a poll can currently produce frames.
@@ -392,6 +400,7 @@ impl RdpServerDisplay for EgfxDisplay {
             last_sent: 0,
             backpressure_events: 0,
             bitrate_boost: 1.0,
+            clear_bytes_per_px: CLEARCODEC_BYTES_PER_PX,
             busy_ms: 0.0,
         }))
     }
@@ -513,6 +522,9 @@ struct EgfxUpdates {
     /// (quality anchors are WAN-safe floors; a LAN wants best-effort quality
     /// bounded only by what the client can decode), 1x under strain.
     bitrate_boost: f64,
+    /// Measured ClearCodec bytes per source pixel (EWMA), sizing the lossless
+    /// band budget. Seeded from [`CLEARCODEC_BYTES_PER_PX`].
+    clear_bytes_per_px: f64,
     /// Capture+process CPU-proxy time accumulated in the heartbeat window:
     /// every consumed grab's poll duration plus every frame's processing
     /// duration. Divided by the window length in the heartbeat log, this is
@@ -607,7 +619,7 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
                     tokio::time::sleep(POLL_INTERVAL - since_last).await;
                     continue;
                 }
-                self.maybe_start_grab(cursor_due);
+                self.maybe_start_grab(cursor_due, self.pending_full);
                 if self.pending_grab.is_none() {
                     // Could not start (source lost, rebuild throttled): idle
                     // briefly instead of spinning.
@@ -731,7 +743,7 @@ impl EgfxUpdates {
     /// [`Self::try_consume_grab`] awaits its result — that split is what lets
     /// the next GetImage + tile diff overlap the previous frame's conversion
     /// and encode.
-    fn maybe_start_grab(&mut self, cursor_due: bool) {
+    fn maybe_start_grab(&mut self, cursor_due: bool, debt_due: bool) {
         if self.pending_grab.is_some() {
             return; // one poll at a time
         }
@@ -749,7 +761,7 @@ impl EgfxUpdates {
         self.hb_polls += 1;
         self.last_grab_start = Instant::now();
         let handle = tokio::task::spawn_blocking(move || {
-            let polled = source.poll_and_cursor(cursor_due);
+            let polled = source.poll_and_cursor(cursor_due, debt_due);
             (source, polled)
         });
         self.pending_grab = Some(PendingGrab {
@@ -1125,9 +1137,13 @@ impl EgfxUpdates {
                 self.owe_region(dx, dy, dw, dh);
                 return;
             }
-            self.send_h264(handle, data, width, height).await;
-            self.in_motion = true;
-            self.motion_until = Instant::now() + MOTION_LINGER;
+            // Motion mode only if the frame actually shipped: it suppresses
+            // the lossless partial path below, so entering it on a dropped
+            // frame strands the pixels nothing else will deliver.
+            if self.send_h264(handle, data, width, height).await {
+                self.in_motion = true;
+                self.motion_until = Instant::now() + MOTION_LINGER;
+            }
         } else if self.in_motion {
             // Small damage inside the motion window: suppress the lossless
             // partial. Sending it would flip these pixels to exact colors,
@@ -1173,13 +1189,70 @@ impl EgfxUpdates {
         }
     }
 
-    /// How many pixels one lossless paint may cover, from the same measured
-    /// goodput that drives the H.264 bitrate. Budgeted at an eighth of a
-    /// second of link capacity: enough to repaint a full screen in a handful
-    /// of frames, small enough that audio never queues behind one.
-    fn lossless_budget_px(&self) -> u32 {
-        let bytes_per_eighth_second = self.h264_bitrate_bps() / 8 / 8;
-        (bytes_per_eighth_second / CLEARCODEC_BYTES_PER_PX).max(u32::from(MIN_BAND_ROWS) * 64)
+    /// How many pixels one lossless paint may cover, from the only backpressure
+    /// signal the protocol actually defines.
+    ///
+    /// MS-RDPEGFX 3.2.5.13: the server SHOULD throttle "if the queueDepth field
+    /// is in the range 0x00000001 to 0xFFFFFFFE" — that range is the whole
+    /// mandate. `queueDepth == 0` is the client reporting an empty decode queue,
+    /// i.e. explicitly *not* lagging, so there is nothing to throttle and the
+    /// paint goes out whole. Above zero the budget shrinks with the room left
+    /// before [`CLIENT_QUEUE_BACKOFF`], where the pipeline stops sending.
+    ///
+    /// Two tempting inputs are deliberately NOT used:
+    /// - `bw_kbps`: MS-RDPBCGR 3.2.5.14 computes it as `(byteCount * 8) /
+    ///   timeDelta` over "the PDUs sent from server to client", so on a quiet
+    ///   session it measures our own output. Feeding it back here made the
+    ///   budget chase itself downward.
+    /// - QoE timings: MS-RDPEGFX 3.2.5.21 says they "SHOULD only be used for
+    ///   informational and debugging purposes".
+    ///
+    /// The previous formula budgeted an eighth of a second of a fixed H.264
+    /// bitrate anchor so "audio never queues behind one". Measured on this
+    /// path: `SharedWriter` `lock_wait_ms` was 0 across 34113 samples with a
+    /// largest single write of 448 KB at `write_ms` ≤ 1 — the head-of-line cost
+    /// it was guarding against was not there, while the anchor cut a 2880x1800
+    /// repaint into 34-row strips that took ~30 s to walk down the screen.
+    fn lossless_budget_px(&self, handle: &GfxHandle) -> u32 {
+        // Bound the guard to this statement: `send_clear` locks the same mutex
+        // a few lines later in the caller.
+        let depth = Self::lock_handle(handle).fresh_client_queue_depth();
+        let headroom_bytes = match depth {
+            // No usable measurement (no ack yet, acks suspended, or the sample
+            // has expired) or a client reporting zero backlog: no throttle.
+            None | Some(0) => return u32::MAX,
+            Some(depth) => CLIENT_QUEUE_BACKOFF.saturating_sub(depth),
+        };
+        let px = f64::from(headroom_bytes) / self.clear_bytes_per_px;
+        let floor = f64::from(u32::from(MIN_BAND_ROWS) * 64);
+        // Precision guard: clamped into [floor, u32::MAX] before the cast.
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "clamped to a u32 range"
+        )]
+        let px = px.clamp(floor, f64::from(u32::MAX)) as u32;
+        px
+    }
+
+    /// Fold one finished ClearCodec encode into the compression-ratio estimate
+    /// that sizes the next band.
+    ///
+    /// [`CLEARCODEC_BYTES_PER_PX`] is only a bootstrap value, and a deliberately
+    /// pessimistic one. Measured on a real desktop it overstates the true cost
+    /// about fivefold, which shrank every band by the same factor on top of the
+    /// budget error above.
+    fn record_clear_ratio(&mut self, bytes: usize, w: u16, h: u16) {
+        let px = f64::from(u32::from(w) * u32::from(h));
+        if px <= 0.0 {
+            return;
+        }
+        // Precision guard: an encoded frame is far below 2^53 bytes.
+        #[expect(clippy::cast_precision_loss, reason = "encoded sizes are small")]
+        let ratio = bytes as f64 / px;
+        self.clear_bytes_per_px =
+            (self.clear_bytes_per_px * (1.0 - CLEAR_RATIO_ALPHA) + ratio * CLEAR_RATIO_ALPHA).max(MIN_CLEAR_BYTES_PER_PX);
     }
 
     /// Pay off the outstanding lossless debt over `rect`. The debt is only
@@ -1202,7 +1275,7 @@ impl EgfxUpdates {
             self.debt_rect = None;
             return;
         }
-        let (band, remainder) = split_debt_band((x, y, w, h), self.lossless_budget_px());
+        let (band, remainder) = split_debt_band((x, y, w, h), self.lossless_budget_px(handle));
         let (bx, by, bw, bh) = band;
         if self.send_clear(handle, data, frame_w, frame_h, bx, by, bw, bh).await {
             let (pending, rect) = settle_debt(remainder);
@@ -1462,6 +1535,10 @@ impl EgfxUpdates {
             return false;
         };
         self.encoders = Some(encoders);
+        // Learn this content's real compression ratio before the next band is
+        // sized — recorded on encode, not on delivery, because a frame the
+        // pipeline rejects still tells the truth about the bytes per pixel.
+        self.record_clear_ratio(stream.len(), w, h);
 
         let dest = ExclusiveRectangle {
             left: x,
@@ -1473,6 +1550,14 @@ impl EgfxUpdates {
         let sent = server.send_clearcodec_frame(surface.id, dest, stream, ts);
         drop(server);
 
+        // Counted on OFFER, not on delivery. `update_in_flight_window` sizes the
+        // window from this rate and its own comment claims the rate is measured
+        // upstream of the window "so the estimate cannot feed back into itself" —
+        // which only holds if a frame the window rejected still counts as
+        // produced. Counting deliveries made it a feedback loop: a starved
+        // producer decayed to MIN_PRODUCER_FPS and pinned the window at
+        // MIN_IN_FLIGHT, which starved it further.
+        self.producer_frames += 1;
         let delivered = sent.is_some();
         if delivered {
             // The message is on the wire: the session's next ClearCodec
@@ -1486,24 +1571,35 @@ impl EgfxUpdates {
             );
             self.clear_seq = self.clear_seq.wrapping_add(1);
             self.stat_clear += 1;
-            self.producer_frames += 1;
         } else {
             // Dropped (backpressure): this grab's pixels are already consumed
             // from the damage tracker, so only a later lossless paint can
             // deliver them — the region stays owed.
             self.owe_region(x, y, w, h);
+            // See the matching note in send_h264: an actual rejection is the
+            // strain signal the quality loop needs.
+            self.backpressure_events += 1;
         }
         self.record_drained(self.session.drain_and_send(handle));
         delivered
     }
 
     /// Full-frame H.264 encode for motion.
-    async fn send_h264(&mut self, handle: &GfxHandle, data: Vec<u8>, w: u16, h: u16) {
-        let Some(surface) = self.surface else { return };
+    /// Returns whether the client's view is now current *via H.264*, i.e.
+    /// whether the caller may enter (or stay in) motion mode.
+    ///
+    /// `false` covers every path that did not put this grab's pixels on the
+    /// wire as an H.264 frame: no surface, AVC disabled or broken (those repay
+    /// the debt losslessly instead), a failed encode, and a frame the pipeline
+    /// rejected. Motion mode suppresses the lossless partial path, so claiming
+    /// it after a frame that never shipped strands those pixels until some
+    /// later repaint — with AVC disabled, permanently.
+    async fn send_h264(&mut self, handle: &GfxHandle, data: Vec<u8>, w: u16, h: u16) -> bool {
+        let Some(surface) = self.surface else { return false };
 
         if self.avc_disabled {
             self.repay_debt(handle, data, w, h, 0, 0, w, h).await;
-            return;
+            return false;
         }
 
         // Adaptive encoder config: (re)build whenever the target bitrate
@@ -1558,11 +1654,11 @@ impl EgfxUpdates {
                     tracing::warn!(error = %e, "EGFX: x264 init failed — ClearCodec only");
                     self.avc_disabled = true;
                     self.repay_debt(handle, data, w, h, 0, 0, w, h).await;
-                    return;
+                    return false;
                 }
             }
         }
-        let Some(mut encoders) = self.take_encoders() else { return };
+        let Some(mut encoders) = self.take_encoders() else { return false };
 
         let (pw, ph) = (surface.pad_width, surface.pad_height);
         let ts = self.timestamp_ms();
@@ -1605,17 +1701,20 @@ impl EgfxUpdates {
 
         let Ok((encoders, luma_bs, chroma_bs)) = joined else {
             tracing::error!("H.264 encode task failed to join — motion frame dropped");
-            return;
+            return false;
         };
         self.encoders = Some(encoders);
 
         let Some(luma_bitstream) = luma_bs else {
             // No encoder: recover with a lossless full paint.
             self.owe_everything();
-            return;
+            return false;
         };
         if luma_bitstream.is_empty() {
-            return; // encoder skipped unchanged input
+            // The encoder skipped unchanged input: nothing went out, but the
+            // client's view already matches these pixels, so motion mode is
+            // still telling the truth.
+            return true;
         }
 
         // Region rects cover the real desktop, for both v1 and v2. The
@@ -1667,9 +1766,11 @@ impl EgfxUpdates {
         };
         drop(server);
 
-        if sent.is_some() {
+        // On offer, not on delivery — see the note in `send_clear`.
+        self.producer_frames += 1;
+        let delivered = sent.is_some();
+        if delivered {
             self.stat_h264 += 1;
-            self.producer_frames += 1;
             self.motion_frames += 1;
             self.last_sent += 1;
             self.last_h264 = Instant::now();
@@ -1687,8 +1788,14 @@ impl EgfxUpdates {
                 enc.force_intra();
             }
             self.owe_everything();
+            // A rejected send IS the strain signal. Counting only the
+            // pre-encode `should_backpressure()` polls misses exactly the
+            // drops that matter, so the adaptive quality loop never learns
+            // about them.
+            self.backpressure_events += 1;
         }
         self.record_drained(self.session.drain_and_send(handle));
+        delivered
     }
 
     /// Encoders for this frame, re-initializing if a previous blocking task
@@ -1943,11 +2050,22 @@ fn bgrx_to_yuv444v2(
     )
 }
 
-/// ClearCodec residual-RLE output per source pixel, measured on real desktop
-/// content: a 2880x1800 full-screen paint encoded to 1,069,809 bytes, i.e.
-/// ~0.21 B/px. Rounded up, because undershooting the budget is harmless and
-/// overshooting it is what stalls the audio channel.
-const CLEARCODEC_BYTES_PER_PX: u32 = 1; // conservative: 4x the measured rate
+/// Bootstrap ClearCodec output per source pixel, until real encodes replace it.
+///
+/// Measured on real desktop content a 2880x1800 full-screen paint encodes to
+/// 1,069,809 bytes, i.e. ~0.21 B/px; this starts at the pessimistic end and
+/// [`EgfxUpdates::record_clear_ratio`] converges it onto whatever the actual
+/// content costs. It used to be the permanent value, which understated every
+/// band by ~5x.
+const CLEARCODEC_BYTES_PER_PX: f64 = 1.0;
+
+/// Weight of the newest encode in the bytes-per-pixel estimate.
+const CLEAR_RATIO_ALPHA: f64 = 0.25;
+
+/// Floor for the bytes-per-pixel estimate. A few flat bands in a row can drive
+/// the ratio to near zero, and dividing the byte headroom by that would hand
+/// back an unbounded pixel budget just before busy content arrives.
+const MIN_CLEAR_BYTES_PER_PX: f64 = 0.02;
 
 /// Minimum band height, so a tight budget cannot degenerate into hundreds of
 /// one-row PDUs whose headers cost more than their pixels.
@@ -2229,6 +2347,23 @@ mod debt_region_tests {
 
         assert_eq!(painted_rows, u32::from(full.3), "every row must be repainted exactly once");
         assert!(bands > 1, "a full screen must not go out as a single write");
+    }
+
+    /// An unthrottled client gets the whole repaint at once.
+    ///
+    /// Regression: the budget came from a fixed H.264 bitrate anchor rather
+    /// than from the client, so a 2880x1800 first paint was cut into 53 strips
+    /// of 34 rows. Each strip needed its own damage event to go out, which on
+    /// an idle desktop arrive ~1.6/s — the screen filled top to bottom over
+    /// ~30 s on a 1 Gbit link. MS-RDPEGFX 3.2.5.13 only asks for throttling
+    /// while `queueDepth` is in 1..=0xFFFFFFFE; `lossless_budget_px` answers
+    /// `u32::MAX` outside that range, and that must mean one band.
+    #[test]
+    fn an_unthrottled_budget_paints_the_whole_screen_in_one_band() {
+        let full = (0u16, 0u16, 2880u16, 1800u16);
+        let (band, rest) = split_debt_band(full, u32::MAX);
+        assert_eq!(band, full, "no throttle must paint the entire region at once");
+        assert_eq!(rest, None, "nothing may be left owed");
     }
 }
 
