@@ -150,47 +150,63 @@ mod tests {
         (y, u, v)
     }
 
-    /// [MS-RDPEGFX 2.2.4.6]: each substream is decoded by its own decoder,
-    /// so BOTH streams must start with SPS/PPS + IDR. This simulates the
-    /// session flow: 30 luma-only lead frames, then the first dual-view
-    /// frame — the chroma encoder's first-ever use. Its first output MUST
-    /// be an IDR even though the encoder was created long before.
+    /// [MS-RDPEGFX 2.2.4.5/2.2.4.6]: the two AVC444 subframes "MUST be
+    /// encoded using the same MPEG-4 AVC/H.264 encoder and decoded by a
+    /// single MPEG-4 AVC/H.264 decoder as one stream".
+    ///
+    /// So the concatenation of everything we send must be ONE well-formed
+    /// stream: exactly one SPS/PPS+IDR at the start, then nothing but
+    /// P-frames. The regression this guards is the opposite design — a
+    /// second encoder for the chroma view, whose own IDR flushed the single
+    /// decoder's DPB and left the next luma P-frame referencing a picture
+    /// that no longer existed. mstsc answered that with a pipeline reset and
+    /// an RST 70 ms later.
     #[test]
-    fn chroma_substream_starts_with_idr_after_luma_lead() {
+    fn both_avc444_views_form_one_stream_from_one_encoder() {
         const W: usize = 320;
         const H: usize = 320;
-        let (mut luma, mut chroma) =
-            crate::gfx_display::make_h264_encoder(6_000_000, 30.0, W as u16, H as u16).unwrap();
+        let mut enc = crate::gfx_display::make_h264_encoder(6_000_000, 30.0, W as u16, H as u16).unwrap();
 
-        // Luma-only lead: chroma encoder receives nothing yet.
-        let mut first_luma_types = Vec::new();
-        for i in 0..30 {
-            let (y, u, v) = pseudo_frame(i + 1, W, H);
-            let bs = luma.encode_planes(&y, &u, &v);
-            assert!(!bs.is_empty(), "luma frame {i}");
-            if i == 0 {
-                first_luma_types = nal_types(&bs);
-                assert!(first_luma_types.contains(&7) && first_luma_types.contains(&8),
-                    "luma stream must start with SPS+PPS, got {first_luma_types:?}");
-                assert!(first_luma_types.contains(&5),
-                    "luma stream must start with IDR, got {first_luma_types:?}");
-            }
+        // 20 v2 frames: each is the luma view followed by the chroma view,
+        // both through this one encoder.
+        let mut stream_types = Vec::new();
+        for i in 0..20u32 {
+            let (ly, lu, lv) = pseudo_frame(2 * i + 1, W, H);
+            let (cy, cu, cv) = pseudo_frame(2 * i + 2, W, H);
+
+            let luma_bs = enc.encode_planes(&ly, &lu, &lv);
+            assert!(!luma_bs.is_empty(), "luma view of frame {i} produced nothing");
+            stream_types.extend(nal_types(&luma_bs));
+
+            let chroma_bs = enc.encode_planes(&cy, &cu, &cv);
+            assert!(!chroma_bs.is_empty(), "chroma view of frame {i} produced nothing");
+            stream_types.extend(nal_types(&chroma_bs));
         }
 
-        // First dual-view frame: chroma encoder's first use.
-        let (y, u, v) = pseudo_frame(31, W, H);
-        let _lbs = luma.encode_planes(&y, &u, &v);
-        let cbs = chroma.encode_planes(&y, &u, &v);
-        assert!(!cbs.is_empty(), "chroma bitstream empty on first use");
-        let types = nal_types(&cbs);
-        assert!(types.contains(&7) && types.contains(&8),
-                "chroma stream must start with SPS+PPS, got {types:?}");
-        assert!(types.contains(&5), "chroma stream must start with IDR, got {types:?}");
+        // NAL 7 = SPS, 8 = PPS, 5 = IDR slice, 1 = non-IDR (P) slice. x264
+        // splits each picture into several slices here (sliced threads), so
+        // count parameter sets and slice ORDER, not slice counts.
+        assert_eq!(
+            stream_types.iter().filter(|&&t| t == 7).count(),
+            1,
+            "a second SPS is a second stream restarting the client's decoder, got {stream_types:?}"
+        );
+        assert_eq!(
+            stream_types.iter().filter(|&&t| t == 8).count(),
+            1,
+            "a second PPS means the same, got {stream_types:?}"
+        );
 
-        // Subsequent chroma frames are P-frames (no IDR churn).
-        let (y, u, v) = pseudo_frame(32, W, H);
-        let cbs2 = chroma.encode_planes(&y, &u, &v);
-        let types2 = nal_types(&cbs2);
-        assert!(!types2.contains(&5), "second chroma frame must not be IDR, got {types2:?}");
+        let sps_at = stream_types.iter().position(|&t| t == 7).expect("SPS present");
+        let first_idr = stream_types.iter().position(|&t| t == 5).expect("IDR present");
+        let last_idr = stream_types.iter().rposition(|&t| t == 5).expect("IDR present");
+        let first_p = stream_types.iter().position(|&t| t == 1).expect("P slices present");
+
+        assert!(sps_at < first_idr, "SPS/PPS must precede the IDR");
+        assert!(
+            last_idr < first_p,
+            "every IDR slice belongs to the first picture; an IDR after P slices would \
+             flush the single decoder's DPB mid-session, got {stream_types:?}"
+        );
     }
 }

@@ -1,28 +1,33 @@
 #!/usr/bin/env bash
-# Round-trip check for the AVC444v2 dual-encoder wire format:
-# decode both substreams (ffmpeg), recombine to 4:4:4 exactly the way
-# FreeRDP's general_LumaToYUV444 + general_ChromaV2ToYUV444 read them,
-# and measure the error against the reference planes written by the
-# v2_roundtrip_writes_artifacts test.
+# Round-trip check for the AVC444v2 wire format.
+#
+# Per MS-RDPEGFX 2.2.4.6 both subframes come from ONE encoder and are decoded
+# by ONE decoder as one stream, so the artifact written by the
+# v2_roundtrip_writes_artifacts test alternates: luma, chroma, luma, chroma…
+# Decode it (ffmpeg), take the last converged luma/chroma pair, recombine to
+# 4:4:4 exactly the way FreeRDP's general_LumaToYUV444 +
+# general_ChromaV2ToYUV444 read them, and measure the error against the
+# reference planes.
 set -euo pipefail
 
-ffmpeg -v error -y -i /tmp/v2_luma.h264 -pix_fmt yuv420p -f rawvideo /tmp/v2_luma.yuv
-ffmpeg -v error -y -i /tmp/v2_chroma.h264 -pix_fmt yuv420p -f rawvideo /tmp/v2_chroma.yuv
+ffmpeg -v error -y -i /tmp/v2_stream.h264 -pix_fmt yuv420p -f rawvideo /tmp/v2_stream.yuv
 
 python3 - <<'EOF'
-W = H = 640, 480
 W, H = 640, 480
 PW, PH = W, H
 HW = PW // 2   # half width
 QW = PW // 4   # quarter width
 
-luma = open('/tmp/v2_luma.yuv', 'rb').read()
-chroma = open('/tmp/v2_chroma.yuv', 'rb').read()
+data = open('/tmp/v2_stream.yuv', 'rb').read()
 ref = open('/tmp/v2_ref.y444', 'rb').read()
 frame_sz = PW * PH * 3 // 2
-assert len(luma) >= frame_sz and len(chroma) >= frame_sz, (len(luma), len(chroma))
-luma = luma[-frame_sz:]      # last (converged) frame
-chroma = chroma[-frame_sz:]
+n_frames = len(data) // frame_sz
+assert n_frames >= 2, n_frames
+# The stream is luma, chroma, luma, chroma… so the last pair is
+# (second-to-last, last). An odd frame count would mean a dropped subframe.
+assert n_frames % 2 == 0, f"odd frame count {n_frames}: a subframe went missing"
+luma = data[(n_frames - 2) * frame_sz:(n_frames - 1) * frame_sz]
+chroma = data[(n_frames - 1) * frame_sz:n_frames * frame_sz]
 
 ly = luma[: PW * PH]
 lu = luma[PW * PH: PW * PH * 5 // 4]
