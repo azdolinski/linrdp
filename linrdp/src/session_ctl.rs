@@ -221,6 +221,10 @@ mod tests {
             0x0415,
             ironrdp_pdu::gcc::KeyboardType::IBM_ENHANCED,
             String::new(),
+            ironrdp_connector::DesktopSize {
+                width: 1920,
+                height: 1080,
+            },
         ));
         assert_eq!(ctl.inner.active.load(Ordering::Acquire), 1);
 

@@ -104,6 +104,13 @@ pub struct AcceptorResult {
     /// channel. `None` when the client did not request it.
     pub message_channel_id: Option<u16>,
     pub reactivation: bool,
+    /// Desktop size in effect for this connection (MS-RDPBCGR 2.2.1.3.2).
+    ///
+    /// With `set_honor_client_desktop_size` this is the size the client asked
+    /// for, clamped to the configured maximum; otherwise it is the server's
+    /// own configured size. A server that materializes a desktop per
+    /// connection needs it to create one the client will not have to scale.
+    pub desktop_size: DesktopSize,
     /// Keyboard layout identifier (KLID) announced by the client in its GCC
     /// Client Core Data (section 2.2.1.3.2, `keyboardLayout`).
     ///
@@ -389,6 +396,7 @@ impl Acceptor {
                 user_channel_id: self.user_channel_id,
                 io_channel_id: self.io_channel_id,
                 message_channel_id: self.message_channel_id,
+                desktop_size: self.desktop_size,
                 keyboard_layout: self.keyboard_layout,
                 keyboard_type: self.keyboard_type,
                 ime_file_name: self.ime_file_name.clone(),

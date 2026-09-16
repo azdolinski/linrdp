@@ -92,9 +92,7 @@ impl X11InputHandler {
     pub(crate) fn connect() -> anyhow::Result<Self> {
         // Through the session gate: injecting input into the ambient display
         // would type into another user's desktop.
-        let display_name = crate::session::gate::display_name()?;
-        let (conn, screen_num) = x11rb::rust_connection::RustConnection::connect(Some(display_name.as_str()))
-            .with_context(|| format!("connect to X display {display_name}"))?;
+        let (conn, screen_num) = crate::session::gate::connect()?;
         let root = conn.setup().roots.get(screen_num).context("no X screen")?.root;
         let mut handler = Self {
             conn: Arc::new(conn),

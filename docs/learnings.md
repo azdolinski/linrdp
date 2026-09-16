@@ -362,3 +362,54 @@ with ECHILD, reporting a keeper that had started perfectly as a failure.
 18. Every fork that execs a foreign program restores `SIGCHLD` to `SIG_DFL`
     first (`session::keeper::restore_default_sigchld`). The supervisor's
     auto-reaping is the supervisor's alone.
+
+## Saga: the desktop the client could not fill, and the input it could not reach
+
+Two symptoms from one session, with two unrelated causes.
+
+**Input never arrived.** Every event logged `connect to X display :10` and was
+dropped, while the capture path was serving frames from that same display in
+that same process. The connect calls were identical, so the difference had to be
+state: x11rb locates the cookie through `$XAUTHORITY`, and **it discards every
+error while doing so, connecting unauthenticated instead**. The X server answers
+that with a bare "Authorization required", which says nothing about a cookie. The
+worker inherits `XAUTHORITY` from the service unit — pointing at the console
+user's file — so the environment was never a safe place to learn a session's
+secret from. The gate's own module comment already claimed the capture and input
+paths trusted the gate rather than the environment; they did not, and now they
+do: `gate::connect` reads the session's cookie from the bound Xauthority and
+passes it explicitly.
+
+**The desktop did not fill the monitor.** Xvfb's `-screen 0 WxH` is also its
+RandR *maximum*: a session born at 1920x1080 can never grow, and `--newmode`
++ `--addmode` fail against it. The keeper was starting every session at a
+hardcoded default, so a 2880x1800 client got a 1920x1080 desktop with the
+acceptor telling it 2880x1800 — which looks exactly like a scaling bug. Sessions
+are now created at the size the connecting client negotiated (plumbed through
+`AcceptorResult`/`ConnectionInfo`), and a reconnect at a different size gets a
+warning naming both numbers instead of a silently letterboxed screen.
+
+- **A library that swallows errors turns a misconfiguration into a mystery.**
+  `get_auth(...).unwrap_or(None).unwrap_or_else(|| (Vec::new(), Vec::new()))` is
+  four words of Rust that convert "your cookie file is wrong" into "authorization
+  required". When a connection fails for reasons the error text cannot explain,
+  read what the client library does with *its* errors.
+- **Inherited environment is not configuration.** The unit's `DISPLAY` and
+  `XAUTHORITY` exist for the single-session path and silently followed every
+  worker into the multi-session one.
+- **`pgrep -f` matched my own shell three times in one session** (exit 144),
+  including twice after this file already warned about it. `pgrep -x` plus a
+  read of `/proc/<pid>/cmdline` cannot do that.
+- **Truncating the log before reproducing destroyed the evidence** for the very
+  failure being chased. Copy first, truncate second.
+- **A test suite that touches the live X server can be broken by your own
+  debugging.** `selection_owner_serves_gnome_copied_files` failed because the
+  FreeRDP client I had left running owned the clipboard on `:99`.
+
+## Invariants now enforced (keep them)
+
+19. Every X connection in a multi-session worker goes through `gate::connect`,
+    which authenticates with the bound session's own cookie. No X path reads
+    `$XAUTHORITY`.
+20. A session's X screen is created at the size the connecting client
+    negotiated, never a default, because Xvfb cannot resize afterwards.

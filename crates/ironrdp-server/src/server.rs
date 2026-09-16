@@ -135,6 +135,8 @@ pub struct ConnectionInfo {
     pub keyboard_type: ironrdp_pdu::gcc::KeyboardType,
     /// See [`ironrdp_acceptor::AcceptorResult::ime_file_name`].
     pub ime_file_name: String,
+    /// See [`ironrdp_acceptor::AcceptorResult::desktop_size`].
+    pub desktop_size: ironrdp_connector::DesktopSize,
 }
 
 impl ConnectionInfo {
@@ -142,11 +144,17 @@ impl ConnectionInfo {
     /// that want to exercise [`ConnectionHandler::on_connection_info`] in their own unit tests
     /// without going through a live connection. `#[non_exhaustive]` blocks struct-literal
     /// construction outside this crate, so a constructor is the only way to do that.
-    pub fn new(keyboard_layout: u32, keyboard_type: ironrdp_pdu::gcc::KeyboardType, ime_file_name: String) -> Self {
+    pub fn new(
+        keyboard_layout: u32,
+        keyboard_type: ironrdp_pdu::gcc::KeyboardType,
+        ime_file_name: String,
+        desktop_size: ironrdp_connector::DesktopSize,
+    ) -> Self {
         Self {
             keyboard_layout,
             keyboard_type,
             ime_file_name,
+            desktop_size,
         }
     }
 }
@@ -3689,6 +3697,7 @@ impl RdpServer {
                 keyboard_layout: result.keyboard_layout,
                 keyboard_type: result.keyboard_type,
                 ime_file_name: result.ime_file_name.clone(),
+                desktop_size: result.desktop_size,
             });
         }
 

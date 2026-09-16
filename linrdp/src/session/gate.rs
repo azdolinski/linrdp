@@ -90,6 +90,55 @@ pub(crate) fn display_name() -> anyhow::Result<String> {
     }
 }
 
+/// The display number this worker is bound to, if any.
+fn bound_display_number() -> Option<u16> {
+    BOUND
+        .get()?
+        .display
+        .trim_start_matches(':')
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Connect to this worker's X display, authenticating with the session's own
+/// cookie rather than with whatever `$XAUTHORITY` happens to name.
+///
+/// Every X connection in a multi-session worker goes through here. The
+/// environment cannot be trusted for this: the service unit exports an
+/// `XAUTHORITY` of its own (the console user's file), and x11rb silently
+/// swallows every error while locating auth — an unreadable or wrong file
+/// makes it connect **unauthenticated**, which the X server refuses with a
+/// bare "Authorization required, but no authorization protocol specified".
+/// That is what the capture and input paths were relying on, and what the
+/// module comment above already claimed they did not.
+///
+/// Unarmed (single-session, or `--console`) nothing is bound and this is
+/// x11rb's ordinary environment-driven connect, exactly as before.
+pub(crate) fn connect() -> anyhow::Result<(x11rb::rust_connection::RustConnection, usize)> {
+    use anyhow::Context as _;
+
+    let name = display_name()?;
+    let (Some(display), Some(path)) = (bound_display_number(), xauthority()) else {
+        return x11rb::rust_connection::RustConnection::connect(Some(name.as_str()))
+            .with_context(|| format!("connect to X display {name}"));
+    };
+
+    let screen = name.split('.').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0usize);
+    let socket = format!("/tmp/.X11-unix/X{display}");
+    let unix = std::os::unix::net::UnixStream::connect(&socket)
+        .with_context(|| format!("connect to X display {name} at {socket}"))?;
+    let (stream, _peer) = x11rb::rust_connection::DefaultStream::from_unix_stream(unix)
+        .with_context(|| format!("wrap the X socket for {name}"))?;
+    let (auth_name, auth_data) = super::xauth::cookie_for(std::path::Path::new(&path), display)
+        .with_context(|| format!("no usable cookie for {name}"))?;
+    let conn =
+        x11rb::rust_connection::RustConnection::connect_to_stream_with_auth_info(stream, screen, auth_name, auth_data)
+            .with_context(|| format!("X11 setup for {name}"))?;
+    Ok((conn, screen))
+}
+
 /// The Xauthority for the bound session, if any.
 pub(crate) fn xauthority() -> Option<String> {
     BOUND.get().map(|b| b.xauthority.clone())

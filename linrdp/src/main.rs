@@ -446,7 +446,7 @@ async fn serve() -> anyhow::Result<()> {
                 // Deferred for the same reason as the display: connecting now
                 // would bind input to the shared desktop, and a worker that
                 // later failed to bind a session would be typing into it.
-                AnyInput::DeferredX11(None)
+                AnyInput::DeferredX11(None, DeferredInputLog::default())
             } else {
                 AnyInput::X11(X11InputHandler::connect().expect("X11 unavailable for input"))
             },
@@ -563,7 +563,7 @@ async fn serve() -> anyhow::Result<()> {
                     std::path::PathBuf::from(session::runtime_dir::STATE_DIR),
                     display_range.clone(),
                     console_mode,
-                    fixed_size.unwrap_or((1920, 1080)),
+                    fixed_size,
                 )) as Box<dyn ironrdp_server::ConnectionHandler>
             } else {
                 lifecycle
@@ -660,9 +660,40 @@ enum AnyInput {
     /// would be typing into it. Input only arrives after authentication, by
     /// which time the session gate names the right display, so the
     /// connection is made on the first event and never before.
-    DeferredX11(Option<X11InputHandler>),
+    DeferredX11(Option<X11InputHandler>, DeferredInputLog),
     #[cfg(feature = "wayland")]
     Wayland(wayland::ei::EiInputHandler),
+}
+
+
+/// Rate limit for the deferred-input failure message.
+///
+/// Input arrives as fast as the client can send it, and every event retries
+/// the connection, so an unreported cause turns into a flood that buries the
+/// one line that matters. One line per failure burst, with a count.
+#[derive(Default)]
+struct DeferredInputLog {
+    last: Option<std::time::Instant>,
+    suppressed: u64,
+}
+
+impl DeferredInputLog {
+    const EVERY: core::time::Duration = core::time::Duration::from_secs(5);
+
+    fn report(&mut self, error: &anyhow::Error) {
+        let now = std::time::Instant::now();
+        if self.last.is_some_and(|at| now.duration_since(at) < Self::EVERY) {
+            self.suppressed += 1;
+            return;
+        }
+        self.last = Some(now);
+        tracing::warn!(
+            error = format!("{error:#}"),
+            dropped_since_last = self.suppressed,
+            "input: cannot reach the bound display — events dropped"
+        );
+        self.suppressed = 0;
+    }
 }
 
 impl AnyInput {
@@ -672,12 +703,17 @@ impl AnyInput {
     fn x11(&mut self) -> Option<&mut X11InputHandler> {
         match self {
             Self::X11(handler) => Some(handler),
-            Self::DeferredX11(slot) => {
+            Self::DeferredX11(slot, log) => {
                 if slot.is_none() {
                     match X11InputHandler::connect() {
                         Ok(handler) => *slot = Some(handler),
                         Err(error) => {
-                            tracing::warn!(%error, "input: no display bound yet — event dropped");
+                            // The whole chain: "connect to X display :10" on
+                            // its own says nothing, and a client streaming
+                            // mouse moves repeats it hundreds of times a
+                            // second — 748 identical lines in one session,
+                            // none of them naming the cause.
+                            log.report(&error);
                             return None;
                         }
                     }

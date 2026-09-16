@@ -63,8 +63,7 @@ impl X11Display {
         // worker with no bound session must be refused here rather than
         // reaching the shared desktop.
         let display_name = crate::session::gate::display_name()?;
-        let (conn, screen_num) = x11rb::rust_connection::RustConnection::connect(Some(display_name.as_str()))
-            .with_context(|| format!("connect to X display {display_name}"))?;
+        let (conn, screen_num) = crate::session::gate::connect()?;
         let screen = conn.setup().roots.get(screen_num).context("no X screen")?;
         let (width, height) = (screen.width_in_pixels, screen.height_in_pixels);
         let root = screen.root;
