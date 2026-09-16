@@ -1200,41 +1200,81 @@ pub(crate) fn compute_tile_damage(
 /// crash/freeze self-healing stay in [`ScreenGrabber`]; this only feeds the
 /// generic display machinery.
 pub(crate) struct X11DisplayFactory {
-    display: std::sync::Mutex<X11Display>,
+    display: std::sync::Mutex<Option<X11Display>>,
+    fixed_size: Option<(u16, u16)>,
 }
 
 impl X11DisplayFactory {
     pub(crate) fn new(display: X11Display) -> Self {
+        let fixed_size = display.fixed_size;
         Self {
-            display: std::sync::Mutex::new(display),
+            display: std::sync::Mutex::new(Some(display)),
+            fixed_size,
         }
+    }
+
+    /// A factory that connects to `$DISPLAY` on first use rather than now.
+    ///
+    /// A multi-session worker does not know which desktop it serves until the
+    /// client has authenticated: the session is resolved from the verified
+    /// identity, which sets `$DISPLAY` for this process. Connecting eagerly
+    /// would bind the worker to whatever display it started with — the shared
+    /// one — no matter who logged in.
+    pub(crate) fn deferred(fixed_size: Option<(u16, u16)>) -> Self {
+        Self {
+            display: std::sync::Mutex::new(None),
+            fixed_size,
+        }
+    }
+
+    /// The display, connecting on first use. `None` only if X is unreachable.
+    fn with_display<T>(&self, f: impl FnOnce(&mut X11Display) -> T) -> Option<T> {
+        let mut guard = self.display.lock().expect("display lock poisoned");
+        if guard.is_none() {
+            match X11Display::connect(self.fixed_size) {
+                Ok(display) => *guard = Some(display),
+                Err(error) => {
+                    tracing::warn!(%error, "X display unavailable");
+                    return None;
+                }
+            }
+        }
+        guard.as_mut().map(f)
     }
 }
 
 impl crate::gfx_display::DisplaySourceFactory for X11DisplayFactory {
     fn size(&self) -> ironrdp_connector::DesktopSize {
-        let display = self.display.lock().expect("display lock poisoned");
-        let (width, height) = (display.width(), display.height());
-        ironrdp_connector::DesktopSize { width, height }
+        self.with_display(|display| ironrdp_connector::DesktopSize {
+            width: display.width(),
+            height: display.height(),
+        })
+        .unwrap_or(ironrdp_connector::DesktopSize {
+            width: 1920,
+            height: 1080,
+        })
     }
 
     fn request_initial_size(&self, client_size: ironrdp_connector::DesktopSize) -> ironrdp_connector::DesktopSize {
-        let mut display = self.display.lock().expect("display lock poisoned");
-        display.request_initial_size_sync(client_size)
+        self.with_display(|display| display.request_initial_size_sync(client_size))
+            .unwrap_or(client_size)
     }
 
     fn request_layout(&self, layout: ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout) {
-        let mut display = self.display.lock().expect("display lock poisoned");
-        display.request_layout_sync(layout);
+        self.with_display(|display| display.request_layout_sync(layout));
     }
 
     fn updates_source(&self) -> Box<dyn crate::gfx_display::FrameSource> {
-        let display = self.display.lock().expect("display lock poisoned");
-        Box::new(X11Source {
+        let built = self.with_display(|display| X11Source {
             grabber: Some(display.grabber()),
             display_name: display.display_name().to_owned(),
             fixed_size: display.fixed_size,
-        })
+        });
+        Box::new(built.unwrap_or_else(|| X11Source {
+            grabber: None,
+            display_name: std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_owned()),
+            fixed_size: self.fixed_size,
+        }))
     }
 }
 

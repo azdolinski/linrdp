@@ -7,11 +7,14 @@ pub(crate) mod keeper;
 pub(crate) mod pam_session;
 pub(crate) mod privilege;
 pub(crate) mod registry;
+pub(crate) mod router;
 pub(crate) mod xauth;
 pub(crate) mod runtime_dir;
 
 use std::ops::RangeInclusive;
 use std::path::Path;
+
+use anyhow::Context as _;
 
 /// The user's session, if one is recorded.
 pub(crate) fn attach_existing(
@@ -74,6 +77,74 @@ pub(crate) fn resolve_display(
         Some(rec) => format!(":{}", rec.display),
         None => ambient.to_owned(),
     }
+}
+
+
+/// Build a new session for `user`: claim a display, open a PAM session so
+/// logind creates the runtime dir, write the cookie there, start the X
+/// server, and record the result.
+///
+/// The display lease and the PAM handle are deliberately leaked into the
+/// session: both must outlive this function, because the desktop outlives the
+/// connection that created it. Every early return instead drops the lease,
+/// which releases the claim — that is what stops a failed setup from
+/// stranding a display number.
+pub(crate) fn create(
+    base: &Path,
+    user: &str,
+    password: &str,
+    range: RangeInclusive<u16>,
+    size: (u16, u16),
+) -> anyhow::Result<registry::SessionRecord> {
+    let ids = privilege::lookup_user(user)?;
+    let lease = display_alloc::allocate(base, range)?;
+
+    // PAM first: pam_systemd creates /run/user/<uid> (0700, user-owned), and
+    // there is nowhere safe to put the cookie until it exists.
+    let (pam, env) = crate::pam::LibPamSession::open(user, password)
+        .map_err(|e| anyhow::anyhow!("open a PAM session for {user}: {e}"))?;
+    let runtime_dir = env
+        .iter()
+        .find(|(k, _)| k == "XDG_RUNTIME_DIR")
+        .map(|(_, v)| v.clone())
+        .context("PAM gave no XDG_RUNTIME_DIR — is pam_systemd.so in /etc/pam.d/linrdp?")?;
+
+    let xauthority = xauth::write_cookie(&runtime_dir, lease.number, &ids)?;
+    let rec = registry::SessionRecord {
+        user: user.to_owned(),
+        display: lease.number,
+        runtime_dir,
+        xauthority: xauthority.to_string_lossy().into_owned(),
+    };
+
+    let cmd = keeper::xvfb_command(rec.display, &rec.xauthority, size);
+    let env_pairs = keeper::session_env(&rec, &ids);
+    keeper::spawn_detached(&cmd, &env_pairs, &ids)
+        .with_context(|| format!("start the X server for {user} on :{}", rec.display))?;
+
+    lease.record_owner(user)?;
+    registry::write_record(base, &rec)?;
+
+    tracing::info!(user, display = rec.display, "session created");
+    // The session now owns the claim and the PAM handle for its lifetime.
+    core::mem::forget(lease);
+    core::mem::forget(pam);
+    Ok(rec)
+}
+
+/// The user's session, creating one if they have none.
+pub(crate) fn attach_or_create(
+    base: &Path,
+    user: &str,
+    password: &str,
+    range: RangeInclusive<u16>,
+    size: (u16, u16),
+) -> anyhow::Result<registry::SessionRecord> {
+    if let Some(existing) = attach_live(base, user, range.clone()) {
+        tracing::info!(user, display = existing.display, "attached to the existing session");
+        return Ok(existing);
+    }
+    create(base, user, password, range, size)
 }
 
 #[cfg(test)]

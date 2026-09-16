@@ -128,7 +128,6 @@ async fn serve() -> anyhow::Result<()> {
         Some(spec) => supervisor::parse_display_range(&spec)?,
         None => 10..=99,
     };
-    let _ = (&console_mode, &display_range);
 
     let bind_addr: SocketAddr = args
         .opt_value_from_str("--bind-addr")?
@@ -162,7 +161,24 @@ async fn serve() -> anyhow::Result<()> {
     let identity = tls::load_or_generate_identity().context("failed to prepare TLS identity")?;
     let acceptor = identity.make_acceptor().context("failed to build TLS acceptor")?;
 
-    let validator: Arc<dyn ironrdp_server::CredentialValidator> = Arc::new(auth::ShadowValidator);
+    let mut validator: Arc<dyn ironrdp_server::CredentialValidator> = Arc::new(auth::ShadowValidator);
+
+    // Multi-session: a worker routes the connection to the authenticated
+    // user's own desktop. Wrapping the validator is what makes the decision
+    // follow the identity CredSSP verified rather than anything the client
+    // asked for, and it lands before the display is first used.
+    let multi_session = serve_fd.is_some();
+    if multi_session {
+        session::runtime_dir::ensure_state_dir(std::path::Path::new(session::runtime_dir::STATE_DIR))
+            .context("prepare the session state directory")?;
+        validator = Arc::new(session::router::SessionRouter::new(
+            Arc::clone(&validator),
+            std::path::PathBuf::from(session::runtime_dir::STATE_DIR),
+            display_range.clone(),
+            console_mode,
+            fixed_size.unwrap_or((1920, 1080)),
+        ));
+    }
 
     // NLA per MS-RDPBCGR 5.4.2: NTLM verifies the client's typed password
     // against the account secret from our SAM (the Linux analogue of Windows
@@ -250,9 +266,16 @@ async fn serve() -> anyhow::Result<()> {
     } else {
         (
             AnyInput::X11(X11InputHandler::connect().expect("X11 unavailable for input")),
-            Arc::new(capture::X11DisplayFactory::new(
-                X11Display::connect(fixed_size).expect("X11 display unavailable"),
-            )),
+            if serve_fd.is_some() && !console_mode {
+                // A worker must not bind to a display before it knows whose
+                // desktop it serves; the factory connects on the first frame,
+                // after the router has set $DISPLAY.
+                Arc::new(capture::X11DisplayFactory::deferred(fixed_size))
+            } else {
+                Arc::new(capture::X11DisplayFactory::new(
+                    X11Display::connect(fixed_size).expect("X11 display unavailable"),
+                ))
+            },
         )
     };
 

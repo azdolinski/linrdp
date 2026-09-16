@@ -22,6 +22,13 @@ const PAM_CONV_ERR: c_int = 19;
 
 const PAM_SERVICE_LOGIN: &str = "login";
 
+/// Session stack for linrdp; must include `pam_systemd.so` so logind
+/// registers the session and creates `/run/user/<uid>`.
+pub(crate) const PAM_SERVICE_LINRDP: &str = "linrdp";
+
+const PAM_ESTABLISH_CRED: c_int = 0x0002;
+const PAM_DELETE_CRED: c_int = 0x0004;
+
 type PamConvFn = unsafe extern "C" fn(
     num_msg: c_int,
     msg: *mut *const PamMessage,
@@ -59,6 +66,10 @@ struct PamApi {
     pam_authenticate: unsafe extern "C" fn(handle: *mut c_void, flags: c_int) -> c_int,
     pam_acct_mgmt: unsafe extern "C" fn(handle: *mut c_void, flags: c_int) -> c_int,
     pam_end: unsafe extern "C" fn(handle: *mut c_void, status: c_int) -> c_int,
+    pam_setcred: unsafe extern "C" fn(handle: *mut c_void, flags: c_int) -> c_int,
+    pam_open_session: unsafe extern "C" fn(handle: *mut c_void, flags: c_int) -> c_int,
+    pam_close_session: unsafe extern "C" fn(handle: *mut c_void, flags: c_int) -> c_int,
+    pam_getenvlist: unsafe extern "C" fn(handle: *mut c_void) -> *mut *mut c_char,
     // strdup equivalent: PAM frees response strings with free(3), so the
     // response memory must come from the same libc allocator.
     strdup: unsafe extern "C" fn(s: *const c_char) -> *mut c_char,
@@ -107,6 +118,10 @@ fn load_pam() -> Result<PamApi, &'static str> {
             pam_authenticate: sym!("pam_authenticate"),
             pam_acct_mgmt: sym!("pam_acct_mgmt"),
             pam_end: sym!("pam_end"),
+            pam_setcred: sym!("pam_setcred"),
+            pam_open_session: sym!("pam_open_session"),
+            pam_close_session: sym!("pam_close_session"),
+            pam_getenvlist: sym!("pam_getenvlist"),
             strdup: sym!("strdup"),
         })
     }
@@ -241,4 +256,148 @@ mod tests {
             Err(reason) => tracing::debug!(%reason, "PAM unavailable in this environment"),
         }
     }
+}
+
+/// A live PAM session: the handle stays open for as long as the desktop runs.
+///
+/// Dropping this closes the session, so the keeper holds it and the worker
+/// never does — the desktop outlives every connection to it.
+pub(crate) struct LibPamSession {
+    handle: *mut c_void,
+    /// Kept alive because the conversation callback borrows it for the whole
+    /// authentication, and PAM may re-enter it during `pam_setcred`.
+    _data: Box<ConvData>,
+    closed: bool,
+}
+
+// SAFETY: the handle is only ever touched from the thread that owns this
+// value; the keeper is single-threaded by construction.
+unsafe impl Send for LibPamSession {}
+
+impl LibPamSession {
+    /// Authenticate `user` and open a PAM session for them.
+    ///
+    /// Call order is the contract (see `session::pam_session::PamSessionApi`):
+    /// authenticate, account check, `setcred(ESTABLISH)`, then
+    /// `open_session`. `pam_systemd` needs established credentials before it
+    /// will register the logind session and create `/run/user/<uid>`.
+    pub(crate) fn open(user: &str, password: &str) -> Result<(Self, Vec<(String, String)>), String> {
+        let c_user = CString::new(user).map_err(|_| "username contains NUL".to_owned())?;
+        let c_pass = CString::new(password).map_err(|_| "password contains NUL".to_owned())?;
+
+        let api = match PAM.get_or_init(load_pam) {
+            Ok(api) => api,
+            Err(reason) => return Err((*reason).to_owned()),
+        };
+
+        let data = Box::new(ConvData {
+            user: c_user,
+            password: c_pass,
+        });
+        let conv_struct = PamConv {
+            conv,
+            appdata_ptr: (&raw const *data).cast::<c_void>().cast_mut(),
+        };
+
+        // SAFETY: every call below uses a handle produced by pam_start on the
+        // line above; each failure path ends the handle before returning, so
+        // no handle escapes un-ended.
+        unsafe {
+            let service = CString::new(PAM_SERVICE_LINRDP).expect("static, no NUL");
+            let mut handle: *mut c_void = std::ptr::null_mut();
+            let status = (api.pam_start)(service.as_ptr(), data.user.as_ptr(), &conv_struct, &mut handle);
+            if status != PAM_SUCCESS {
+                return Err(format!("pam_start: {status}"));
+            }
+
+            let mut fail = |code: c_int, what: &str| -> String {
+                (api.pam_end)(handle, code);
+                format!("{what}: {code}")
+            };
+
+            let auth = (api.pam_authenticate)(handle, 0);
+            if auth != PAM_SUCCESS {
+                return Err(fail(auth, "pam_authenticate"));
+            }
+            let acct = (api.pam_acct_mgmt)(handle, 0);
+            if acct != PAM_SUCCESS {
+                return Err(fail(acct, "pam_acct_mgmt"));
+            }
+            let cred = (api.pam_setcred)(handle, PAM_ESTABLISH_CRED);
+            if cred != PAM_SUCCESS {
+                return Err(fail(cred, "pam_setcred"));
+            }
+            let sess = (api.pam_open_session)(handle, 0);
+            if sess != PAM_SUCCESS {
+                (api.pam_setcred)(handle, PAM_DELETE_CRED);
+                return Err(fail(sess, "pam_open_session"));
+            }
+
+            let env = read_env(api, handle);
+            Ok((
+                Self {
+                    handle,
+                    _data: data,
+                    closed: false,
+                },
+                env,
+            ))
+        }
+    }
+
+    /// Close the session and end the handle. Idempotent.
+    pub(crate) fn close(&mut self) -> Result<(), String> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        let api = match PAM.get_or_init(load_pam) {
+            Ok(api) => api,
+            Err(reason) => return Err((*reason).to_owned()),
+        };
+        // SAFETY: `handle` came from pam_start and has not been ended yet.
+        unsafe {
+            let sess = (api.pam_close_session)(self.handle, 0);
+            (api.pam_setcred)(self.handle, PAM_DELETE_CRED);
+            (api.pam_end)(self.handle, sess);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for LibPamSession {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+/// Copy PAM's environment list into owned pairs.
+///
+/// The list and its strings are allocated by PAM with malloc; this reads them
+/// and leaks the array deliberately — the alternative is calling free(3) on
+/// each element, and the leak is bounded by one session.
+unsafe fn read_env(api: &PamApi, handle: *mut c_void) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    // SAFETY: pam_getenvlist returns a NULL-terminated array of NUL-terminated
+    // "KEY=VALUE" strings, or NULL.
+    unsafe {
+        let list = (api.pam_getenvlist)(handle);
+        if list.is_null() {
+            return out;
+        }
+        let mut i = 0isize;
+        loop {
+            let entry = *list.offset(i);
+            if entry.is_null() {
+                break;
+            }
+            if let Ok(text) = std::ffi::CStr::from_ptr(entry).to_str()
+                && let Some((k, v)) = text.split_once('=')
+            {
+                out.push((k.to_owned(), v.to_owned()));
+            }
+            i += 1;
+        }
+    }
+    out
 }
