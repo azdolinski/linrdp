@@ -328,11 +328,20 @@ async fn main() -> anyhow::Result<()> {
     // the TCP bootstrap PDU and the UDP accept loop, binding the two
     // transports to one session via the security cookie. The event channel
     // connects the tunnel to the session (Soft-Sync + DVC data pump).
-    let multitransport = match udp::spawn(bind_addr, &identity, server.event_sender().clone()) {
-        Ok(request) => Some(request),
-        Err(error) => {
-            tracing::warn!(%error, "RDP-UDP listener unavailable; serving TCP-only");
-            None
+    // LINRDP_NO_UDP=1 skips the listener entirely — TCP-only sessions, used
+    // to bisect transport bugs (a corrupted big frame over the fresh UDP
+    // tunnel makes mstsc fire its CapsAdvertise decoder recovery, which the
+    // session never survives).
+    let multitransport = if std::env::var("LINRDP_NO_UDP").as_deref() == Ok("1") {
+        tracing::warn!("LINRDP_NO_UDP=1 — UDP disabled, serving TCP-only");
+        None
+    } else {
+        match udp::spawn(bind_addr, &identity, server.event_sender().clone()) {
+            Ok(request) => Some(request),
+            Err(error) => {
+                tracing::warn!(%error, "RDP-UDP listener unavailable; serving TCP-only");
+                None
+            }
         }
     };
     server.set_multitransport(multitransport);

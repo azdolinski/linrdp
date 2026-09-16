@@ -347,6 +347,8 @@ impl RdpServerDisplay for EgfxDisplay {
             started: Instant::now(),
             avc444v2_enabled: false,
             avc444v2_luma_only: false,
+            v2_start_luma: 0,
+            v2_luma_lead: 0,
             stat_frames: 0,
             stat_h264: 0,
             stat_clear: 0,
@@ -445,6 +447,13 @@ struct EgfxUpdates {
     /// When set, v2 frames carry the luma substream only (LC=1) — bisect
     /// mode for the v2 envelope vs chroma packing.
     avc444v2_luma_only: bool,
+    /// LINRDP_V2_START_LUMA=N: send N luma-only (LC=1) v2 frames of a fresh
+    /// surface before the first dual-view (LC=0) frame. mstsc's v2 decoder
+    /// bootstrap: every session whose FIRST frame was dual-view died in its
+    /// CapsAdvertise recovery; healthy sessions started luma-only.
+    v2_start_luma: u32,
+    /// Remaining luma-only lead frames for the current surface.
+    v2_luma_lead: u32,
     started: Instant,
     stat_frames: u64,
     stat_h264: u64,
@@ -1132,8 +1141,14 @@ impl EgfxUpdates {
         // chroma-view packing.
         let avc444v2_requested = std::env::var("LINRDP_AVC444V2").as_deref() == Ok("1");
         let luma_only = std::env::var("LINRDP_AVC444V2_LUMA_ONLY").as_deref() == Ok("1");
+        let v2_start_luma = std::env::var("LINRDP_V2_START_LUMA")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
         self.avc444v2_enabled = server.supports_avc444v2() && avc444v2_requested;
         self.avc444v2_luma_only = luma_only;
+        self.v2_start_luma = v2_start_luma;
+        self.v2_luma_lead = v2_start_luma;
 
         let Some(id) = server.create_surface_with_format(pad_width, pad_height, PixelFormat::XRgb) else {
             tracing::warn!("EGFX: surface creation failed — legacy path resumes next frame");
@@ -1542,8 +1557,11 @@ impl EgfxUpdates {
         let mut server = handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let sent = if avc444v2 {
-            let chroma_bitstream = if luma_only {
-                Vec::new() // bisect mode: luma substream only (LC=1)
+            // Fresh-surface luma-only lead (see `v2_start_luma`): mstsc's v2
+            // decoder must see the luma view before the first dual-view frame.
+            let luma_lead_active = self.v2_luma_lead > 0;
+            let chroma_bitstream = if luma_only || luma_lead_active {
+                Vec::new() // luma substream only (LC=1)
             } else {
                 chroma_bs.unwrap_or_default()
             };
@@ -1583,6 +1601,9 @@ impl EgfxUpdates {
             self.last_sent += 1;
             self.last_h264 = Instant::now();
             self.pending_full = false;
+            if self.v2_luma_lead > 0 {
+                self.v2_luma_lead -= 1;
+            }
         } else {
             self.pending_full = true;
         }
