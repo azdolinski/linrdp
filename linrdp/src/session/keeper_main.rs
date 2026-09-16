@@ -43,6 +43,7 @@ pub(crate) fn run(args: &KeeperArgs) -> anyhow::Result<()> {
         .context("read the session password from stdin")?;
     let password = password.trim_end_matches(['\n', '\r']).to_owned();
 
+    tracing::info!(user = %args.user, display = args.display, "keeper starting");
     let ids = privilege::lookup_user(&args.user)?;
 
     // Claim the display here, in the process that will hold it for the
@@ -52,6 +53,7 @@ pub(crate) fn run(args: &KeeperArgs) -> anyhow::Result<()> {
     let lease = display_alloc::allocate(&args.state_dir, args.display..=args.display)
         .with_context(|| format!("claim display :{}", args.display))?;
 
+    tracing::debug!(display = args.display, "display claimed; opening the PAM session");
     let (mut pam, env) = crate::pam::LibPamSession::open(&args.user, &password)
         .map_err(|e| anyhow::anyhow!("open a PAM session for {}: {e}", args.user))?;
     drop(password);
@@ -62,6 +64,7 @@ pub(crate) fn run(args: &KeeperArgs) -> anyhow::Result<()> {
         .map(|(_, v)| v.clone())
         .context("PAM gave no XDG_RUNTIME_DIR — is pam_systemd.so in /etc/pam.d/linrdp?")?;
 
+    tracing::debug!(runtime_dir = %runtime_dir, "PAM session open; writing the X cookie");
     let xauthority = xauth::write_cookie(&runtime_dir, args.display, &ids)?;
     let rec = registry::SessionRecord {
         user: args.user.clone(),
@@ -75,12 +78,18 @@ pub(crate) fn run(args: &KeeperArgs) -> anyhow::Result<()> {
     let x_log = args.state_dir.join(format!("display-{}.log", args.display));
     let x_cmd = keeper::xvfb_command(args.display, &rec.xauthority, args.size);
     let env_pairs = keeper::session_env(&rec, &ids);
+    tracing::debug!(display = args.display, log = %x_log.display(), "starting the X server");
     let x_pid = keeper::spawn_child(&x_cmd, &env_pairs, &ids, &x_log)
         .with_context(|| format!("start the X server for {} on :{}", args.user, args.display))?;
 
     // Only now is the display real. Publishing the record earlier is what let
     // a failed start masquerade as a healthy session.
     keeper::wait_for_display(args.display, core::time::Duration::from_secs(10)).inspect_err(|_| {
+        tracing::error!(
+            display = args.display,
+            log = %x_log.display(),
+            "the X server never published its socket — its own output is in that log"
+        );
         // SAFETY: a pid this process created and has not reaped.
         unsafe { libc::kill(x_pid, libc::SIGTERM) };
     })?;

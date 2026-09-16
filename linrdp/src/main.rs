@@ -96,7 +96,7 @@ fn keeper_main() -> anyhow::Result<()> {
     let mut args = pico_args::Arguments::from_env();
     let _ = args.contains("--keeper");
     let user: String = args.value_from_str("--keeper-user")?;
-    let display: u16 = args.value_from_str("--keeper-display")?;
+    let display_number: u16 = args.value_from_str("--keeper-display")?;
     let state_dir = session::keeper_main::state_dir_from(args.opt_value_from_str("--keeper-state-dir")?);
     let size_spec: String = args.opt_value_from_str("--keeper-size")?.unwrap_or_else(|| "1920x1080".to_owned());
     let session_exec: String = args.opt_value_from_str("--keeper-exec")?.unwrap_or_default();
@@ -133,12 +133,25 @@ fn keeper_main() -> anyhow::Result<()> {
         _ => unsafe { libc::_exit(0) },
     }
 
-    session::keeper_main::run(&session::keeper_main::KeeperArgs {
+    let args = session::keeper_main::KeeperArgs {
         user,
-        display,
+        display: display_number,
         state_dir,
         size,
         session_exec,
+    };
+    let user_for_log = args.user.clone();
+    // Log the failure before returning it. The worker spawns this process
+    // with stdout and stderr on /dev/null, so an Err out of main goes nowhere
+    // — which is exactly why a failed session reported only "start the
+    // session keeper for <user>" with no cause attached.
+    session::keeper_main::run(&args).inspect_err(|error| {
+        tracing::error!(
+            user = %user_for_log,
+            display = display_number,
+            error = format!("{error:#}"),
+            "session keeper failed"
+        );
     })
 }
 
