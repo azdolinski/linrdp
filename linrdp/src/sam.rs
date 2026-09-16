@@ -64,6 +64,16 @@ pub(crate) fn set_password(username: &str, password: &str) -> std::io::Result<()
     Ok(())
 }
 
+/// The account names the SAM holds, sorted. Empty when the store is missing.
+///
+/// Names only — the secrets stay in this module. Callers want to report what
+/// is provisioned, never what the passwords are.
+pub(crate) fn account_names() -> Vec<String> {
+    let mut names: Vec<String> = load().unwrap_or_default().into_keys().collect();
+    names.sort();
+    names
+}
+
 /// Look up one user's stored password (None = not provisioned / locked).
 pub(crate) fn lookup(username: &str) -> std::io::Result<Option<String>> {
     Ok(load()?.get(username).cloned())

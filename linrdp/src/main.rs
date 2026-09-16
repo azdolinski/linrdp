@@ -156,6 +156,25 @@ fn keeper_main() -> anyhow::Result<()> {
 }
 
 /// Report what linrdp can do on this machine.
+
+/// An empty SAM makes every login fail as "invalid username", which reads
+/// like the user typed the wrong name.
+///
+/// NLA needs the account secret (MS-NLMP), so `/etc/shadow` cannot serve it
+/// and linrdp keeps its own store. When that store is empty — never
+/// provisioned, or emptied by accident — CredSSP denies every logon with a
+/// message about the *name*, and nothing anywhere says the store is the
+/// problem. Say it at startup, where it is cheap to read.
+fn warn_if_no_accounts() {
+    if sam::account_names().is_empty() {
+        tracing::warn!(
+            store = %sam::sam_path().display(),
+            "no NLA accounts are provisioned — every login will be denied as \
+             'invalid username'. Provision one with: linrdp --set-password USER:PASSWORD"
+        );
+    }
+}
+
 fn doctor() -> anyhow::Result<()> {
     use session::detect::Verdict;
 
@@ -168,6 +187,15 @@ fn doctor() -> anyhow::Result<()> {
             "none".to_owned()
         } else {
             caps.x_servers.join(", ")
+        }
+    );
+    let accounts = sam::account_names();
+    println!(
+        "  NLA accounts : {}",
+        if accounts.is_empty() {
+            format!("none provisioned in {}", sam::sam_path().display())
+        } else {
+            accounts.join(", ")
         }
     );
     println!(
@@ -220,6 +248,17 @@ fn doctor() -> anyhow::Result<()> {
                 println!("  BLOCKER {m}");
             }
         }
+    }
+
+    // Not part of `verdicts`, which reports what the *machine* can do: an
+    // empty account store is a provisioning state, and it blocks every login
+    // with a message that blames the username instead.
+    if accounts.is_empty() {
+        blockers += 1;
+        println!(
+            "  BLOCKER no NLA account is provisioned — every login is denied as \
+             'invalid username'; run: linrdp --set-password USER:PASSWORD"
+        );
     }
 
     println!();
@@ -329,6 +368,7 @@ async fn serve() -> anyhow::Result<()> {
     setup_logging(log_file.as_deref());
 
     tracing::info!(%bind_addr, "LinRDP starting — auth: /etc/shadow accounts");
+    warn_if_no_accounts();
 
     let identity = tls::load_or_generate_identity().context("failed to prepare TLS identity")?;
     let acceptor = identity.make_acceptor().context("failed to build TLS acceptor")?;

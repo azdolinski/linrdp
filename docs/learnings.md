@@ -435,6 +435,27 @@ and the server reverted.
   capture connection: it is opened when the client arrives and closed when it
   leaves, which is precisely the lifetime a per-client desktop size should have.
 
+### Destroying the credential store while tidying up
+
+Cleaning up a test account, I ran
+`open(p,'w').write('\n'.join(l for l in open(p).read().splitlines() if ...))`.
+Python evaluates `open(p,'w')` **first**, which truncates the file; the
+argument then reads the file it just emptied. `/var/lib/linrdp/sam` lost every
+account, including the operator's own, and no backup existed — the passwords
+are plaintext by NTLM's requirement, and I had deliberately never read them.
+
+The failure that followed said `LogonDenied: invalid username`, which points at
+the person typing their name.
+
+- **Never read and write the same file in one expression.** Read into a
+  variable, write from the variable — or write a temp file and rename.
+- **A filter-in-place on a credential store is a destructive operation** and
+  deserves the same care as a delete: look at the file first, keep a copy.
+- **An error message that blames the input hides a missing store.** linrdp now
+  warns at startup when no NLA account is provisioned and `doctor` reports the
+  provisioned names, so "invalid username" can no longer mean "the store is
+  empty" without saying so.
+
 ## Invariants now enforced (keep them)
 
 19. Every X connection in a multi-session worker goes through `gate::connect`,
@@ -445,3 +466,5 @@ and the server reverted.
     each client over the capture connection, never by shelling out to xrandr.
 21. A resize that the X server refuses is a warning, not a failed session. An
     old desktop served at its own size beats no desktop at all.
+22. An empty NLA store is reported at startup and as a `doctor` blocker,
+    because CredSSP's own message for it blames the username.
