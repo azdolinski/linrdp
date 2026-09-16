@@ -969,22 +969,6 @@ impl EgfxUpdates {
 
     /// Process one grab through the graphics pipeline.
     async fn egfx_frame(&mut self, handle: &GfxHandle, grab: Grab) {
-        // The client re-advertised caps mid-session (decoder recovery): the
-        // surface stays, but the decoder gets a fresh IDR (new SPS/PPS via an
-        // encoder re-create) to resync against.
-        if self.session.take_force_idr() {
-            tracing::info!("caps re-advertised — forcing an IDR, surface untouched");
-            if let Some(Encoders { luma, chroma, .. }) = self.encoders.as_mut() {
-                if let Some(enc) = luma {
-                    enc.force_intra();
-                }
-                if let Some(enc) = chroma {
-                    enc.force_intra();
-                }
-            }
-            self.pending_full = true;
-        }
-
         // New connection or screen resize: re-create the surface.
         let generation_changed = !self.generation.as_ref().is_some_and(|g| Arc::ptr_eq(g, handle));
         let size_changed = !self
