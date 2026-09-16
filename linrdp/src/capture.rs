@@ -535,6 +535,71 @@ impl Drop for ShmCapture {
     }
 }
 
+/// What one poll of the screen produced.
+///
+/// The distinction between `Idle` and `Failed` is the whole point of this
+/// type: a static desktop and a dead X server both used to collapse into a
+/// bare `None`, so ~0.5 s of an unchanging screen was indistinguishable from
+/// the connection dying — see [`GrabFailures`].
+enum PollOutcome {
+    /// The damage gate reported no change; no grab was attempted.
+    Idle,
+    /// A frame (its `damage` field says whether any tile actually changed).
+    Frame(Box<Grab>),
+    /// The grab itself failed — the X connection may be gone.
+    Failed,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PollKind {
+    Idle,
+    Frame,
+    Failed,
+}
+
+impl PollOutcome {
+    fn kind(&self) -> PollKind {
+        match self {
+            Self::Idle => PollKind::Idle,
+            Self::Frame(_) => PollKind::Frame,
+            Self::Failed => PollKind::Failed,
+        }
+    }
+}
+
+/// Consecutive-grab-failure accounting for the poll loop.
+///
+/// An idle poll must leave the counter alone: it proves neither that the
+/// connection works nor that it is broken. Counting idle polls as failures
+/// made a static screen trip the reconnect after ~0.5 s, and every spurious
+/// reconnect dropped the diff baseline and forced a full-screen lossless
+/// repaint (~1.2 MB at 2880x1800, once or twice a second on a quiet desktop).
+#[derive(Default)]
+struct GrabFailures {
+    consecutive: u32,
+}
+
+impl GrabFailures {
+    /// Record one poll. Returns the failure count when a reconnect is due.
+    fn record(&mut self, kind: PollKind) -> Option<u32> {
+        match kind {
+            PollKind::Idle => None,
+            PollKind::Frame => {
+                self.consecutive = 0;
+                None
+            }
+            PollKind::Failed => {
+                self.consecutive = self.consecutive.saturating_add(1);
+                let n = self.consecutive;
+                let due = n == GRAB_FAILURES_BEFORE_RECONNECT
+                    || (n > GRAB_FAILURES_BEFORE_RECONNECT
+                        && (n - GRAB_FAILURES_BEFORE_RECONNECT) % GRAB_RECONNECT_RETRY_EVERY == 0);
+                due.then_some(n)
+            }
+        }
+    }
+}
+
 /// Reusable screen poller: grabs the X11 root and computes tile-level damage
 /// against the previous grab. Shared by the legacy bitmap path (`Updates`)
 /// and the EGFX display backend.
@@ -545,7 +610,7 @@ pub(crate) struct ScreenGrabber {
     height: u16,
     prev_frame: Option<Vec<u8>>,
     display_name: String,
-    consecutive_failures: u32,
+    failures: GrabFailures,
     /// Whether XFixes QueryVersion has been exchanged on this connection
     /// (reset by reconnect — a fresh connection must renegotiate).
     xfixes_negotiated: bool,
@@ -588,7 +653,7 @@ impl ScreenGrabber {
             height,
             prev_frame: None,
             display_name,
-            consecutive_failures: 0,
+            failures: GrabFailures::default(),
             xfixes_negotiated: false,
             shm: None,
             shm_failures: 0,
@@ -763,17 +828,8 @@ impl ScreenGrabber {
     /// Grab the current screen contents and diff them against the previous
     /// grab. Returns `None` on a transient X11 failure (retry next tick).
     pub(crate) fn poll(&mut self) -> Option<Grab> {
-        let grab = self.poll_inner();
-        if grab.is_some() {
-            self.consecutive_failures = 0;
-            return grab;
-        }
-        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        let failures = self.consecutive_failures;
-        let due = failures == GRAB_FAILURES_BEFORE_RECONNECT
-            || (failures > GRAB_FAILURES_BEFORE_RECONNECT
-                && (failures - GRAB_FAILURES_BEFORE_RECONNECT) % GRAB_RECONNECT_RETRY_EVERY == 0);
-        if due {
+        let outcome = self.poll_inner();
+        if let Some(failures) = self.failures.record(outcome.kind()) {
             if self.reconnect() {
                 tracing::warn!(
                     display = %self.display_name,
@@ -788,7 +844,10 @@ impl ScreenGrabber {
                 );
             }
         }
-        grab
+        match outcome {
+            PollOutcome::Frame(grab) => Some(*grab),
+            PollOutcome::Idle | PollOutcome::Failed => None,
+        }
     }
 
     /// One screen grab plus, when `cursor_due`, a fresh cursor image.
@@ -835,23 +894,25 @@ impl ScreenGrabber {
         })
     }
 
-    fn poll_inner(&mut self) -> Option<Grab> {
+    fn poll_inner(&mut self) -> PollOutcome {
         // Damage gate: skip the whole GetImage + diff when the root window has
         // not changed since the previous grab. The first grab (and the first
         // after a reconnect) is forced so the diff baseline exists.
         let force = std::mem::take(&mut self.force_grab);
         if !force && !self.damage_pending() {
-            return None;
+            return PollOutcome::Idle; // static screen: healthy, not a failure
         }
         // Re-arm BEFORE taking the image: any change that happens after the
         // subtraction re-arms the damage, so it can never be silently
         // swallowed by a grab that already contains it.
         self.rearm_damage();
 
-        let (data, width, height) = tokio::task::block_in_place(|| self.grab())?;
+        let Some((data, width, height)) = tokio::task::block_in_place(|| self.grab()) else {
+            return PollOutcome::Failed;
+        };
         let stride = usize::from(width) * 4;
         if data.len() != stride * usize::from(height) {
-            return None; // geometry changed mid-grab; retry next tick
+            return PollOutcome::Failed; // geometry changed mid-grab; retry next tick
         }
 
         if self.width != width || self.height != height {
@@ -871,14 +932,14 @@ impl ScreenGrabber {
         if damage.is_some() {
             self.prev_frame = Some(data.clone());
         }
-        Some(Grab {
+        PollOutcome::Frame(Box::new(Grab {
             data,
             width,
             height,
             damage,
             changed_tiles,
             total_tiles,
-        })
+        }))
     }
 
     /// Whether the root window changed since the last grab, per the DAMAGE
@@ -1198,7 +1259,9 @@ impl crate::gfx_display::FrameSource for X11Source {
 
 #[cfg(test)]
 mod tests {
-    use super::argb_to_rdp_xor;
+    use super::{
+        GRAB_FAILURES_BEFORE_RECONNECT, GRAB_RECONNECT_RETRY_EVERY, GrabFailures, PollKind, argb_to_rdp_xor,
+    };
 
     #[test]
     fn cursor_conversion_preserves_alpha_and_flips_rows() {
@@ -1227,5 +1290,62 @@ mod tests {
         let px = 0xFF00_FF80u32; // a=255 r=0 g=255 b=128
         let xor = argb_to_rdp_xor(&[px], 1, 1);
         assert_eq!(&xor[0..4], &[0x00, 0xFF, 0x80, 0xFF]);
+    }
+
+    /// A static desktop must never look like a dead X server.
+    ///
+    /// Regression: `poll_inner` returned a bare `None` both for "the damage
+    /// gate saw no change" and for "the grab failed", and `poll` counted
+    /// every `None` as a failure. ~0.5 s of an unchanging screen therefore
+    /// tripped the reconnect, which drops the diff baseline and forces a
+    /// full-screen lossless repaint — measured live at 37 repaints of 1.2 MB
+    /// in one quiet session, ~1.7 MB/s for a desktop that was barely moving.
+    #[test]
+    fn idle_polls_never_trigger_a_reconnect() {
+        let mut failures = GrabFailures::default();
+
+        for _ in 0..(GRAB_FAILURES_BEFORE_RECONNECT * 10) {
+            assert_eq!(failures.record(PollKind::Idle), None, "an idle poll is not a failure");
+        }
+    }
+
+    /// Idle polls must not mask a genuinely dead connection either: a run of
+    /// real failures still reconnects, whatever idle polls sit between them.
+    #[test]
+    fn real_failures_still_reconnect_across_idle_polls() {
+        let mut failures = GrabFailures::default();
+
+        for _ in 0..(GRAB_FAILURES_BEFORE_RECONNECT - 1) {
+            assert_eq!(failures.record(PollKind::Failed), None);
+            assert_eq!(failures.record(PollKind::Idle), None, "idle must not reset the run");
+        }
+
+        assert_eq!(
+            failures.record(PollKind::Failed),
+            Some(GRAB_FAILURES_BEFORE_RECONNECT),
+            "the 30th consecutive failure reconnects"
+        );
+    }
+
+    /// A successful grab clears the run, and the retry cadence after the
+    /// first reconnect is every GRAB_RECONNECT_RETRY_EVERY failures.
+    #[test]
+    fn a_frame_resets_the_run_and_retries_are_paced() {
+        let mut failures = GrabFailures::default();
+
+        for _ in 0..(GRAB_FAILURES_BEFORE_RECONNECT - 1) {
+            assert_eq!(failures.record(PollKind::Failed), None);
+        }
+        assert_eq!(failures.record(PollKind::Frame), None, "a frame clears the run");
+        assert_eq!(failures.record(PollKind::Failed), None, "the run restarts from one");
+
+        let mut failures = GrabFailures::default();
+        let mut reconnects = 0;
+        for _ in 0..(GRAB_FAILURES_BEFORE_RECONNECT + GRAB_RECONNECT_RETRY_EVERY * 2) {
+            if failures.record(PollKind::Failed).is_some() {
+                reconnects += 1;
+            }
+        }
+        assert_eq!(reconnects, 3, "first at 30, then every 60");
     }
 }
