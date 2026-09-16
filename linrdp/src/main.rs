@@ -67,6 +67,12 @@ Verbosity: LINRDP_LOG env var (default \"info,ironrdp=warn\").
 /// runtime leaves only the calling thread alive in the child. So the argv is
 /// inspected before any runtime exists, and the supervisor never builds one.
 fn main() -> anyhow::Result<()> {
+    // `doctor` answers "what is this machine, and what may linrdp do on it?"
+    // before anything is started, so a missing piece is a report rather than
+    // a runtime failure with no explanation.
+    if std::env::args().nth(1).as_deref() == Some("doctor") {
+        return doctor();
+    }
     if std::env::args().any(|arg| arg == "--supervisor") {
         return supervisor_main();
     }
@@ -75,6 +81,82 @@ fn main() -> anyhow::Result<()> {
         .build()
         .context("build tokio runtime")?
         .block_on(serve())
+}
+
+/// Report what linrdp can do on this machine.
+fn doctor() -> anyhow::Result<()> {
+    use session::detect::Verdict;
+
+    let caps = session::detect::probe();
+    println!("linrdp doctor");
+    println!("  distribution : {}", caps.distro);
+    println!(
+        "  X servers    : {}",
+        if caps.x_servers.is_empty() {
+            "none".to_owned()
+        } else {
+            caps.x_servers.join(", ")
+        }
+    );
+    println!(
+        "  logind       : {}",
+        if caps.logind { "yes" } else { "no" }
+    );
+    println!(
+        "  PAM service  : {}",
+        if caps.pam_service {
+            "/etc/pam.d/linrdp"
+        } else {
+            "missing"
+        }
+    );
+    println!(
+        "  lockers      : {}",
+        if caps.lockers.is_empty() {
+            "none".to_owned()
+        } else {
+            caps.lockers.join(", ")
+        }
+    );
+
+    println!("\n  desktop sessions:");
+    if caps.sessions.is_empty() {
+        println!("    (none found in /usr/share/xsessions or /usr/share/wayland-sessions)");
+    }
+    for s in &caps.sessions {
+        println!(
+            "    {:<18} {:<8} {:<10} {}",
+            s.id,
+            match s.kind {
+                session::detect::SessionKind::X11 => "x11",
+                session::detect::SessionKind::Wayland => "wayland",
+            },
+            if s.runnable { "runnable" } else { "MISSING" },
+            s.exec
+        );
+    }
+
+    let verdicts = session::detect::verdicts(&caps);
+    println!();
+    let mut blockers = 0;
+    for verdict in &verdicts {
+        match verdict {
+            Verdict::Ok(m) => println!("  ok      {m}"),
+            Verdict::Warning(m) => println!("  warn    {m}"),
+            Verdict::Blocker(m) => {
+                blockers += 1;
+                println!("  BLOCKER {m}");
+            }
+        }
+    }
+
+    println!();
+    if blockers == 0 {
+        println!("  Per-user sessions can run on this machine.");
+    } else {
+        println!("  {blockers} blocker(s): per-user sessions cannot run until these are fixed.");
+    }
+    Ok(())
 }
 
 /// Accept on the bind address and fork a worker per connection.
