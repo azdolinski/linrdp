@@ -78,6 +78,9 @@ fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("doctor") {
         return doctor();
     }
+    if std::env::args().any(|arg| arg == "--keeper") {
+        return keeper_main();
+    }
     if std::env::args().any(|arg| arg == "--supervisor") {
         return supervisor_main();
     }
@@ -86,6 +89,41 @@ fn main() -> anyhow::Result<()> {
         .build()
         .context("build tokio runtime")?
         .block_on(serve())
+}
+
+/// Own one user's session for its whole life (see `session::keeper_main`).
+fn keeper_main() -> anyhow::Result<()> {
+    let mut args = pico_args::Arguments::from_env();
+    let _ = args.contains("--keeper");
+    let user: String = args.value_from_str("--keeper-user")?;
+    let display: u16 = args.value_from_str("--keeper-display")?;
+    let state_dir = session::keeper_main::state_dir_from(args.opt_value_from_str("--keeper-state-dir")?);
+    let size_spec: String = args.opt_value_from_str("--keeper-size")?.unwrap_or_else(|| "1920x1080".to_owned());
+    let session_exec: String = args.opt_value_from_str("--keeper-exec")?.unwrap_or_default();
+    let log_file: Option<String> = args.opt_value_from_str("--log-file")?;
+    setup_logging(log_file.as_deref());
+
+    let size = match size_spec.split_once(['x', 'X']) {
+        Some((w, h)) => (
+            w.trim().parse().context("--keeper-size width")?,
+            h.trim().parse().context("--keeper-size height")?,
+        ),
+        None => anyhow::bail!("--keeper-size expects <WIDTHxHEIGHT>"),
+    };
+
+    // Detach from the worker that spawned us: the session must outlive the
+    // connection, and a keeper still in the worker's process group would be
+    // torn down with it.
+    // SAFETY: setsid on a process that is not already a group leader.
+    unsafe { libc::setsid() };
+
+    session::keeper_main::run(&session::keeper_main::KeeperArgs {
+        user,
+        display,
+        state_dir,
+        size,
+        session_exec,
+    })
 }
 
 /// Report what linrdp can do on this machine.

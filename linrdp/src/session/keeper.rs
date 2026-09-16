@@ -114,6 +114,56 @@ pub(crate) fn wait_for_display(display: u16, timeout: core::time::Duration) -> a
     anyhow::bail!("X server for :{display} did not start within {timeout:?}")
 }
 
+/// Start `cmd` as a direct child, running as `user`, and return its pid.
+///
+/// Used by the keeper, which stays alive to supervise what it starts — so
+/// unlike [`spawn_detached`] the child is reapable and its death is
+/// observable, which is what lets the keeper end the session when the X
+/// server exits.
+pub(crate) fn spawn_child(
+    cmd: &DesktopCommand,
+    env: &[(String, String)],
+    user: &UserIds,
+    log_path: &std::path::Path,
+) -> anyhow::Result<i32> {
+    let resolved = resolve_program(&cmd.program)
+        .with_context(|| format!("{} not found in PATH", cmd.program))?;
+    let program = std::ffi::CString::new(resolved.as_str()).context("program name NUL")?;
+    let mut argv_owned = vec![program.clone()];
+    for a in &cmd.args {
+        argv_owned.push(std::ffi::CString::new(a.as_str()).context("argument NUL")?);
+    }
+    let mut envp_owned = Vec::with_capacity(env.len());
+    for (k, v) in env {
+        envp_owned.push(std::ffi::CString::new(format!("{k}={v}")).context("env NUL")?);
+    }
+    let log_c = std::ffi::CString::new(log_path.as_os_str().as_encoded_bytes()).context("log path NUL")?;
+
+    // SAFETY: the keeper is single-threaded, so the child inherits a
+    // consistent address space.
+    match unsafe { libc::fork() } {
+        -1 => anyhow::bail!("fork: {}", std::io::Error::last_os_error()),
+        0 => {
+            redirect_stdio(&log_c);
+            if crate::session::privilege::drop_to(user).is_err() {
+                // SAFETY: _exit is async-signal-safe and never returns.
+                unsafe { libc::_exit(1) };
+            }
+            let mut argv: Vec<*const std::ffi::c_char> = argv_owned.iter().map(|a| a.as_ptr()).collect();
+            argv.push(std::ptr::null());
+            let mut envp: Vec<*const std::ffi::c_char> = envp_owned.iter().map(|e| e.as_ptr()).collect();
+            envp.push(std::ptr::null());
+            // SAFETY: NUL-terminated argv/envp built above; execve only
+            // returns on failure.
+            unsafe {
+                libc::execve(program.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                libc::_exit(1)
+            }
+        }
+        pid => Ok(pid),
+    }
+}
+
 /// Start `cmd` as a detached child of init, running as `user`.
 ///
 /// Double-fork: the intermediate child exits immediately, so the grandchild

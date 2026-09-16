@@ -59,6 +59,21 @@ fn read_record(base: &Path, display: u16) -> Option<SessionRecord> {
     })
 }
 
+/// One session record by display number.
+pub(crate) fn read_one(base: &Path, display: u16) -> Option<SessionRecord> {
+    read_record(base, display)
+}
+
+/// Remove a session record (the session is over).
+pub(crate) fn forget_record(base: &Path, display: u16) -> anyhow::Result<()> {
+    let path = record_path(base, display);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow::Error::from(e).context(format!("remove {}", path.display()))),
+    }
+}
+
 /// Mark every recorded session locked.
 ///
 /// Run at supervisor start: whatever happened to the previous supervisor, the

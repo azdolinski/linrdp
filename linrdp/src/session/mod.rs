@@ -6,6 +6,7 @@ pub(crate) mod detect;
 pub(crate) mod display_alloc;
 pub(crate) mod gate;
 pub(crate) mod keeper;
+pub(crate) mod keeper_main;
 pub(crate) mod pam_session;
 pub(crate) mod privilege;
 pub(crate) mod registry;
@@ -84,15 +85,15 @@ pub(crate) fn resolve_display(
 }
 
 
-/// Build a new session for `user`: claim a display, open a PAM session so
-/// logind creates the runtime dir, write the cookie there, start the X
-/// server, and record the result.
+/// Start a session for `user` by handing it to a keeper process.
 ///
-/// The display lease and the PAM handle are deliberately leaked into the
-/// session: both must outlive this function, because the desktop outlives the
-/// connection that created it. Every early return instead drops the lease,
-/// which releases the claim — that is what stops a failed setup from
-/// stranding a display number.
+/// The keeper, not this function, owns the session: it holds the PAM handle
+/// and the display lock for as long as the desktop runs. Doing that here
+/// would tie both to the connection, which is how a dead X server first came
+/// to look like a healthy session.
+///
+/// The password goes to the keeper on a pipe, never on argv or in the
+/// environment, where any local user could read it out of /proc.
 pub(crate) fn create(
     base: &Path,
     user: &str,
@@ -100,50 +101,73 @@ pub(crate) fn create(
     range: RangeInclusive<u16>,
     size: (u16, u16),
 ) -> anyhow::Result<registry::SessionRecord> {
-    let ids = privilege::lookup_user(user)?;
-    let lease = display_alloc::allocate(base, range)?;
-
-    // PAM first: pam_systemd creates /run/user/<uid> (0700, user-owned), and
-    // there is nowhere safe to put the cookie until it exists.
-    let (pam, env) = crate::pam::LibPamSession::open(user, password)
-        .map_err(|e| anyhow::anyhow!("open a PAM session for {user}: {e}"))?;
-    let runtime_dir = env
-        .iter()
-        .find(|(k, _)| k == "XDG_RUNTIME_DIR")
-        .map(|(_, v)| v.clone())
-        .context("PAM gave no XDG_RUNTIME_DIR — is pam_systemd.so in /etc/pam.d/linrdp?")?;
-
-    let xauthority = xauth::write_cookie(&runtime_dir, lease.number, &ids)?;
-    let rec = registry::SessionRecord {
-        user: user.to_owned(),
-        display: lease.number,
-        runtime_dir,
-        xauthority: xauthority.to_string_lossy().into_owned(),
-        // A fresh session starts unlocked: the user who just authenticated
-        // is the one about to look at it.
-        locked: false,
+    // Pick a free number without keeping the claim: the keeper takes its own
+    // lock, and holding one here would make the keeper's claim fail.
+    let display = {
+        let probe = display_alloc::allocate(base, range)?;
+        probe.number
     };
 
-    let cmd = keeper::xvfb_command(rec.display, &rec.xauthority, size);
-    let env_pairs = keeper::session_env(&rec, &ids);
-    let desktop_log = base.join(format!("display-{}.log", rec.display));
-    keeper::spawn_detached(&cmd, &env_pairs, &ids, &desktop_log)
-        .with_context(|| format!("start the X server for {user} on :{}", rec.display))?;
-    // The desktop is detached, so its exec failure cannot be waited for.
-    // Without this check a failed start would be recorded as a healthy
-    // session and the connection would be routed to a display that does not
-    // exist — which is precisely how it first went wrong.
-    keeper::wait_for_display(rec.display, core::time::Duration::from_secs(5))
-        .with_context(|| format!("X server for {user} on :{}", rec.display))?;
+    let caps = detect::probe();
+    let session_exec = detect::choose_session(&caps.sessions, None)
+        .map(|s| s.exec.clone())
+        .unwrap_or_default();
+    if session_exec.is_empty() {
+        tracing::warn!(
+            "no runnable desktop session found — the user will get a bare X server. \
+             Run `linrdp doctor` to see why."
+        );
+    }
 
-    lease.record_owner(user)?;
-    registry::write_record(base, &rec)?;
+    spawn_keeper(base, user, password, display, size, &session_exec)
+        .with_context(|| format!("start the session keeper for {user}"))?;
 
-    tracing::info!(user, display = rec.display, "session created");
-    // The session now owns the claim and the PAM handle for its lifetime.
-    core::mem::forget(lease);
-    core::mem::forget(pam);
-    Ok(rec)
+    keeper_main::wait_for_record(base, display, core::time::Duration::from_secs(20))
+        .with_context(|| format!("session for {user} on :{display}"))
+}
+
+/// Fork a detached `linrdp --keeper` and feed it the password on stdin.
+fn spawn_keeper(
+    base: &Path,
+    user: &str,
+    password: &str,
+    display: u16,
+    size: (u16, u16),
+    session_exec: &str,
+) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let exe = std::env::current_exe().context("locate the linrdp binary")?;
+    let mut child = Command::new(exe)
+        .arg("--keeper")
+        .arg("--keeper-user")
+        .arg(user)
+        .arg("--keeper-display")
+        .arg(display.to_string())
+        .arg("--keeper-state-dir")
+        .arg(base)
+        .arg("--keeper-size")
+        .arg(format!("{}x{}", size.0, size.1))
+        .arg("--keeper-exec")
+        .arg(session_exec)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawn the session keeper")?;
+
+    child
+        .stdin
+        .take()
+        .context("keeper stdin")?
+        .write_all(password.as_bytes())
+        .context("hand the password to the keeper")?;
+
+    // The keeper detaches itself; this direct child exits immediately, so
+    // reap it rather than leaving a zombie.
+    let _ = child.wait();
+    Ok(())
 }
 
 /// The user's session, creating one if they have none.
