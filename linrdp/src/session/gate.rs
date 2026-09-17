@@ -11,6 +11,7 @@
 //! must go through [`display_name`], which refuses to answer until a session
 //! has actually been bound. There is no fallback to refuse into.
 
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -45,6 +46,97 @@ struct Bound {
     /// Desktop size this client negotiated — the size the session's screen is
     /// scaled to once the capture path connects.
     client_size: (u16, u16),
+    /// Which PulseAudio this worker may capture. `None` for the logon screen,
+    /// which has no audio of its own and nothing to play.
+    audio: Option<AudioTarget>,
+}
+
+/// Which PulseAudio this worker may capture, and how to authenticate to it.
+///
+/// Audio has to answer the same question the display does — *whose?* — and it
+/// has to answer it from the same place. Before this existed the capture path
+/// connected to whatever the environment named, which on a multi-session host
+/// is wrong in one of two ways. With `PULSE_SERVER` set in the service unit,
+/// every session records that one daemon: measured here, a worker serving any
+/// account captured uid 1000's mixer, so a second user was sent the first
+/// user's desktop audio. Without it, libpulse follows `XDG_RUNTIME_DIR` —
+/// which [`bind_kind`] points at the session owner while the worker is still
+/// root — and refuses outright:
+///
+/// ```text
+/// XDG_RUNTIME_DIR (/run/user/1002) is not owned by us (uid 0), but by uid 1002!
+/// ```
+///
+/// Both failures come from asking the environment a question only the session
+/// can answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AudioTarget {
+    /// libpulse server string for this session's own socket.
+    pub(crate) server: String,
+    /// The session owner's PulseAudio cookie.
+    ///
+    /// The worker is root and the daemon is the user's, so the daemon's
+    /// unix-credential check cannot pass — uid 0 is not uid 1002, and
+    /// PulseAudio gives root no exemption. Measured: without the cookie the
+    /// connection is refused with `Access denied`; with it, an authenticated
+    /// session.
+    pub(crate) cookie: PathBuf,
+    /// The session's runtime dir, which is where its audio objects live.
+    pub(crate) runtime_dir: String,
+}
+
+impl AudioTarget {
+    /// Where a session's PulseAudio lives, from the session's runtime dir and
+    /// the owner's home.
+    ///
+    /// `runtime_dir` is `/run/user/<uid>`, so the socket path needs no uid
+    /// arithmetic of its own — which is the point: there is no number here to
+    /// get wrong or to hardcode.
+    fn new(runtime_dir: &str, home: &str) -> Self {
+        Self {
+            server: format!("unix:{runtime_dir}/pulse/native"),
+            cookie: Path::new(home).join(".config").join("pulse").join("cookie"),
+            runtime_dir: runtime_dir.to_owned(),
+        }
+    }
+
+    /// The socket [`Self::server`] names, as a path that can be looked at.
+    ///
+    /// Worth looking at before connecting, because libpulse reports a missing
+    /// socket as `Access denied` — the same thing it says about a rejected
+    /// cookie. Two very different faults behind one misleading word.
+    pub(crate) fn socket(&self) -> PathBuf {
+        Path::new(&self.runtime_dir).join("pulse").join("native")
+    }
+
+    /// Whether this session belongs to uid 0.
+    ///
+    /// Root is a special case worth naming in the log: the distribution's
+    /// `pulseaudio.socket` carries `ConditionUser=!root`, so systemd never
+    /// starts a sound server for uid 0 — measured here, with the condition
+    /// reported as unmet — and a root desktop therefore has no audio for any
+    /// RDP server to capture. PulseAudio itself runs as root perfectly well;
+    /// it is the unit's condition that stops it.
+    pub(crate) fn is_root(&self) -> bool {
+        self.runtime_dir == "/run/user/0"
+    }
+
+    /// Build a target without a session, for tests in other modules that need
+    /// one to describe.
+    #[cfg(test)]
+    pub(crate) fn for_test(runtime_dir: &str, home: &str) -> Self {
+        Self::new(runtime_dir, home)
+    }
+
+    /// This session's microphone FIFO: the file a `module-pipe-source` in the
+    /// session's daemon reads as a capture device, and the file the client's
+    /// microphone packets are written into.
+    ///
+    /// Under the session's own runtime dir, next to its X cookie — the same
+    /// private per-session directory [`super::xauth::cookie_path`] uses.
+    pub(crate) fn mic_fifo(&self) -> PathBuf {
+        Path::new(&self.runtime_dir).join("linrdp").join("mic.fifo")
+    }
 }
 
 /// Mark this process as a multi-session worker: no ambient display may be
@@ -60,12 +152,33 @@ pub(crate) fn is_armed() -> bool {
 /// Bind this worker to the authenticated user's session. Idempotent; a second
 /// call with a different session is refused rather than silently ignored.
 pub(crate) fn bind(
+    user: &str,
     display: u16,
     xauthority: &str,
     runtime_dir: &str,
     client_size: (u16, u16),
 ) -> anyhow::Result<()> {
-    bind_kind(Binding::Session, display, xauthority, runtime_dir, client_size)
+    let audio = audio_for(user, runtime_dir);
+    bind_kind(Binding::Session, display, xauthority, runtime_dir, client_size, audio)
+}
+
+/// This session's audio target, or `None` with the reason in the log.
+///
+/// Audio must never fail the binding. A desktop with a screen and no sound is
+/// a working desktop; a connection refused because the cookie was missing is
+/// not.
+fn audio_for(user: &str, runtime_dir: &str) -> Option<AudioTarget> {
+    match super::privilege::lookup_user(user) {
+        Ok(ids) => Some(AudioTarget::new(runtime_dir, &ids.home)),
+        Err(error) => {
+            tracing::warn!(
+                user,
+                error = format!("{error:#}"),
+                "no home directory for this account — the session gets no audio"
+            );
+            None
+        }
+    }
 }
 
 /// Point this worker at the logon screen, before anyone has authenticated.
@@ -75,7 +188,10 @@ pub(crate) fn bind_greeter(
     runtime_dir: &str,
     client_size: (u16, u16),
 ) -> anyhow::Result<()> {
-    bind_kind(Binding::Greeter, display, xauthority, runtime_dir, client_size)
+    // No audio: the logon screen is linrdp's own X server with nobody's
+    // session on it, so there is no daemon to capture and nothing that could
+    // make a sound. Silence there is the correct behaviour, not a gap.
+    bind_kind(Binding::Greeter, display, xauthority, runtime_dir, client_size, None)
 }
 
 fn bind_kind(
@@ -84,22 +200,40 @@ fn bind_kind(
     xauthority: &str,
     runtime_dir: &str,
     client_size: (u16, u16),
+    audio: Option<AudioTarget>,
 ) -> anyhow::Result<()> {
     let wanted = Bound {
         kind,
         display: format!(":{display}"),
         xauthority: xauthority.to_owned(),
         client_size,
+        audio,
     };
     // The subsystems that start later (clipboard, selection owner) read the
     // environment, so set it too — but the gate, not the environment, is what
     // the capture and input paths trust.
+    //
+    // `PULSE_COOKIE` is here because libpulse takes the cookie only from the
+    // environment or from a client.conf: there is no argument for it on
+    // `pa_context_connect`, so the server string can be passed explicitly
+    // (and is, so a stale `PULSE_SERVER` cannot hijack a session) while the
+    // cookie cannot. It is set only for a session binding, so the greeter
+    // never carries one.
+    //
     // SAFETY: the worker is still single-threaded with respect to these; the
-    // X-touching paths connect only after this returns.
+    // X-touching paths connect only after this returns. The audio capture
+    // thread is the one reader that can already exist here — RDPSND
+    // negotiates before the logon screen accepts — and it reads the cookie
+    // only when it builds a PulseAudio context, which it does after seeing
+    // the generation below move. These four variables share that argument;
+    // it is not made weaker by the fourth.
     unsafe {
         std::env::set_var("DISPLAY", &wanted.display);
         std::env::set_var("XAUTHORITY", xauthority);
         std::env::set_var("XDG_RUNTIME_DIR", runtime_dir);
+        if let Some(audio) = &wanted.audio {
+            std::env::set_var("PULSE_COOKIE", &audio.cookie);
+        }
     }
     let mut cell = BOUND.lock().unwrap_or_else(|p| p.into_inner());
     bind_into(&mut cell, wanted)?;
@@ -202,7 +336,7 @@ pub(crate) fn connect() -> anyhow::Result<(x11rb::rust_connection::RustConnectio
         .with_context(|| format!("connect to X display {name} at {socket}"))?;
     let (stream, _peer) = x11rb::rust_connection::DefaultStream::from_unix_stream(unix)
         .with_context(|| format!("wrap the X socket for {name}"))?;
-    let (auth_name, auth_data) = super::xauth::cookie_for(std::path::Path::new(&path), display)
+    let (auth_name, auth_data) = super::xauth::cookie_for(Path::new(&path), display)
         .with_context(|| format!("no usable cookie for {name}"))?;
     let conn =
         x11rb::rust_connection::RustConnection::connect_to_stream_with_auth_info(stream, screen, auth_name, auth_data)
@@ -217,6 +351,37 @@ pub(crate) fn connect() -> anyhow::Result<(x11rb::rust_connection::RustConnectio
 /// the area it reserved for it.
 pub(crate) fn client_size() -> Option<(u16, u16)> {
     BOUND.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|b| b.client_size)
+}
+
+/// Which PulseAudio this worker may capture, if any.
+///
+/// `None` means capture nothing, and every `None` is a real answer rather
+/// than a missing one: an unarmed worker (single-session, or `--console`)
+/// keeps the ambient environment the service unit gave it, an armed worker
+/// with no session bound has no daemon to reach yet, and the logon screen has
+/// none at all. There is no fallback to some other user's daemon, which is
+/// exactly the fallback that made 3389 play uid 1000's audio to everyone.
+pub(crate) fn audio_target() -> Option<AudioTarget> {
+    if !is_armed() {
+        return None;
+    }
+    BOUND.lock().unwrap_or_else(|p| p.into_inner()).as_ref()?.audio.clone()
+}
+
+/// Where this worker's microphone FIFO is.
+///
+/// A bound session's own FIFO, or — unarmed, where the environment is a
+/// correct description of the single desktop there is — the one under
+/// `$XDG_RUNTIME_DIR`. `None` means there is nowhere to put a microphone
+/// packet, which is the honest answer while the logon screen is up: the only
+/// other place to put it would be some other account's FIFO, and that is what
+/// the literal `/run/user/1000/linrdp/mic.fifo` used to be.
+pub(crate) fn mic_fifo() -> Option<PathBuf> {
+    if !is_armed() {
+        let dir = std::env::var("XDG_RUNTIME_DIR").ok()?;
+        return Some(Path::new(&dir).join("linrdp").join("mic.fifo"));
+    }
+    Some(audio_target()?.mic_fifo())
 }
 
 /// The Xauthority for the bound session, if any.
@@ -254,7 +419,88 @@ mod tests {
             display: display.to_owned(),
             xauthority: format!("/run/user/1000/linrdp/Xauthority{display}"),
             client_size: (1920, 1080),
+            audio: match kind {
+                Binding::Greeter => None,
+                Binding::Session => Some(AudioTarget::new("/run/user/1002", "/home/rdptest")),
+            },
         }
+    }
+
+    /// The socket and the cookie both come from the session, and nothing in
+    /// either is a constant. This is the whole fix: the old capture path
+    /// reached one hardcoded daemon (`tcp:127.0.0.1:4713`, uid 1000's), so
+    /// every user heard that user's desktop.
+    #[test]
+    fn an_audio_target_names_the_sessions_own_daemon() {
+        let target = AudioTarget::new("/run/user/1002", "/home/rdptest");
+
+        assert_eq!(target.server, "unix:/run/user/1002/pulse/native");
+        assert_eq!(
+            target.cookie,
+            Path::new("/home/rdptest/.config/pulse/cookie")
+        );
+    }
+
+    /// Two sessions must never be handed the same audio target. Without this
+    /// the socket is the same string for everyone, which is the bug.
+    #[test]
+    fn two_sessions_get_different_daemons() {
+        let one = AudioTarget::new("/run/user/1002", "/home/rdptest");
+        let two = AudioTarget::new("/run/user/1003", "/home/rdptest2");
+
+        assert_ne!(one.server, two.server);
+        assert_ne!(one.cookie, two.cookie);
+        assert_ne!(one.mic_fifo(), two.mic_fifo());
+    }
+
+    /// The microphone FIFO belongs to the session, under the same private
+    /// runtime directory as its X cookie. It used to be the literal
+    /// `/run/user/1000/linrdp/mic.fifo` for every session on the host, so
+    /// this asserts the shape that made that impossible.
+    #[test]
+    fn the_mic_fifo_is_derived_from_the_session_not_from_a_uid() {
+        let target = AudioTarget::new("/run/user/1002", "/home/rdptest");
+
+        assert_eq!(
+            target.mic_fifo(),
+            Path::new("/run/user/1002/linrdp/mic.fifo")
+        );
+        assert!(
+            !target.mic_fifo().starts_with("/run/user/1000"),
+            "a session's FIFO must never resolve to another user's runtime dir"
+        );
+    }
+
+    /// The logon screen gets no audio target at all: there is no session
+    /// behind it, so there is no daemon that could legitimately be captured.
+    /// A fallback here would be some other user's desktop.
+    #[test]
+    fn the_logon_screen_has_no_audio() {
+        let mut cell = None;
+        bind_into(&mut cell, sample(Binding::Greeter, ":90")).expect("greeter binds");
+
+        assert!(cell.as_ref().expect("bound").audio.is_none());
+    }
+
+    /// After the handover the worker carries the session's audio, not the
+    /// greeter's absence of it — the same single move the display makes.
+    #[test]
+    fn the_handover_brings_the_sessions_audio_with_it() {
+        let mut cell = None;
+        bind_into(&mut cell, sample(Binding::Greeter, ":90")).expect("greeter binds");
+        bind_into(&mut cell, sample(Binding::Session, ":11")).expect("handover after login");
+
+        let audio = cell.as_ref().expect("bound").audio.as_ref().expect("session audio");
+        assert_eq!(audio.server, "unix:/run/user/1002/pulse/native");
+    }
+
+    /// An unarmed worker (single-session, or `--console`) keeps the ambient
+    /// environment the unit gave it, so nothing about that deployment
+    /// changes.
+    #[test]
+    fn an_unarmed_worker_has_no_audio_target_of_its_own() {
+        assert!(!is_armed(), "default state is unarmed");
+        assert!(audio_target().is_none());
     }
 
     /// Binding twice to the same session is fine (a reconnect); binding to a

@@ -129,6 +129,7 @@ impl SessionRouter {
                         match crate::session::attach_or_create(&state_dir, &user, &password, range, size) {
                             Ok(rec) => {
                                 if let Err(error) = crate::session::gate::bind(
+                                    &rec.user,
                                     rec.display,
                                     &rec.xauthority,
                                     &rec.runtime_dir,
@@ -179,7 +180,7 @@ impl SessionRouter {
         // The gate, not the environment, is what the capture and input paths
         // trust. Binding also sets the environment for the subsystems that
         // start later and read it (clipboard, selection owner).
-        crate::session::gate::bind(rec.display, &rec.xauthority, &rec.runtime_dir, client_size)?;
+        crate::session::gate::bind(&rec.user, rec.display, &rec.xauthority, &rec.runtime_dir, client_size)?;
         // The user just proved who they are, so the desktop is theirs to see.
         // Unlocking is recorded rather than assumed, so a later disconnect —
         // or a supervisor restart — can put it back.

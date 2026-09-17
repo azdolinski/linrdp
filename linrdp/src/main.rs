@@ -573,20 +573,13 @@ async fn serve() -> anyhow::Result<()> {
         .with_dynamic_channel_attacher(|dvc| {
             // Write client mic audio into the PulseAudio pipe-source FIFO so
             // Linux applications see it as a microphone (USB-sound-card model).
-            let mic_fifo: Option<Arc<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> =
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .open("/run/user/1000/linrdp/mic.fifo")
-                    .map(|f| Arc::new(std::sync::Mutex::new(std::io::BufWriter::new(f))))
-                    .ok();
+            //
+            // The FIFO belongs to the session, so it is resolved when packets
+            // arrive rather than here: this channel is attached before the
+            // logon screen has accepted anyone, when no session exists yet.
+            let mut fifo = mic::MicFifo::new();
             let channel = mic::MicInputChannel::new(Box::new(move |packet: Vec<u8>| {
-                if let Some(w) = &mic_fifo {
-                    use std::io::Write as _;
-                    let mut guard = w.lock().expect("mic fifo poisoned");
-                    let _ = guard.write_all(&packet);
-                    let _ = guard.flush();
-                }
-                tracing::trace!(bytes = packet.len(), "mic packet → linrdp_mic");
+                fifo.write(&packet);
             }));
             *dvc = std::mem::replace(
                 dvc,

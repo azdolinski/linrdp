@@ -1,6 +1,6 @@
 //! Probe: verifies the PulseAudio monitor capture path (same API usage as
 //! sound_real.rs). Run with `cargo run --release --example pa_capture_test`
-//! while something plays into `linrdp_sink` — expects NON-ZERO audio.
+//! while something plays into `linrdp_audio` — expects NON-ZERO audio.
 use libpulse_binding as pulse;
 use pulse::context::FlagSet as ContextFlags;
 use pulse::context::Context;
@@ -32,7 +32,7 @@ fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("stream"))?;
     stream
         .connect_record(
-            Some("linrdp_sink.monitor"),
+            Some("linrdp_audio.monitor"),
             None,
             StreamFlags::START_UNMUTED | StreamFlags::ADJUST_LATENCY,
         )
@@ -46,7 +46,7 @@ fn main() -> anyhow::Result<()> {
             _ => { mainloop.iterate(false); }
         }
     }
-    println!("capturing from linrdp_sink.monitor for 6s — play something!");
+    println!("capturing from linrdp_audio.monitor for 6s — play something!");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
     let mut got_nonzero = false;
     let mut total = 0usize;

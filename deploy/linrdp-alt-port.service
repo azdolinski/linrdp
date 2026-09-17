@@ -32,13 +32,18 @@ Wants=network-online.target
 ExecStart=/usr/local/bin/linrdp --supervisor --auth greeter --bind-addr 0.0.0.0:3390
 Environment=LINRDP_LOG=info
 # Enables the AVC444v2 layout (full-resolution chroma) where the client
-# negotiates cap version 10.6. This is not only a quality knob: at 4:2:0 the
-# motion-linger exit owes the screen a lossless repaint to undo the half-res
-# chroma, and on an idle desktop that repaint is the entire bandwidth of the
-# session — measured at 14 whole-screen ClearCodec paints per 10 s, 14.8 MB,
-# 2.8 fps at 2880x1800. Under AVC444v2 there is nothing to repair and the
-# snap-back is skipped. See gfx_display.rs (motion-linger exit).
+# negotiates cap version 10.6. A quality setting and nothing more: the idle
+# bandwidth storm this line was once credited with curing came from the tile
+# diff comparing unrelated pixels of the two frames, and that is fixed in
+# capture.rs. Full-resolution chroma is still worth having, so it stays on.
 Environment=LINRDP_AVC444V2=1
+# No audio configuration here, deliberately — and PULSE_SERVER in particular
+# would be actively wrong. Every session has a PulseAudio daemon of its own;
+# linrdp finds it through the session gate, the same place it gets the
+# display, and creates the sink and the microphone source inside it. A
+# PULSE_SERVER here overrides that for every session at once, which is
+# precisely how one account's desktop audio came to be streamed to every
+# client on this port. Nothing to add: the sessions configure themselves.
 # Root is needed to read /etc/shadow, open PAM sessions, and start each
 # session's X server as its own user.
 User=root

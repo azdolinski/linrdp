@@ -113,3 +113,110 @@ impl AsAny for MicInputChannel {
     }
 }
 
+/// Writes the client's microphone packets into the session's pipe-source
+/// FIFO, so the desktop's applications see them as a capture device.
+///
+/// Opened on the first packet, and reopened when the session gate moves — not
+/// when the channel is attached. It cannot be opened then: on the greeter
+/// port the AUDIO_INPUT channel is negotiated before anybody has logged in,
+/// so at that moment there is no session, no daemon and no FIFO. The path
+/// that was opened there instead, the literal `/run/user/1000/linrdp/mic.fifo`,
+/// belonged to whichever account happened to be uid 1000 — so on a
+/// multi-session host every client's microphone was wired into one user's
+/// desktop.
+#[derive(Debug)]
+pub(crate) struct MicFifo {
+    file: Option<std::fs::File>,
+    /// Gate generation `file` was opened at. `None` while nothing is open.
+    generation: Option<u64>,
+    /// Whether the current failure has been logged, so a session without a
+    /// microphone says so once rather than once per packet.
+    reported: bool,
+}
+
+impl MicFifo {
+    pub(crate) fn new() -> Self {
+        Self {
+            file: None,
+            generation: None,
+            reported: false,
+        }
+    }
+
+    /// Hand one packet to the session's microphone, if it has one.
+    ///
+    /// Dropping a packet is always preferable to blocking here: this runs on
+    /// the connection's own task, and a microphone that stalls it would stall
+    /// the screen with it.
+    pub(crate) fn write(&mut self, packet: &[u8]) {
+        use std::io::Write as _;
+
+        let generation = crate::session::gate::generation();
+        if self.generation != Some(generation) {
+            // The gate moved (or this is the first packet): whatever was open
+            // belongs to a session this worker is no longer serving.
+            self.file = None;
+            self.generation = Some(generation);
+            self.reported = false;
+            self.file = self.open();
+        }
+
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
+        // A single non-blocking write, and no retry. `write_all` would spin on
+        // EAGAIN when the desktop is not draining the FIFO, which for live
+        // audio is worse than losing the packet.
+        match file.write(packet) {
+            Ok(written) if written == packet.len() => {
+                tracing::trace!(bytes = written, "mic packet → linrdp_mic");
+            }
+            Ok(written) => {
+                tracing::debug!(
+                    written,
+                    len = packet.len(),
+                    "the microphone FIFO was full — dropped the rest of this packet"
+                );
+            }
+            Err(error) => {
+                // The reader went away (the daemon unloaded the module, or the
+                // session ended). Drop the handle so the next packet reopens.
+                tracing::debug!(error = %error, "the microphone FIFO stopped accepting writes");
+                self.file = None;
+                self.generation = None;
+            }
+        }
+    }
+
+    fn open(&mut self) -> Option<std::fs::File> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let path = crate::session::gate::mic_fifo()?;
+        // O_NONBLOCK matters twice over. A write-only open of a FIFO with no
+        // reader *blocks* until one arrives, which on this thread would hang
+        // the connection; non-blocking, it fails with ENXIO instead, which is
+        // a fact we can log. It also keeps every later write from blocking.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+        {
+            Ok(file) => {
+                tracing::info!(fifo = %path.display(), "microphone attached to this session");
+                Some(file)
+            }
+            Err(error) => {
+                if !self.reported {
+                    self.reported = true;
+                    tracing::info!(
+                        fifo = %path.display(),
+                        error = %error,
+                        "no microphone for this session yet"
+                    );
+                }
+                None
+            }
+        }
+    }
+}
+
