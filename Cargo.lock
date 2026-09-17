@@ -2439,13 +2439,17 @@ dependencies = [
 name = "linrdp"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "arboard",
  "async-trait",
+ "base64",
  "byteorder",
  "cliclack",
  "console",
  "futures-util",
+ "getrandom 0.3.4",
+ "hkdf",
  "ironrdp-cliprdr",
  "ironrdp-cliprdr-native",
  "ironrdp-connector",
@@ -2470,6 +2474,7 @@ dependencies = [
  "png",
  "rcgen",
  "sha-crypt",
+ "sha2 0.11.0",
  "tokio",
  "tokio-rustls",
  "tracing",

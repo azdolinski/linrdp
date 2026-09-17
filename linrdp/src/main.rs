@@ -279,6 +279,11 @@ fn supervisor_main() -> anyhow::Result<()> {
     let log_file: Option<String> = args.opt_value_from_str("--log-file")?;
     setup_logging(log_file.as_deref());
 
+    // Seal a legacy cleartext SAM once, here in the long-lived root supervisor,
+    // before any worker is forked. No-op when the store is missing or already
+    // sealed. The workers inherit the sealed file and never re-migrate.
+    sam::migrate_plaintext();
+
     session::runtime_dir::ensure_state_dir(std::path::Path::new(session::runtime_dir::STATE_DIR))
         .context("prepare the supervisor state directory")?;
 
@@ -385,6 +390,14 @@ async fn serve() -> anyhow::Result<()> {
     };
 
     setup_logging(log_file.as_deref());
+
+    // Seal a legacy cleartext store, once. In `--supervisor` mode the migration
+    // already ran there before any worker forked (see `supervisor_main`); only
+    // the direct, single-process path needs it here. Guarding on `serve_fd`
+    // keeps per-connection workers from re-reading the file on every login.
+    if serve_fd.is_none() {
+        sam::migrate_plaintext();
+    }
 
     match auth_mode.as_str() {
         "nla" => {
