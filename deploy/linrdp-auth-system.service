@@ -1,0 +1,47 @@
+# Second linrdp instance: the --auth system path, on its own port.
+#
+# Runs alongside deploy/linrdp.service (NLA on 3389) rather than replacing it,
+# so both login styles are available at once:
+#
+#   3389  NLA — the client's own prompt, needs deploy/pam-capture in the PAM
+#         stack. What mstsc uses out of the box.
+#   3390  --auth system — TLS, and the credentials the client sends in the
+#         Client Info PDU go straight to /etc/shadow + PAM. Nothing is stored
+#         and PAM is not touched, but the client has to send credentials
+#         without NLA: FreeRDP, Remmina and most mobile clients do, mstsc
+#         does not.
+#
+# Both instances share /run/linrdp and the same display range, which is
+# deliberate: display numbers are handed out under a flock, and a user who
+# arrives on either port lands on their own single session. Connecting on
+# 3390 and later on 3389 returns to the same desktop.
+#
+# One thing to know before exposing this: --auth system has no
+# pre-authentication. A client reaches the RDP stack and is only then asked
+# for credentials, whereas NLA on 3389 requires them before the session
+# exists. TLS still protects the password in transit either way.
+#
+# Install:
+#   sudo install -m644 deploy/linrdp-auth-system.service \
+#     /etc/systemd/system/linrdp-auth-system.service
+#   sudo systemctl enable --now linrdp-auth-system
+[Unit]
+Description=LinRDP - system-password login (no NLA, nothing stored)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/linrdp --supervisor --auth system --bind-addr 0.0.0.0:3390
+Environment=LINRDP_LOG=info
+# Root is needed to read /etc/shadow, open PAM sessions, and start each
+# session's X server as its own user.
+User=root
+Restart=on-failure
+RestartSec=2
+# Sessions outlive the connection that created them and are owned by keeper
+# processes re-parented to init; stopping this unit must not take the
+# desktops with it.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

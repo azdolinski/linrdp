@@ -117,6 +117,19 @@ the choice is NLA plus the PAM capture above.
 `linrdp doctor` knows the difference: with `--auth system` configured in the
 unit it reports the missing capture as fine rather than as a blocker.
 
+Both modes can run at once, on separate ports —
+`deploy/linrdp-auth-system.service` does exactly that:
+
+| port | mode | client |
+|---|---|---|
+| 3389 | NLA (`deploy/linrdp.service`) | mstsc and everything else |
+| 3390 | `--auth system` (`deploy/linrdp-auth-system.service`) | clients that send credentials without NLA |
+
+They share `/run/linrdp` and the display range on purpose: display numbers are
+handed out under a `flock`, so a user arriving on either port lands on their
+own single session, and connecting on one port after the other returns to the
+same desktop.
+
 ## Run
 
 Multi-session: one worker per connection, each serving its own user's desktop.
