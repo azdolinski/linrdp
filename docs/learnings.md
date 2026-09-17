@@ -596,3 +596,51 @@ server, the record, and a few orphaned panels all stay behind.
     the desktop exits, the keeper stops the other, drops the record and closes
     the PAM session. No connection is ever offered a display with no desktop
     on it.
+
+## Saga: every connection died because the binary had been replaced
+
+"Nothing works any more." The log said:
+
+```
+DEBUG linrdp::supervisor: forked worker peer=192.168.1.1:61650 pid=275707
+```
+
+and nothing after it, for every connection. The client saw a reset.
+
+One command found it:
+
+```
+$ sudo readlink /proc/$(systemctl show linrdp -p MainPID --value)/exe
+/usr/local/bin/linrdp (deleted)
+```
+
+`install` over a running binary unlinks the inode the process was started
+from, and `/proc/self/exe` — which `std::env::current_exe` reads — then reads
+back with a ` (deleted)` suffix. Rust returns that verbatim, and `execv` on it
+fails with ENOENT. Every worker died between fork and its first line of code.
+
+- **`current_exe()` is not a path you can exec.** It is a *description* of
+  where the running image came from, and after an upgrade in place it names
+  something that no longer exists. Strip the suffix and exec the path the
+  operator installed to — a running supervisor then picks up the new binary
+  on the next connection instead of breaking on it.
+- **A bare `return` in the process that is about to become the connection is
+  a bug by itself.** `exec_worker` had four of them: `dup2`, `current_exe`,
+  the NUL check, and `execv`. Any one firing produced a reset connection and
+  a log that said only "forked worker". The cause was findable in a minute
+  once one line of logging existed; without it, it was invisible.
+- **I had seen this failure an hour earlier and dropped it.** The same
+  "forked worker and then silence" appeared in my own test, and I moved to
+  the next question instead of finishing. Evidence of a failure on screen is
+  not something to come back to later.
+- **Two agents in one worktree cost real time here**: a binary replaced under
+  a live server, a rewritten commit hash, and part of one file's changes
+  reverted underneath me. Separate worktrees, not separate discipline.
+
+## Invariants now enforced (keep them)
+
+28. The supervisor execs workers at the installed path, with the kernel's
+    ` (deleted)` suffix stripped, so replacing the binary never breaks the
+    running server.
+29. No failure path in `exec_worker` is silent. It is the process that was
+    about to be the whole connection.

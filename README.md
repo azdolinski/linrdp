@@ -148,6 +148,10 @@ desktop can be reattached from a different monitor.
 and whether their programs exist, PAM, logind, screen lockers, and whether
 credential capture is wired.
 
+Upgrading in place is safe: replace `/usr/local/bin/linrdp` and the running
+supervisor execs the new binary for the next connection. (Restart the unit
+too if you want the supervisor itself on the new code.)
+
 On first start it generates a self-signed TLS certificate
 (`linrdp-cert.pem` / `linrdp-key.pem` next to the crate) and reuses it.
 
