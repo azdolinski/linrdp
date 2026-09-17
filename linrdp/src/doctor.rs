@@ -378,13 +378,29 @@ struct AuthListener {
 }
 
 impl AuthListener {
-    /// Whether this listener needs a captured system password.
+    /// Whether a missing captured password shuts this listener's door.
     ///
-    /// Only the modes that offer NLA do. `system` checks the client's own
-    /// credentials against `/etc/shadow`, and `greeter` never asks the client
-    /// for credentials at all.
-    fn needs_capture(&self) -> bool {
-        matches!(self.mode.as_str(), "both" | "nla")
+    /// Only `nla` does. It advertises CredSSP alone, so a client that cannot
+    /// complete it has nowhere else to go.
+    fn refuses_without_capture(&self) -> bool {
+        self.mode == "nla"
+    }
+
+    /// Whether a missing captured password costs this listener NLA but not
+    /// the login.
+    ///
+    /// `both` advertises CredSSP *or* TLS. Traced on this machine: with no
+    /// stored secret the NTLM exchange runs to the public-key step, the
+    /// server computes its response from a session key derived from a
+    /// password it does not have, the client rejects it and abandons
+    /// CredSSP — then mstsc opens a second connection asking for plain
+    /// `SSL`, sends the typed password in the Client Info PDU, and
+    /// `ShadowValidator` checks it against `/etc/shadow`. The login
+    /// succeeds. So this is a lost feature, not a locked door, and calling
+    /// it a blocker told someone their account was broken while they were
+    /// sitting in its desktop.
+    fn loses_nla_without_capture(&self) -> bool {
+        self.mode == "both"
     }
 }
 
@@ -643,10 +659,21 @@ fn build_account(probe: &AccountProbe) -> AccountReport {
         },
     ];
 
-    // Capture matters only where NLA is actually offered. A machine that only
-    // runs the greeter port stores nothing and needs nothing stored.
-    let needing: Vec<&AuthListener> = probe.listeners.iter().filter(|l| l.needs_capture()).collect();
-    let capture_needed = !needing.is_empty();
+    // Capture matters only where NLA is offered, and it matters differently:
+    // `nla` has no other path, `both` falls back to TLS.
+    let refusing: Vec<&str> = probe
+        .listeners
+        .iter()
+        .filter(|l| l.refuses_without_capture())
+        .map(|l| l.unit.as_str())
+        .collect();
+    let degrading: Vec<&str> = probe
+        .listeners
+        .iter()
+        .filter(|l| l.loses_nla_without_capture())
+        .map(|l| l.unit.as_str())
+        .collect();
+    let capture_needed = !refusing.is_empty() || !degrading.is_empty();
     let authentication = vec![
         Fact {
             key: "listeners",
@@ -748,33 +775,35 @@ fn build_account(probe: &AccountProbe) -> AccountReport {
     }
 
     if !probe.captured && capture_needed {
-        let units: Vec<&str> = needing.iter().map(|l| l.unit.as_str()).collect();
-        let greeters: Vec<&str> = probe
-            .listeners
-            .iter()
-            .filter(|l| !l.needs_capture())
-            .map(|l| l.unit.as_str())
-            .collect();
-        findings.push(Finding::Warning(format!(
-            "no password captured for {} yet, so {} cannot let this account in: NLA must know the \
-             secret to compute the expected NTLM response, and it cannot verify an /etc/shadow \
-             hash. Authenticate once as {} by any other means — `su - {}`, ssh, a console login — \
-             and the PAM capture records it for the next RDP login. Nothing needs to be \
-             provisioned in linrdp; the system password is the only one it uses.{}",
-            probe.name,
-            units.join(" or "),
-            probe.name,
-            probe.name,
-            if greeters.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    " This does not affect {} — the server-drawn logon screen hands what you type \
-                     straight to PAM and needs nothing stored.",
-                    greeters.join(" or ")
-                )
-            }
-        )));
+        // How to get a password captured, which is the same sentence either
+        // way. linrdp provisions nothing of its own: the system password is
+        // the only one it ever uses.
+        let remedy = format!(
+            "Authenticate once as {} by any other means — `su - {}`, ssh, a console login — and \
+             the PAM capture records it for the next RDP login.",
+            probe.name, probe.name
+        );
+
+        if !refusing.is_empty() {
+            findings.push(Finding::Blocker(format!(
+                "no password captured for {} yet, and {} advertises CredSSP alone. NLA must know \
+                 the secret to compute its half of the exchange and cannot verify an /etc/shadow \
+                 hash, so this account has no way in on that listener at all. {remedy}",
+                probe.name,
+                refusing.join(" and ")
+            )));
+        }
+        if !degrading.is_empty() {
+            findings.push(Finding::Warning(format!(
+                "no password captured for {} yet, so NLA cannot authenticate it on {}. The login \
+                 still works: that listener advertises CredSSP *or* TLS, and a client that gives \
+                 up on CredSSP reconnects over plain TLS, where the password it sends is checked \
+                 against /etc/shadow. mstsc does exactly that — it opens a second connection — so \
+                 what is actually lost is pre-authentication, not access. {remedy}",
+                probe.name,
+                degrading.join(" and ")
+            )));
+        }
     }
 
     match &probe.sound_policy {
@@ -1213,15 +1242,60 @@ mod tests {
         let mut probe = account("rdptest", 1002);
         probe.captured = false;
 
-        probe.listeners = vec![AuthListener { unit: "linrdp.service".to_owned(), mode: "system".to_owned() }];
-        assert!(warnings(&build_account(&probe)).is_empty());
+        let listener = |mode: &str| {
+            vec![AuthListener { unit: "linrdp.service".to_owned(), mode: mode.to_owned() }]
+        };
 
-        probe.listeners = vec![AuthListener { unit: "linrdp.service".to_owned(), mode: "nla".to_owned() }];
-        let found = warnings(&build_account(&probe)).join("\n");
+        probe.listeners = listener("system");
+        assert!(build_account(&probe).findings.is_empty());
+
+        probe.listeners = listener("greeter");
+        assert!(build_account(&probe).findings.is_empty());
+
+        probe.listeners = listener("nla");
+        let found = blockers(&build_account(&probe)).join("\n");
         assert!(found.contains("su - rdptest"), "got {found}");
         assert!(
             !found.contains("set-password"),
             "linrdp must never offer to provision a password of its own: {found}"
+        );
+    }
+
+    /// `--auth both` without a captured password is a lost feature, not a
+    /// locked door: NLA fails, the client reconnects over TLS, and
+    /// /etc/shadow lets it in. Traced on a real login — the first draft
+    /// called this a blocker and told someone their account could not get in
+    /// while they were sitting in its desktop.
+    #[test]
+    fn auth_both_without_a_capture_loses_nla_but_not_the_login() {
+        let mut probe = account("user", 1000);
+        probe.captured = false;
+        probe.listeners = vec![AuthListener { unit: "linrdp.service".to_owned(), mode: "both".to_owned() }];
+
+        let report = build_account(&probe);
+        assert!(blockers(&report).is_empty(), "not a blocker: {:?}", blockers(&report));
+
+        let found = warnings(&report).join("\n");
+        assert!(found.contains("login still works"), "got {found}");
+        assert!(found.contains("/etc/shadow"), "it says what does let them in: {found}");
+    }
+
+    /// Both kinds of listener at once — this machine's actual shape. The
+    /// blocker names only the listener that truly refuses.
+    #[test]
+    fn a_greeter_alongside_an_nla_listener_is_not_blamed_for_the_nla_listener() {
+        let mut probe = account("rdptest", 1002);
+        probe.captured = false;
+        probe.listeners = vec![
+            AuthListener { unit: "linrdp.service".to_owned(), mode: "nla".to_owned() },
+            AuthListener { unit: "linrdp-alt-port.service".to_owned(), mode: "greeter".to_owned() },
+        ];
+
+        let found = blockers(&build_account(&probe)).join("\n");
+        assert!(found.contains("linrdp.service"), "got {found}");
+        assert!(
+            !found.contains("linrdp-alt-port.service"),
+            "the greeter port needs nothing stored and must not be named: {found}"
         );
     }
 

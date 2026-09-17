@@ -7,12 +7,18 @@
 //!
 //! LinRDP therefore keeps its own SAM: `/var/lib/linrdp/sam` with
 //! `username:password` entries, mode 0600, root-owned — the same trust model
-//! as `/etc/shadow`. Passwords are set with `linrdp --set-password USER`
-//! (the LinRDP equivalent of Windows "set password for this account").
+//! as `/etc/shadow`.
+//!
+//! Nothing here is ever provisioned by hand, and linrdp has no flag to do it
+//! with. The only writer is the PAM capture (`--capture-credential`, see
+//! `main::capture_credential`), which records a password the system itself
+//! has just accepted. That is the whole point: the login uses the account's
+//! system password and no other, so there is no second secret to set, rotate
+//! or forget. An entry that did not come from a successful authentication
+//! would be a password the system does not agree with.
 //!
 //! After CredSSP completes, the delegated credentials are additionally
-//! verified against `/etc/shadow` (see `auth::ShadowValidator`), so the
-//! password set here must equal the Linux account password.
+//! verified against `/etc/shadow` (see `auth::ShadowValidator`).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
