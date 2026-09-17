@@ -17,6 +17,7 @@
 
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
+use anyhow::Context as _;
 use std::sync::{Arc, Mutex};
 
 /// The account CredSSP is authenticating, stashed by the credential resolver
@@ -29,6 +30,15 @@ pub(crate) struct PendingIdentity {
 impl PendingIdentity {
     pub(crate) fn record(&self, user: &str, password: &str) {
         *self.inner.lock().unwrap_or_else(|p| p.into_inner()) = Some((user.to_owned(), password.to_owned()));
+    }
+
+    /// Whether an identity was recorded, without consuming it.
+    pub(crate) fn peek(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|(user, _)| user.clone())
     }
 
     fn take(&self) -> Option<(String, String)> {
@@ -49,6 +59,9 @@ pub(crate) struct SessionRouter {
     /// `--fixed-size`: pin every session's screen instead of following the
     /// connecting client.
     fixed_size: Option<(u16, u16)>,
+    /// `--auth greeter`: the client sends no credentials, so the server draws
+    /// a logon screen and collects them there.
+    greeter: bool,
     /// The display this worker bound, so the disconnect path can lock it.
     /// A Cell because binding happens through `&self` inside the handler.
     bound_display: std::cell::Cell<Option<u16>>,
@@ -62,6 +75,7 @@ impl SessionRouter {
         range: RangeInclusive<u16>,
         console: bool,
         fixed_size: Option<(u16, u16)>,
+        greeter: bool,
     ) -> Self {
         Self {
             inner,
@@ -70,8 +84,75 @@ impl SessionRouter {
             range,
             console,
             fixed_size,
+            greeter,
             bound_display: std::cell::Cell::new(None),
         }
+    }
+
+    /// Start the logon screen and hand the session over once it succeeds.
+    ///
+    /// Returns as soon as the screen is up: the form runs on a thread of its
+    /// own so the connection can start streaming it. Nothing of the user's is
+    /// reachable until the form accepts — the gate is pointed at an X server
+    /// that has no session on it.
+    fn show_greeter(&self, client_size: (u16, u16)) -> anyhow::Result<()> {
+        let greeter = crate::greeter::Greeter::start(&self.state_dir, self.range.clone(), client_size)?;
+        crate::session::gate::bind_greeter(
+            greeter.display,
+            &greeter.xauthority,
+            &greeter.runtime_dir,
+            client_size,
+        )?;
+
+        let state_dir = self.state_dir.clone();
+        let range = self.range.clone();
+        let fixed_size = self.fixed_size;
+        std::thread::Builder::new()
+            .name("linrdp-greeter".to_owned())
+            .spawn(move || {
+                // `greeter` is moved in so its X server lives exactly as long
+                // as the form, and is torn down by Drop on every path out.
+                let greeter = greeter;
+                let (conn, screen) = match crate::session::gate::connect() {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        tracing::error!(error = format!("{error:#}"), "logon screen: cannot connect to its X server");
+                        return;
+                    }
+                };
+                let verify = |user: &str, password: &str| {
+                    crate::auth::verify_system_password(user, password).unwrap_or(false)
+                };
+                match crate::greeter::run_form(&conn, screen, &verify) {
+                    Ok(Some((user, password))) => {
+                        let size = fixed_size.unwrap_or(crate::session::SESSION_SCREEN_MAX);
+                        match crate::session::attach_or_create(&state_dir, &user, &password, range, size) {
+                            Ok(rec) => {
+                                if let Err(error) = crate::session::gate::bind(
+                                    rec.display,
+                                    &rec.xauthority,
+                                    &rec.runtime_dir,
+                                    client_size,
+                                ) {
+                                    tracing::error!(error = format!("{error:#}"), "logon screen: handover refused");
+                                    return;
+                                }
+                                if rec.locked && let Err(error) = crate::session::unlock(&state_dir, &rec) {
+                                    tracing::warn!(error = format!("{error:#}"), "could not unlock the session");
+                                }
+                                tracing::info!(user, display = rec.display, "logon screen: handed over to the desktop");
+                            }
+                            Err(error) => {
+                                tracing::error!(error = format!("{error:#}"), "logon screen: could not start the session");
+                            }
+                        }
+                    }
+                    Ok(None) => tracing::info!("logon screen: the client went away"),
+                    Err(error) => tracing::error!(error = format!("{error:#}"), "logon screen failed"),
+                }
+            })
+            .context("spawn the logon screen thread")?;
+        Ok(())
     }
 
     /// Resolve or create the session and point this process at it.
@@ -79,6 +160,14 @@ impl SessionRouter {
         let Some((user, password)) = self.pending.take() else {
             anyhow::bail!("no authenticated identity recorded — cannot choose a desktop");
         };
+        self.bind_as(&user, &password, client_size)
+    }
+
+    /// Point this worker at `user`'s desktop. The caller has already verified
+    /// them — through CredSSP, through the Client Info PDU, or at the logon
+    /// screen.
+    fn bind_as(&self, user: &str, password: &str, client_size: (u16, u16)) -> anyhow::Result<()> {
+        let (user, password) = (user.to_owned(), password.to_owned());
         // A session's X server is created at the LARGEST desktop we serve,
         // not at this client's size: `-screen 0 WxH` is also Xvfb's RandR
         // maximum and cannot grow afterwards, so a session born at one
@@ -115,6 +204,19 @@ impl ironrdp_server::ConnectionHandler for SessionRouter {
                 display = %std::env::var("DISPLAY").unwrap_or_default(),
                 "console mode — serving the shared display"
             );
+        } else if self.greeter {
+            let size = (info.desktop_size.width, info.desktop_size.height);
+            // A client that already sent credentials the validator verified
+            // does not need to type them again.
+            if self.pending.peek().is_some() {
+                if let Err(error) = self.bind_session(size) {
+                    tracing::error!(error = format!("{error:#}"), "could not bind this connection to a desktop");
+                    std::process::exit(1);
+                }
+            } else if let Err(error) = self.show_greeter(size) {
+                tracing::error!(error = format!("{error:#}"), "could not show the logon screen");
+                std::process::exit(1);
+            }
         } else if let Err(error) = self.bind_session((info.desktop_size.width, info.desktop_size.height)) {
             // Refusing beats falling back: a user whose session cannot start
             // must not silently land on the shared desktop. The worker exits,

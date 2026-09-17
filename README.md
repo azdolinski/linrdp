@@ -101,6 +101,29 @@ port to connect to.
 | `both` (default) | TLS + CredSSP | every client: mstsc takes NLA, others take TLS | only for the clients that choose NLA |
 | `nla` | CredSSP only | every client | yes |
 | `system` | TLS only | only clients that send credentials without NLA (FreeRDP, Remmina, most mobile apps) — **not mstsc** | no, and nothing is ever stored |
+| `greeter` | TLS only | every client, mstsc included | no, and nothing is ever stored |
+
+### `greeter` — a logon screen, and no PAM integration at all
+
+```sh
+sudo /usr/local/bin/linrdp --supervisor --auth greeter --bind-addr 0.0.0.0:3390
+```
+
+The client connects without sending anything, linrdp draws a login form, and
+what you type there goes straight to `/etc/shadow` and PAM. Nothing is stored,
+nothing is provisioned, no PAM stack is edited — and every client works,
+mstsc included, because a server-drawn logon screen is exactly what a client
+expects when NLA is not offered.
+
+The form is drawn on **an X server of its own**, owned by linrdp with a 0600
+cookie and nobody's session on it, so showing it before anyone has
+authenticated reveals nothing. The text is drawn by X with a core font, and
+keystrokes are translated by XKB — so a password with characters that depend
+on the keyboard layout works, which a hand-rolled scancode table would get
+wrong. Only once the form accepts does the worker move to the user's own
+desktop, and the session gate allows that move in one direction only.
+
+`deploy/linrdp-alt-port.service` runs this on port 3390.
 
 Under `system` a client that only speaks NLA sends no credentials at all and
 is refused: mstsc reports **0x904** the moment you press Connect. MS-RDPBCGR
@@ -125,7 +148,7 @@ sudo /usr/local/bin/linrdp --supervisor --bind-addr 0.0.0.0:3389
 ```
 
 ```
---auth both|nla|system what the port accepts (default both; see above)
+--auth both|nla|system|greeter  what the port accepts (default both; see above)
 --display-range L-H    X display numbers workers may allocate (default 10-99)
 --console              attach to $DISPLAY instead of a per-user session
                        (the mstsc /admin equivalent, for a shared screen)

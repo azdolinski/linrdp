@@ -1250,6 +1250,12 @@ pub(crate) fn compute_tile_damage(
 /// generic display machinery.
 pub(crate) struct X11DisplayFactory {
     display: std::sync::Mutex<Option<X11Display>>,
+    /// Session-gate generation the cached connection was made at. When the
+    /// gate moves this worker — the logon screen handing over to the desktop
+    /// the login just proved — the cached connection still points at the old
+    /// X server, and would keep streaming the login form to someone who is
+    /// already inside. Comparing generations is how the cache learns.
+    generation: std::sync::atomic::AtomicU64,
     fixed_size: Option<(u16, u16)>,
 }
 
@@ -1257,6 +1263,7 @@ impl X11DisplayFactory {
     pub(crate) fn new(display: X11Display) -> Self {
         let fixed_size = display.fixed_size;
         Self {
+            generation: std::sync::atomic::AtomicU64::new(crate::session::gate::generation()),
             display: std::sync::Mutex::new(Some(display)),
             fixed_size,
         }
@@ -1271,6 +1278,7 @@ impl X11DisplayFactory {
     /// one — no matter who logged in.
     pub(crate) fn deferred(fixed_size: Option<(u16, u16)>) -> Self {
         Self {
+            generation: std::sync::atomic::AtomicU64::new(crate::session::gate::generation()),
             display: std::sync::Mutex::new(None),
             fixed_size,
         }
@@ -1279,6 +1287,11 @@ impl X11DisplayFactory {
     /// The display, connecting on first use. `None` only if X is unreachable.
     fn with_display<T>(&self, f: impl FnOnce(&mut X11Display) -> T) -> Option<T> {
         let mut guard = self.display.lock().expect("display lock poisoned");
+        let now = crate::session::gate::generation();
+        if self.generation.swap(now, std::sync::atomic::Ordering::SeqCst) != now && guard.is_some() {
+            tracing::info!(generation = now, "the bound display moved — reconnecting capture");
+            *guard = None;
+        }
         if guard.is_none() {
             match X11Display::connect(self.fixed_size) {
                 Ok(display) => *guard = Some(display),
@@ -1318,6 +1331,7 @@ impl crate::gfx_display::DisplaySourceFactory for X11DisplayFactory {
             grabber: Some(display.grabber()),
             display_name: display.display_name().to_owned(),
             fixed_size: display.fixed_size,
+            generation: crate::session::gate::generation(),
         });
         // No display yet (unbound worker, or X unreachable): a source with no
         // grabber produces no frames and, critically, names no display — it
@@ -1326,6 +1340,7 @@ impl crate::gfx_display::DisplaySourceFactory for X11DisplayFactory {
             grabber: None,
             display_name: crate::session::gate::display_name().unwrap_or_default(),
             fixed_size: self.fixed_size,
+            generation: crate::session::gate::generation(),
         }))
     }
 }
@@ -1335,10 +1350,25 @@ struct X11Source {
     grabber: Option<ScreenGrabber>,
     display_name: String,
     fixed_size: Option<(u16, u16)>,
+    /// Session-gate generation this grabber was built at. A source is minted
+    /// once and then holds its own X connection, so the factory noticing that
+    /// the display moved is not enough — without this the logon screen keeps
+    /// being streamed to somebody who has already been let in.
+    generation: u64,
 }
 
 impl crate::gfx_display::FrameSource for X11Source {
     fn poll_and_cursor(&mut self, cursor_due: bool, debt_due: bool) -> Option<(Grab, Option<CursorImage>)> {
+        let now = crate::session::gate::generation();
+        if self.generation != now {
+            self.generation = now;
+            self.display_name = crate::session::gate::display_name().unwrap_or_default();
+            // Dropping it reports "not attached", and the display loop mints a
+            // fresh connection to wherever the gate now points.
+            self.grabber = None;
+            tracing::info!(display = %self.display_name, "the bound display moved — following it");
+            return None;
+        }
         let Some(grabber) = self.grabber.as_mut() else {
             return None;
         };
@@ -1351,7 +1381,9 @@ impl crate::gfx_display::FrameSource for X11Source {
             tracing::warn!(display = %self.display_name, "X grabber lost — reconnecting");
             self.grabber = ScreenGrabber::connect_new(&self.display_name);
             if let Some(grabber) = self.grabber.as_mut() {
-                grabber.set_fixed_size(self.fixed_size);
+                // Follow the client's size on the new display too: a desktop
+                // handed over from the logon screen has never been scaled.
+                grabber.set_fixed_size(self.fixed_size.or_else(crate::session::gate::client_size));
             }
         }
     }

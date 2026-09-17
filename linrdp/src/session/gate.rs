@@ -11,17 +11,35 @@
 //! must go through [`display_name`], which refuses to answer until a session
 //! has actually been bound. There is no fallback to refuse into.
 
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Set when this process is a multi-session worker.
 static ARMED: AtomicBool = AtomicBool::new(false);
 
-/// The session this worker serves. Written once, after authentication.
-static BOUND: OnceLock<Bound> = OnceLock::new();
+/// What this worker is currently allowed to touch.
+static BOUND: Mutex<Option<Bound>> = Mutex::new(None);
+
+/// Bumped on every binding change, so the capture and input paths can notice
+/// that the display under them moved and reconnect. They cache their X
+/// connection; without this they would keep drawing the logon screen after
+/// the user had already been let in.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Which of the two displays a worker can be pointed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Binding {
+    /// The server-drawn logon screen: its own X server, owned by linrdp, with
+    /// nobody's session on it. Nothing private is reachable from here, which
+    /// is what makes it safe to show before anyone has authenticated.
+    Greeter,
+    /// A user's own desktop, after authentication.
+    Session,
+}
 
 #[derive(Debug, Clone)]
 struct Bound {
+    kind: Binding,
     display: String,
     xauthority: String,
     /// Desktop size this client negotiated — the size the session's screen is
@@ -47,7 +65,28 @@ pub(crate) fn bind(
     runtime_dir: &str,
     client_size: (u16, u16),
 ) -> anyhow::Result<()> {
+    bind_kind(Binding::Session, display, xauthority, runtime_dir, client_size)
+}
+
+/// Point this worker at the logon screen, before anyone has authenticated.
+pub(crate) fn bind_greeter(
+    display: u16,
+    xauthority: &str,
+    runtime_dir: &str,
+    client_size: (u16, u16),
+) -> anyhow::Result<()> {
+    bind_kind(Binding::Greeter, display, xauthority, runtime_dir, client_size)
+}
+
+fn bind_kind(
+    kind: Binding,
+    display: u16,
+    xauthority: &str,
+    runtime_dir: &str,
+    client_size: (u16, u16),
+) -> anyhow::Result<()> {
     let wanted = Bound {
+        kind,
         display: format!(":{display}"),
         xauthority: xauthority.to_owned(),
         client_size,
@@ -62,22 +101,43 @@ pub(crate) fn bind(
         std::env::set_var("XAUTHORITY", xauthority);
         std::env::set_var("XDG_RUNTIME_DIR", runtime_dir);
     }
-    bind_into(&BOUND, wanted)
+    let mut cell = BOUND.lock().unwrap_or_else(|p| p.into_inner());
+    bind_into(&mut cell, wanted)?;
+    GENERATION.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
+/// How many times this worker has been pointed somewhere.
+///
+/// Cached X connections compare this against the value they connected at.
+pub(crate) fn generation() -> u64 {
+    GENERATION.load(Ordering::SeqCst)
 }
 
 /// The binding decision, separated from the process-global cell so it can be
 /// tested without mutating it (the statics are shared by every test in the
 /// binary, and mutating them from one test breaks the others).
-fn bind_into(cell: &OnceLock<Bound>, wanted: Bound) -> anyhow::Result<()> {
-    if cell.set(wanted.clone()).is_ok() {
-        return Ok(());
+///
+/// Exactly one move is allowed: from the logon screen to a session, once the
+/// person in front of it has authenticated. Everything else that would change
+/// the display mid-connection is refused, because a worker that switched
+/// displays would be showing two users' screens down one pipe.
+fn bind_into(cell: &mut Option<Bound>, wanted: Bound) -> anyhow::Result<()> {
+    match cell.as_ref() {
+        None => {}
+        Some(existing) if existing.display == wanted.display && existing.kind == wanted.kind => {}
+        // The greeter is not anybody's desktop, so leaving it for the session
+        // the login just proved is not a switch between users.
+        Some(existing) if existing.kind == Binding::Greeter && wanted.kind == Binding::Session => {}
+        Some(existing) => anyhow::bail!(
+            "this worker is already bound to {} ({:?}); refusing to rebind to {} ({:?})",
+            existing.display,
+            existing.kind,
+            wanted.display,
+            wanted.kind
+        ),
     }
-    let existing = cell.get().map(|b| b.display.clone()).unwrap_or_default();
-    anyhow::ensure!(
-        existing == wanted.display,
-        "this worker is already bound to {existing}; refusing to rebind to {}",
-        wanted.display
-    );
+    *cell = Some(wanted);
     Ok(())
 }
 
@@ -90,7 +150,7 @@ pub(crate) fn display_name() -> anyhow::Result<String> {
     if !is_armed() {
         return Ok(std::env::var("DISPLAY").unwrap_or_else(|_| ":99".to_owned()));
     }
-    match BOUND.get() {
+    match BOUND.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
         Some(bound) => Ok(bound.display.clone()),
         None => anyhow::bail!(
             "no session bound yet — refusing to touch a display, because the only \
@@ -102,7 +162,9 @@ pub(crate) fn display_name() -> anyhow::Result<String> {
 /// The display number this worker is bound to, if any.
 fn bound_display_number() -> Option<u16> {
     BOUND
-        .get()?
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()?
         .display
         .trim_start_matches(':')
         .split('.')
@@ -154,12 +216,16 @@ pub(crate) fn connect() -> anyhow::Result<(x11rb::rust_connection::RustConnectio
 /// scaled down to this — a client must never be shown a desktop smaller than
 /// the area it reserved for it.
 pub(crate) fn client_size() -> Option<(u16, u16)> {
-    BOUND.get().map(|b| b.client_size)
+    BOUND.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|b| b.client_size)
 }
 
 /// The Xauthority for the bound session, if any.
 pub(crate) fn xauthority() -> Option<String> {
-    BOUND.get().map(|b| b.xauthority.clone())
+    BOUND
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .map(|b| b.xauthority.clone())
 }
 
 #[cfg(test)]
@@ -182,8 +248,9 @@ mod tests {
         assert!(ambient.starts_with(':'), "got {ambient}");
     }
 
-    fn sample(display: &str) -> Bound {
+    fn sample(kind: Binding, display: &str) -> Bound {
         Bound {
+            kind,
             display: display.to_owned(),
             xauthority: format!("/run/user/1000/linrdp/Xauthority{display}"),
             client_size: (1920, 1080),
@@ -195,14 +262,52 @@ mod tests {
     /// mid-connection would be showing two users' screens down one pipe.
     #[test]
     fn rebinding_to_a_different_session_is_refused() {
-        let cell = OnceLock::new();
+        let mut cell = None;
 
-        bind_into(&cell, sample(":77")).expect("first bind");
-        bind_into(&cell, sample(":77")).expect("same session again");
+        bind_into(&mut cell, sample(Binding::Session, ":77")).expect("first bind");
+        bind_into(&mut cell, sample(Binding::Session, ":77")).expect("same session again");
 
-        let err = bind_into(&cell, sample(":78")).expect_err("a different session must be refused");
+        let err = bind_into(&mut cell, sample(Binding::Session, ":78"))
+            .expect_err("a different session must be refused");
         assert!(err.to_string().contains("refusing to rebind"), "got: {err}");
 
-        assert_eq!(cell.get().map(|b| b.display.as_str()), Some(":77"), "the first binding stands");
+        assert_eq!(
+            cell.as_ref().map(|b| b.display.as_str()),
+            Some(":77"),
+            "the first binding stands"
+        );
+    }
+
+    /// The one move that is allowed: the logon screen hands over to the
+    /// session the person in front of it just authenticated as.
+    #[test]
+    fn the_greeter_may_hand_over_to_a_session() {
+        let mut cell = None;
+
+        bind_into(&mut cell, sample(Binding::Greeter, ":90")).expect("greeter binds");
+        bind_into(&mut cell, sample(Binding::Session, ":11")).expect("handover after login");
+
+        assert_eq!(cell.as_ref().map(|b| b.kind), Some(Binding::Session));
+        assert_eq!(cell.as_ref().map(|b| b.display.as_str()), Some(":11"));
+    }
+
+    /// ...and only in that direction. A session must never be swapped for a
+    /// logon screen, or for a second greeter: once a worker is showing
+    /// someone's desktop, the display it is pointed at is settled.
+    #[test]
+    fn a_session_never_goes_back_to_a_greeter() {
+        let mut cell = None;
+        bind_into(&mut cell, sample(Binding::Session, ":11")).expect("session binds");
+        assert!(
+            bind_into(&mut cell, sample(Binding::Greeter, ":90")).is_err(),
+            "a bound session must not be replaced by a logon screen"
+        );
+
+        let mut cell = None;
+        bind_into(&mut cell, sample(Binding::Greeter, ":90")).expect("greeter binds");
+        assert!(
+            bind_into(&mut cell, sample(Binding::Greeter, ":91")).is_err(),
+            "one greeter per worker"
+        );
     }
 }

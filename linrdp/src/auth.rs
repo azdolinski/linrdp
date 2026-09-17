@@ -19,11 +19,27 @@ pub(crate) struct ShadowValidator {
     /// can create that user's desktop. Recorded only on success: the identity
     /// a session is built from must be one that was actually verified.
     pending: Option<std::sync::Arc<crate::session::router::PendingIdentity>>,
+    /// `--auth greeter`: this validator does not decide anything, the logon
+    /// screen does. A client that sends no credentials — or the wrong ones,
+    /// which is what a client sends when it is just filling in the field its
+    /// UI demands — must still reach the point where the screen can be drawn.
+    /// Accepting here grants nothing: the gate is pointed at an X server with
+    /// no session on it until the form itself authenticates.
+    defer_to_greeter: bool,
 }
 
 impl ShadowValidator {
     pub(crate) fn new(pending: Option<std::sync::Arc<crate::session::router::PendingIdentity>>) -> Self {
-        Self { pending }
+        Self {
+            pending,
+            defer_to_greeter: false,
+        }
+    }
+
+    /// Leave the decision to the logon screen that follows.
+    pub(crate) fn deferring_to_greeter(mut self, defer: bool) -> Self {
+        self.defer_to_greeter = defer;
+        self
     }
 }
 
@@ -63,6 +79,19 @@ impl CredentialValidator for ShadowValidator {
         .await
         .map_err(CredentialValidationError::new)?; // join error only
 
+        // Greeter mode: never reject here. Record only what verified, so the
+        // router can skip the form for a client that already sent something
+        // correct, and show it to everyone else.
+        if self.defer_to_greeter {
+            if matches!(result, Ok(true)) {
+                tracing::info!(%username, "credentials sent and verified — skipping the logon screen");
+                self.accepted(&username, &credentials.password);
+            } else {
+                tracing::info!(%username, "no usable credentials — the logon screen will collect them");
+            }
+            return Ok(CredentialDecision::Accept);
+        }
+
         match result {
             Ok(true) => {
                 tracing::info!(%username, "authentication accepted");
@@ -73,6 +102,7 @@ impl CredentialValidator for ShadowValidator {
                 tracing::warn!(%username, "authentication rejected");
                 Ok(CredentialDecision::Reject)
             }
+
             Err(reason) if username.is_empty() => {
                 // No username at all: the client connected without sending
                 // credentials. That is what mstsc does on a non-NLA server —

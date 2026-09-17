@@ -142,16 +142,48 @@ fn resolve_program(program: &str) -> Option<String> {
         .map(|candidate| candidate.to_string_lossy().into_owned())
 }
 
-/// Wait for an X server to publish its socket, so a failed start is reported
-/// here rather than as a session that routes nowhere.
+/// Clear what a killed X server left behind on this display number.
 ///
-/// The grandchild is detached, so its exec failure cannot be waited for; the
-/// socket appearing is the only evidence available that the desktop is real.
+/// An X server writes `/tmp/.X<n>-lock` and `/tmp/.X11-unix/X<n>`, and a
+/// SIGKILL leaves both. The next server on that number then dies with
+/// "Could not create server lock file" and the number is unusable until
+/// somebody notices — a display leak with no owner.
+///
+/// Safe because of what the caller already holds: the display was allocated
+/// under a `flock`, so no other linrdp session owns this number, and the
+/// socket is only removed when nothing answers on it. A live server is never
+/// touched.
+pub(crate) fn clear_stale_display(display: u16) {
+    let socket = format!("/tmp/.X11-unix/X{display}");
+    if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+        return; // somebody is serving this number; leave it completely alone
+    }
+    for path in [format!("/tmp/.X{display}-lock"), socket] {
+        if std::path::Path::new(&path).exists() {
+            match std::fs::remove_file(&path) {
+                Ok(()) => tracing::info!(path, "removed a dead X server's leftovers"),
+                Err(error) => tracing::warn!(path, %error, "could not remove a dead X server's leftovers"),
+            }
+        }
+    }
+}
+
+/// Wait until an X server on `display` actually accepts connections.
+///
+/// Connecting, not just looking: a server killed with SIGKILL leaves its
+/// socket file behind, and a stale one satisfies an existence check instantly.
+/// That is how a caller ended up talking to a display whose server had not
+/// started yet ("Connection refused"), and how a keeper could have adopted a
+/// foreign server that happened to hold the number.
+///
+/// The grandchild is detached, so its exec failure cannot be waited for; a
+/// socket that accepts is the only evidence available that the desktop is
+/// real.
 pub(crate) fn wait_for_display(display: u16, timeout: core::time::Duration) -> anyhow::Result<()> {
-    let socket = std::path::PathBuf::from(format!("/tmp/.X11-unix/X{display}"));
+    let socket = format!("/tmp/.X11-unix/X{display}");
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        if socket.exists() {
+        if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
             return Ok(());
         }
         std::thread::sleep(core::time::Duration::from_millis(50));

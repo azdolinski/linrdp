@@ -10,6 +10,7 @@ mod auth;
 mod capture;
 mod clipboard;
 mod doctor;
+mod greeter;
 mod gfx;
 mod gfx_display;
 mod input;
@@ -325,9 +326,10 @@ async fn serve() -> anyhow::Result<()> {
     let auth_mode = args
         .opt_value_from_str::<_, String>("--auth")?
         .unwrap_or_else(|| "both".to_owned());
-    if !matches!(auth_mode.as_str(), "both" | "nla" | "system") {
-        anyhow::bail!("--auth expects `both`, `nla` or `system`, got `{auth_mode}`");
+    if !matches!(auth_mode.as_str(), "both" | "nla" | "system" | "greeter") {
+        anyhow::bail!("--auth expects `both`, `nla`, `system` or `greeter`, got `{auth_mode}`");
     }
+    let greeter_mode = auth_mode == "greeter";
 
     let enable_usb = args.contains("--usb");
 
@@ -377,6 +379,9 @@ async fn serve() -> anyhow::Result<()> {
         "system" => {
             tracing::info!(%bind_addr, "LinRDP starting — auth: system password only (TLS, no NLA)");
         }
+        "greeter" => {
+            tracing::info!(%bind_addr, "LinRDP starting — auth: server-drawn logon screen (TLS, no NLA)");
+        }
         _ => {
             tracing::info!(
                 %bind_addr,
@@ -400,7 +405,7 @@ async fn serve() -> anyhow::Result<()> {
     // CredSSP resolver on that path, so the account it just verified is the
     // only authenticated identity the connection will ever produce.
     let validator: Arc<dyn ironrdp_server::CredentialValidator> =
-        Arc::new(auth::ShadowValidator::new(Some(Arc::clone(&pending_identity))));
+        Arc::new(auth::ShadowValidator::new(Some(Arc::clone(&pending_identity))).deferring_to_greeter(greeter_mode));
 
     if multi_session {
         session::runtime_dir::ensure_state_dir(std::path::Path::new(session::runtime_dir::STATE_DIR))
@@ -507,7 +512,7 @@ async fn serve() -> anyhow::Result<()> {
                 // Deferred for the same reason as the display: connecting now
                 // would bind input to the shared desktop, and a worker that
                 // later failed to bind a session would be typing into it.
-                AnyInput::DeferredX11(None, DeferredInputLog::default())
+                AnyInput::DeferredX11(None, DeferredInputLog::default(), session::gate::generation())
             } else {
                 AnyInput::X11(X11InputHandler::connect().expect("X11 unavailable for input"))
             },
@@ -529,7 +534,7 @@ async fn serve() -> anyhow::Result<()> {
     let builder = RdpServer::builder().with_addr(bind_addr);
     let secured = match auth_mode.as_str() {
         "nla" => builder.with_hybrid(acceptor, identity.pub_key.clone()),
-        "system" => builder.with_tls(acceptor),
+        "system" | "greeter" => builder.with_tls(acceptor),
         _ => builder.with_hybrid_or_tls(acceptor, identity.pub_key.clone()),
     };
     let mut server = secured
@@ -631,6 +636,7 @@ async fn serve() -> anyhow::Result<()> {
                     display_range.clone(),
                     console_mode,
                     fixed_size,
+                    greeter_mode,
                 )) as Box<dyn ironrdp_server::ConnectionHandler>
             } else {
                 lifecycle
@@ -727,7 +733,7 @@ enum AnyInput {
     /// would be typing into it. Input only arrives after authentication, by
     /// which time the session gate names the right display, so the
     /// connection is made on the first event and never before.
-    DeferredX11(Option<X11InputHandler>, DeferredInputLog),
+    DeferredX11(Option<X11InputHandler>, DeferredInputLog, u64),
     #[cfg(feature = "wayland")]
     Wayland(wayland::ei::EiInputHandler),
 }
@@ -770,7 +776,16 @@ impl AnyInput {
     fn x11(&mut self) -> Option<&mut X11InputHandler> {
         match self {
             Self::X11(handler) => Some(handler),
-            Self::DeferredX11(slot, log) => {
+            Self::DeferredX11(slot, log, generation) => {
+                // The gate moved this worker (the logon screen handing over to
+                // the desktop it just authenticated): the cached connection
+                // still points at the old X server, and would type the user's
+                // first keystrokes into a login form nobody is looking at.
+                let now = crate::session::gate::generation();
+                if *generation != now {
+                    *generation = now;
+                    *slot = None;
+                }
                 if slot.is_none() {
                     match X11InputHandler::connect() {
                         Ok(handler) => *slot = Some(handler),

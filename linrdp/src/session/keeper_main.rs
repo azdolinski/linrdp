@@ -79,6 +79,7 @@ pub(crate) fn run(args: &KeeperArgs) -> anyhow::Result<()> {
     let x_cmd = keeper::xvfb_command(args.display, &rec.xauthority, args.size);
     let env_pairs = keeper::session_env(&rec, &ids);
     tracing::debug!(display = args.display, log = %x_log.display(), "starting the X server");
+    keeper::clear_stale_display(args.display);
     let x_pid = keeper::spawn_child(&x_cmd, &env_pairs, &ids, &x_log)
         .with_context(|| format!("start the X server for {} on :{}", args.user, args.display))?;
 

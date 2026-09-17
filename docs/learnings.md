@@ -644,3 +644,49 @@ fails with ENOENT. Every worker died between fork and its first line of code.
     running server.
 29. No failure path in `exec_worker` is silent. It is the process that was
     about to be the whole connection.
+
+## Saga: the logon screen, and what it should be drawn on
+
+The requirement, once it was stated plainly: a port where the client sends
+nothing, the server draws a login form, and typing into it logs you in — for
+people who want no PAM integration at all. I had proposed exactly this
+earlier, had it rejected as the *default* path, and then failed to hear it
+being asked for as the *second* one.
+
+The first design instinct was to render the form into frames by hand. That
+needs a font in the binary, and it needs RDP scancodes turned into characters
+by a table of our own — which gets any layout-dependent password wrong. The
+second instinct was better and much smaller: draw it **on an X server of its
+own**. X draws the text with a core font (`xfonts-base` is a dependency the
+desktop already has), XKB turns keycodes into keysyms correctly, and the
+capture and input paths that already exist need no idea that a logon screen
+is a different kind of thing.
+
+- **Reuse the layer that already solves the hard part.** Keyboard layouts are
+  the hard part of a login form, and X solves them. A framebuffer form would
+  have been more code and less correct.
+- **A greeter is a display the worker may leave, once.** The session gate
+  refuses to rebind precisely so a worker cannot show two users' screens; the
+  greeter needs exactly one exception, greeter → session, and stating it that
+  narrowly kept the property that the rule exists for.
+- **Caches must follow the gate.** Three of them held an X connection: the
+  display factory, the *already-minted* frame source, and the input handler.
+  Fixing the first two only would have kept streaming the logon screen to
+  somebody already inside. A generation counter bumped on every bind is what
+  each of them compares against.
+- **`wait_for_display` looked at the socket instead of connecting to it.** A
+  server killed with SIGKILL leaves the socket behind, so the check passed
+  instantly and the caller got "Connection refused" from a server that had
+  not started. It connects now — and the same leftovers (`/tmp/.X<n>-lock`)
+  are cleared before a new server takes that number, which is what "Could not
+  create server lock file" had been costing.
+
+## Invariants now enforced (keep them)
+
+30. The logon screen runs on its own X server, owned by linrdp, with no
+    session on it. Nothing of anyone's is reachable from the display a
+    worker is pointed at before authentication.
+31. The session gate allows exactly one move — greeter to session, after the
+    form accepts — and never the reverse.
+32. Readiness of an X server is decided by connecting to its socket, never by
+    the socket file existing.

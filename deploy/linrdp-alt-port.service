@@ -1,32 +1,35 @@
-# A second linrdp listener, on its own port.
+# linrdp with a logon screen drawn by the server, on its own port.
 #
-# With the default `--auth both` a port advertises TLS *and* CredSSP and each
-# client negotiates the strongest it supports, so one port already serves
-# every client: mstsc takes NLA, a client that cannot takes TLS and sends its
-# credentials in the Client Info PDU. This unit exists for deployments that
-# want a second address — a different interface, a port the firewall already
-# allows — not because the two ports differ in what they accept.
+# This is the path for deployments that want nothing to do with PAM
+# integration. Nothing is stored and nothing is provisioned: the client sends
+# no credentials, linrdp draws a login form, and what you type there goes
+# straight to /etc/shadow and PAM. Every client works, mstsc included — it is
+# exactly what mstsc expects from a server that does not offer NLA.
+#
+# The form is drawn on an X server of its own, owned by linrdp, with nobody's
+# session on it, so showing it before anyone has authenticated reveals
+# nothing. Only once the form accepts does the worker move to the user's own
+# desktop; it can never move back.
+#
+# The other instance (deploy/linrdp.service, port 3389) uses `--auth both`:
+# the client's own credential prompt, with the password learned by the PAM
+# capture in deploy/pam-capture. Run either, or both.
 #
 # Both instances share /run/linrdp and the display range, which is
 # deliberate: display numbers are handed out under a flock, so a user who
-# arrives on either port lands on their own single session. Connecting on one
-# port and later on the other returns to the same desktop.
-#
-# For a port that must never hold a password, add `--auth system`: it refuses
-# NLA entirely, so nothing is ever stored — and a client that only speaks NLA
-# (mstsc) is refused with it, reporting 0x904 the moment you press Connect.
+# arrives on either port lands on their own single session.
 #
 # Install:
 #   sudo install -m644 deploy/linrdp-alt-port.service \
 #     /etc/systemd/system/linrdp-alt-port.service
 #   sudo systemctl enable --now linrdp-alt-port
 [Unit]
-Description=LinRDP - second listener (port 3390)
+Description=LinRDP - logon screen drawn by the server (port 3390)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/linrdp --supervisor --bind-addr 0.0.0.0:3390
+ExecStart=/usr/local/bin/linrdp --supervisor --auth greeter --bind-addr 0.0.0.0:3390
 Environment=LINRDP_LOG=info
 # Root is needed to read /etc/shadow, open PAM sessions, and start each
 # session's X server as its own user.
