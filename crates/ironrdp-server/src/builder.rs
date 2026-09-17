@@ -117,6 +117,21 @@ impl RdpServerBuilder<WantsSecurity> {
             },
         }
     }
+
+    /// Advertise TLS and CredSSP together, letting each client negotiate the
+    /// strongest it supports. See [`RdpServerSecurity::HybridOrTls`].
+    pub fn with_hybrid_or_tls(
+        self,
+        acceptor: impl Into<TlsAcceptor>,
+        pub_key: Vec<u8>,
+    ) -> RdpServerBuilder<WantsHandler> {
+        RdpServerBuilder {
+            state: WantsHandler {
+                addr: self.state.addr,
+                security: RdpServerSecurity::HybridOrTls((acceptor.into(), pub_key)),
+            },
+        }
+    }
 }
 
 impl RdpServerBuilder<WantsHandler> {

@@ -90,45 +90,30 @@ What this costs, stated plainly: the password ends up stored recoverably in
 inherent to NLA. If that trade or the PAM edit is unacceptable, use the
 second option below instead.
 
-### Second option: `--auth system` — no PAM edit, nothing stored
+### `--auth` — what each port accepts
 
-```sh
-sudo /usr/local/bin/linrdp --supervisor --auth system --bind-addr 0.0.0.0:3389
-```
+The default is `both`: a port advertises TLS **and** CredSSP, and each client
+negotiates the strongest it supports (MS-RDPBCGR 5.4.5.1). There is no wrong
+port to connect to.
 
-TLS instead of NLA. The client collects the credentials in its own window and
-sends them in the Client Info PDU (MS-RDPBCGR 2.2.1.11.1.1); linrdp checks
-them against `/etc/shadow` with PAM behind it and forgets them. Nothing is
-stored, no PAM stack is touched, nothing has to be provisioned, and a
-password change takes effect immediately.
+| mode | advertises | client | needs the capture above |
+|---|---|---|---|
+| `both` (default) | TLS + CredSSP | every client: mstsc takes NLA, others take TLS | only for the clients that choose NLA |
+| `nla` | CredSSP only | every client | yes |
+| `system` | TLS only | only clients that send credentials without NLA (FreeRDP, Remmina, most mobile apps) — **not mstsc** | no, and nothing is ever stored |
 
-The catch is the client, not the server. Without NLA the client has to send
-credentials on its own:
+Under `system` a client that only speaks NLA sends no credentials at all and
+is refused: mstsc reports **0x904** the moment you press Connect. MS-RDPBCGR
+offers no way to ask a client to prompt — `LOGON_FAILED_BAD_PASSWORD`
+(2.2.5.1.2) directs the user to the server's own logon screen, which linrdp
+does not draw. So `system` is for deployments that would rather refuse mstsc
+than store anything.
 
-| client | works |
-|---|---|
-| FreeRDP (`xfreerdp /u: /p:`), Remmina, most mobile RDP apps | yes |
-| mstsc (Windows Remote Desktop) | **no** — without NLA it sends nothing and waits for a server-drawn logon screen, which linrdp does not have |
-
-MS-RDPBCGR offers no way to ask a client to prompt: `LOGON_FAILED_BAD_PASSWORD`
-(2.2.5.1.2) directs the user to the server's own logon screen. So with mstsc
-the choice is NLA plus the PAM capture above.
-
-`linrdp doctor` knows the difference: with `--auth system` configured in the
-unit it reports the missing capture as fine rather than as a blocker.
-
-Both modes can run at once, on separate ports —
-`deploy/linrdp-auth-system.service` does exactly that:
-
-| port | mode | client |
-|---|---|---|
-| 3389 | NLA (`deploy/linrdp.service`) | mstsc and everything else |
-| 3390 | `--auth system` (`deploy/linrdp-auth-system.service`) | clients that send credentials without NLA |
-
-They share `/run/linrdp` and the display range on purpose: display numbers are
-handed out under a `flock`, so a user arriving on either port lands on their
-own single session, and connecting on one port after the other returns to the
-same desktop.
+`deploy/linrdp-alt-port.service` runs a second listener on 3390 for
+deployments that want another address. Both instances share `/run/linrdp` and
+the display range on purpose: display numbers are handed out under a `flock`,
+so a user arriving on either port lands on their own single session, and
+moving between ports returns to the same desktop.
 
 ## Run
 
@@ -140,7 +125,7 @@ sudo /usr/local/bin/linrdp --supervisor --bind-addr 0.0.0.0:3389
 ```
 
 ```
---auth nla|system      how logins are verified (default nla; see above)
+--auth both|nla|system what the port accepts (default both; see above)
 --display-range L-H    X display numbers workers may allocate (default 10-99)
 --console              attach to $DISPLAY instead of a per-user session
                        (the mstsc /admin equivalent, for a shared screen)

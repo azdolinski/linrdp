@@ -502,6 +502,16 @@ pub enum RdpServerSecurity {
     Tls(TlsAcceptor),
     /// Used for both hybrid + hybrid-ex.
     Hybrid((TlsAcceptor, Vec<u8>)),
+    /// Advertise TLS *and* CredSSP, and let each client take the strongest it
+    /// supports (MS-RDPBCGR 5.4.5.1 negotiation).
+    ///
+    /// A client that offers HYBRID gets NLA and proves itself before the
+    /// session exists; one that offers only SSL gets TLS and sends its
+    /// credentials in the Client Info PDU instead. Without this, a port has to
+    /// pick one, and a client that cannot speak that one is simply refused —
+    /// mstsc on a TLS-only port sends no credentials at all and reports
+    /// 0x904.
+    HybridOrTls((TlsAcceptor, Vec<u8>)),
 }
 
 impl RdpServerSecurity {
@@ -510,6 +520,9 @@ impl RdpServerSecurity {
             RdpServerSecurity::None => nego::SecurityProtocol::empty(),
             RdpServerSecurity::Tls(_) => nego::SecurityProtocol::SSL,
             RdpServerSecurity::Hybrid(_) => nego::SecurityProtocol::HYBRID | nego::SecurityProtocol::HYBRID_EX,
+            RdpServerSecurity::HybridOrTls(_) => {
+                nego::SecurityProtocol::SSL | nego::SecurityProtocol::HYBRID | nego::SecurityProtocol::HYBRID_EX
+            }
         }
     }
 }
@@ -1099,7 +1112,8 @@ impl PendingConnection {
                     // -- `None` always yields `Continue` instead (the arm below).
                     let tls_acceptor = match security {
                         RdpServerSecurity::Tls(acceptor) => acceptor,
-                        RdpServerSecurity::Hybrid((acceptor, _)) => acceptor,
+                        RdpServerSecurity::Hybrid((acceptor, _))
+                        | RdpServerSecurity::HybridOrTls((acceptor, _)) => acceptor,
                         RdpServerSecurity::None => unreachable!(),
                     };
                     let accept = match tls_acceptor.accept(stream).await {
@@ -1169,7 +1183,15 @@ where
 {
     acceptor.mark_security_upgrade_as_done();
 
-    if let RdpServerSecurity::Hybrid((_, pub_key)) = security {
+    // Whether CredSSP runs is decided by what was NEGOTIATED, not by what the
+    // server was configured to offer: under `HybridOrTls` the same server
+    // serves NLA clients and TLS-only ones, and the acceptor's state already
+    // reflects which of the two this connection chose.
+    let pub_key = match security {
+        RdpServerSecurity::Hybrid((_, key)) | RdpServerSecurity::HybridOrTls((_, key)) => Some(key),
+        RdpServerSecurity::Tls(_) | RdpServerSecurity::None => None,
+    };
+    if let Some(pub_key) = pub_key.filter(|_| acceptor.should_perform_credssp()) {
         // Generic streams don't expose peer address. Use a neutral
         // placeholder; it's unclear whether CredSSP/NTLM actually
         // uses this value in practice.

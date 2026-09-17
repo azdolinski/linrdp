@@ -1,0 +1,42 @@
+# A second linrdp listener, on its own port.
+#
+# With the default `--auth both` a port advertises TLS *and* CredSSP and each
+# client negotiates the strongest it supports, so one port already serves
+# every client: mstsc takes NLA, a client that cannot takes TLS and sends its
+# credentials in the Client Info PDU. This unit exists for deployments that
+# want a second address — a different interface, a port the firewall already
+# allows — not because the two ports differ in what they accept.
+#
+# Both instances share /run/linrdp and the display range, which is
+# deliberate: display numbers are handed out under a flock, so a user who
+# arrives on either port lands on their own single session. Connecting on one
+# port and later on the other returns to the same desktop.
+#
+# For a port that must never hold a password, add `--auth system`: it refuses
+# NLA entirely, so nothing is ever stored — and a client that only speaks NLA
+# (mstsc) is refused with it, reporting 0x904 the moment you press Connect.
+#
+# Install:
+#   sudo install -m644 deploy/linrdp-alt-port.service \
+#     /etc/systemd/system/linrdp-alt-port.service
+#   sudo systemctl enable --now linrdp-alt-port
+[Unit]
+Description=LinRDP - second listener (port 3390)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/linrdp --supervisor --bind-addr 0.0.0.0:3390
+Environment=LINRDP_LOG=info
+# Root is needed to read /etc/shadow, open PAM sessions, and start each
+# session's X server as its own user.
+User=root
+Restart=on-failure
+RestartSec=2
+# Sessions outlive the connection that created them and are owned by keeper
+# processes re-parented to init; stopping this unit must not take the
+# desktops with it.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

@@ -40,23 +40,27 @@ use crate::input::X11InputHandler;
 
 const HELP: &str = "\
 USAGE:
-  linrdp [--bind-addr <ADDR>] [--auth nla|system] [--usb] [--log-file <PATH>]
+  linrdp [--bind-addr <ADDR>] [--auth both|nla|system] [--usb] [--log-file <PATH>]
          [--fixed-size <WxH>]
 
 Serves a real Linux desktop over RDP.
 
-Authentication (--auth, default `nla`):
-  nla     CredSSP/NTLMv2 — the client's own credential prompt, which is what
-          every RDP client does out of the box. You log in with the account's
+Authentication (--auth, default `both`):
+  both    Advertise TLS and CredSSP together and let each client negotiate the
+          strongest it supports, so there is no wrong port to connect to:
+          mstsc takes NLA, a client that cannot takes TLS and sends its
+          credentials in the Client Info PDU. Either way the password checked
+          is the account's system password.
+  nla     CredSSP/NTLMv2 only — the client's own credential prompt, which is
+          what every RDP client does out of the box. You log in with the account's
           system password; there is no linrdp password to set, and no command
           that sets one. NTLM does require the server to know the secret
           (MS-NLMP: it computes the expected response from it), so linrdp
           learns each password from the system's own authentication, the way
           Samba's pam_smbpass did — see deploy/pam-capture. Authenticate once
           on this machine (su -, ssh, console) and RDP works from then on.
-  system  TLS, and whatever credentials the client sends in the Client Info
-          PDU, checked against /etc/shadow and PAM. Stores nothing at all, but
-          only works with clients that send credentials without NLA.
+  system  TLS only. Refuses NLA, so nothing is ever stored — but a client
+          that only speaks NLA (mstsc) is refused with it.
 
   `linrdp doctor` reports whether the capture is wired and whose password it
   has seen.
@@ -480,12 +484,10 @@ async fn serve() -> anyhow::Result<()> {
     // but it needs a client that sends credentials without NLA.
     let auth_mode = args
         .opt_value_from_str::<_, String>("--auth")?
-        .unwrap_or_else(|| "nla".to_owned());
-    let nla = match auth_mode.as_str() {
-        "system" => false,
-        "nla" => true,
-        other => anyhow::bail!("--auth expects `system` or `nla`, got `{other}`"),
-    };
+        .unwrap_or_else(|| "both".to_owned());
+    if !matches!(auth_mode.as_str(), "both" | "nla" | "system") {
+        anyhow::bail!("--auth expects `both`, `nla` or `system`, got `{auth_mode}`");
+    }
 
     let enable_usb = args.contains("--usb");
 
@@ -527,11 +529,21 @@ async fn serve() -> anyhow::Result<()> {
 
     setup_logging(log_file.as_deref());
 
-    if nla {
-        tracing::info!(%bind_addr, "LinRDP starting — auth: NLA (CredSSP/NTLM) against the linrdp SAM");
-        warn_if_no_accounts();
-    } else {
-        tracing::info!(%bind_addr, "LinRDP starting — auth: system password (/etc/shadow, PAM)");
+    match auth_mode.as_str() {
+        "nla" => {
+            tracing::info!(%bind_addr, "LinRDP starting — auth: NLA only (CredSSP/NTLM)");
+            warn_if_no_accounts();
+        }
+        "system" => {
+            tracing::info!(%bind_addr, "LinRDP starting — auth: system password only (TLS, no NLA)");
+        }
+        _ => {
+            tracing::info!(
+                %bind_addr,
+                "LinRDP starting — auth: NLA or TLS, whichever the client negotiates"
+            );
+            warn_if_no_accounts();
+        }
     }
 
     let identity = tls::load_or_generate_identity().context("failed to prepare TLS identity")?;
@@ -672,14 +684,13 @@ async fn serve() -> anyhow::Result<()> {
         )
     };
 
-    // Both arms land on the same builder state; only the advertised security
+    // Every arm lands on the same builder state; only the advertised security
     // protocol differs (MS-RDPBCGR 5.4.5.1 negotiation).
-    let secured = if nla {
-        RdpServer::builder()
-            .with_addr(bind_addr)
-            .with_hybrid(acceptor, identity.pub_key.clone())
-    } else {
-        RdpServer::builder().with_addr(bind_addr).with_tls(acceptor)
+    let builder = RdpServer::builder().with_addr(bind_addr);
+    let secured = match auth_mode.as_str() {
+        "nla" => builder.with_hybrid(acceptor, identity.pub_key.clone()),
+        "system" => builder.with_tls(acceptor),
+        _ => builder.with_hybrid_or_tls(acceptor, identity.pub_key.clone()),
     };
     let mut server = secured
         .with_input_handler(input_handler)
