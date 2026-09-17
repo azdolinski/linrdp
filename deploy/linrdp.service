@@ -22,6 +22,14 @@ Wants=network-online.target
 # connection, so two people can work at once without sharing a desktop.
 ExecStart=/usr/local/bin/linrdp --supervisor --bind-addr 0.0.0.0:3389
 Environment=LINRDP_LOG=info
+# Enables the AVC444v2 layout (full-resolution chroma) where the client
+# negotiates cap version 10.6. This is not only a quality knob: at 4:2:0 the
+# motion-linger exit owes the screen a lossless repaint to undo the half-res
+# chroma, and on an idle desktop that repaint is the entire bandwidth of the
+# session — measured at 14 whole-screen ClearCodec paints per 10 s, 14.8 MB,
+# 2.8 fps at 2880x1800. Under AVC444v2 there is nothing to repair and the
+# snap-back is skipped. See gfx_display.rs (motion-linger exit).
+Environment=LINRDP_AVC444V2=1
 # Root is needed to read /etc/shadow, open PAM sessions, and start each
 # session's X server as its own user.
 User=root
