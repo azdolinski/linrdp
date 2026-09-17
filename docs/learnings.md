@@ -556,3 +556,43 @@ password by construction, refreshed on every login, and no human maintains it.
 26. Anything linrdp runs from inside a PAM stack exits successfully no matter
     what goes wrong, and is wired `optional`. An authentication must never
     fail because of us.
+
+## Saga: the logout that left a live X server behind
+
+First login worked. The user pressed Log Out. The next login was a black
+screen, and stayed one.
+
+The evidence settled it in three commands: `xlsclients` on that display
+returned **nothing**, `Xvfb` was still running, the session record still
+advertised the session, and `xfce4-session` was a zombie whose exit status
+(read out of `/proc/<pid>/stat`) said **exit code 0** — it had not crashed, it
+had logged out, exactly as asked. The keeper waited on the X server and only
+the X server, so the half that died was the half nobody was watching. Every
+later connection attached to a live display with no clients on it.
+
+Reproduced deterministically: send `SIGTERM` to `xfce4-session` and the X
+server, the record, and a few orphaned panels all stay behind.
+
+- **Supervise every process whose death ends the thing.** A session is an X
+  server *and* a desktop; watching one of the two is watching half a session.
+  `waitpid(-1)` covers both children and costs nothing.
+- **A zombie carries its exit status, and `/proc/<pid>/stat`'s last field is
+  it.** "Exited cleanly with 0" versus "killed by a signal" is the difference
+  between a logout and a crash, and it is readable without reproducing
+  anything.
+- **A degraded mode that looks identical to a failure is not a degraded
+  mode.** The keeper used to serve a bare X server when the desktop failed to
+  start, commented as "the user gets a bare display rather than a refused
+  login". A bare display *is* the black screen. It now ends the session so the
+  next connection builds a working one.
+- **Leftovers from an earlier test invalidate the next one.** A stale `Xvfb
+  :11` that a previous `kill` had not removed made a clean run look like a
+  fix that failed; `wait_for_display` only checks that the socket exists, so
+  the keeper adopted the foreign server without noticing.
+
+## Invariants now enforced (keep them)
+
+27. A session lasts exactly as long as both halves: when either the X server or
+    the desktop exits, the keeper stops the other, drops the record and closes
+    the PAM session. No connection is ever offered a display with no desktop
+    on it.

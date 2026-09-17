@@ -94,26 +94,39 @@ pub(crate) fn run(args: &KeeperArgs) -> anyhow::Result<()> {
         unsafe { libc::kill(x_pid, libc::SIGTERM) };
     })?;
 
+    let mut desktop_pid = None;
     if !args.session_exec.is_empty() {
         let desktop_log = args.state_dir.join(format!("display-{}.desktop.log", args.display));
         let desktop = split_exec(&args.session_exec);
         match keeper::spawn_child(&desktop, &env_pairs, &ids, &desktop_log) {
-            Ok(pid) => tracing::info!(
-                user = %args.user,
-                display = args.display,
-                exec = %args.session_exec,
-                pid,
-                "desktop session started"
-            ),
-            // A missing desktop is a degraded session, not a failed one: the
-            // X server is up and the user gets a bare display rather than a
-            // refused login.
-            Err(error) => tracing::error!(
-                user = %args.user,
-                display = args.display,
-                %error,
-                "desktop session failed to start — serving a bare X server"
-            ),
+            Ok(pid) => {
+                desktop_pid = Some(pid);
+                tracing::info!(
+                    user = %args.user,
+                    display = args.display,
+                    exec = %args.session_exec,
+                    pid,
+                    "desktop session started"
+                );
+            }
+            // An X server with no desktop on it is a black screen, which is
+            // indistinguishable to the user from a broken server. Fail the
+            // session instead, so the error reaches the log and the next
+            // connection starts a fresh one.
+            Err(error) => {
+                tracing::error!(
+                    user = %args.user,
+                    display = args.display,
+                    %error,
+                    "desktop session failed to start — ending the session rather than \
+                     serving an empty screen"
+                );
+                end_session(x_pid);
+                let _ = registry::forget_record(&args.state_dir, args.display);
+                let _ = pam.close();
+                drop(lease);
+                return Err(error);
+            }
         }
     }
 
@@ -121,11 +134,28 @@ pub(crate) fn run(args: &KeeperArgs) -> anyhow::Result<()> {
     registry::write_record(&args.state_dir, &rec)?;
     tracing::info!(user = %args.user, display = args.display, "session ready");
 
-    // The session lasts as long as its X server.
-    let mut status = 0;
-    // SAFETY: waiting on our own child.
-    unsafe { libc::waitpid(x_pid, &mut status, 0) };
-    tracing::info!(user = %args.user, display = args.display, "X server exited — ending the session");
+    // The session lasts as long as BOTH its X server and its desktop.
+    //
+    // Watching only the X server is what turned "log out" into a black
+    // screen: XFCE's logout ends `xfce4-session`, Xvfb keeps running, and the
+    // record goes on advertising a session whose desktop is gone — so the next
+    // login attached to a live X server with no clients on it. Reproduced
+    // deterministically: terminate `xfce4-session` and the X server, the
+    // record and a few orphaned panels all stay behind.
+    let ended_by = wait_for_either(x_pid, desktop_pid);
+    tracing::info!(
+        user = %args.user,
+        display = args.display,
+        ended_by,
+        "session over — tearing it down"
+    );
+    // Whichever half died, the other must not outlive it: an X server with no
+    // desktop is the black screen above, and a desktop with no X server has
+    // nothing to draw on.
+    end_session(x_pid);
+    if let Some(pid) = desktop_pid {
+        end_session(pid);
+    }
 
     let _ = registry::forget_record(&args.state_dir, args.display);
     let _ = pam.close();
@@ -138,6 +168,68 @@ pub(crate) fn run(args: &KeeperArgs) -> anyhow::Result<()> {
 ///
 /// Field codes like %U are placeholders for files a launcher would pass; a
 /// session has none, and leaving them in would hand the desktop a literal
+
+/// Wait until either the X server or the desktop exits, and say which.
+///
+/// Both are direct children, so a single `waitpid(-1)` loop covers them; any
+/// other child reaped here (a desktop that forked and left one behind) is not
+/// the end of the session and the loop continues.
+fn wait_for_either(x_pid: i32, desktop_pid: Option<i32>) -> &'static str {
+    loop {
+        let mut status = 0;
+        // SAFETY: waiting on our own children; -1 means "any of them".
+        let dead = unsafe { libc::waitpid(-1, &mut status, 0) };
+        match classify_exit(dead, x_pid, desktop_pid) {
+            Some(what) => return what,
+            None if dead == -1 => return "no children left",
+            None => continue,
+        }
+    }
+}
+
+/// Which half of the session just died, if this pid was one of them.
+///
+/// Split out from the wait loop so the decision can be tested without
+/// forking: the loop is three lines of libc, this is the part with a rule in
+/// it.
+fn classify_exit(dead: i32, x_pid: i32, desktop_pid: Option<i32>) -> Option<&'static str> {
+    if dead == x_pid {
+        return Some("the X server exited");
+    }
+    if desktop_pid.is_some_and(|pid| pid == dead) {
+        return Some("the desktop session exited (logout)");
+    }
+    None
+}
+
+/// Stop a session process: ask, then insist.
+///
+/// `SIGTERM` lets the X server clean up its socket and lock file; the
+/// `SIGKILL` a moment later is for the case where it does not.
+fn end_session(pid: i32) {
+    // SAFETY: signalling our own child; an already-dead pid fails harmlessly
+    // because it has not been reaped yet, so the number is still ours.
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+    for _ in 0..20 {
+        std::thread::sleep(core::time::Duration::from_millis(50));
+        // SAFETY: signal 0 only tests whether the pid is still signalable.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return;
+        }
+        let mut status = 0;
+        // SAFETY: reaping our own child, without blocking.
+        if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == pid {
+            return;
+        }
+    }
+    // SAFETY: as above.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+}
+
 /// "%U" as an argument.
 fn split_exec(exec: &str) -> keeper::DesktopCommand {
     let mut parts = exec
@@ -174,6 +266,43 @@ pub(crate) fn wait_for_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session ends when EITHER half dies.
+    ///
+    /// Regression: the keeper waited only on the X server, so XFCE's "Log Out"
+    /// — which ends `xfce4-session` and leaves Xvfb running — left a session
+    /// record advertising a desktop that no longer existed. The next login
+    /// attached to a live X server with no clients on it: a black screen that
+    /// never recovered, because nothing was watching the half that had died.
+    #[test]
+    fn either_half_dying_ends_the_session() {
+        assert_eq!(
+            classify_exit(100, 100, Some(200)),
+            Some("the X server exited"),
+            "the X server dying has always ended the session"
+        );
+        assert_eq!(
+            classify_exit(200, 100, Some(200)),
+            Some("the desktop session exited (logout)"),
+            "a logout must end the session too, or it leaves an empty screen behind"
+        );
+    }
+
+    /// Grandchildren the desktop left behind are reaped without ending
+    /// anything: only the two processes the keeper started are the session.
+    #[test]
+    fn an_unrelated_child_does_not_end_the_session() {
+        assert_eq!(classify_exit(999, 100, Some(200)), None);
+        assert_eq!(classify_exit(-1, 100, Some(200)), None, "waitpid failure is not a death");
+    }
+
+    /// With no desktop configured the X server alone is the session.
+    #[test]
+    fn without_a_desktop_only_the_x_server_ends_it() {
+        assert_eq!(classify_exit(100, 100, None), Some("the X server exited"));
+        assert_eq!(classify_exit(200, 100, None), None);
+    }
+
 
     #[test]
     fn exec_field_codes_are_dropped() {
