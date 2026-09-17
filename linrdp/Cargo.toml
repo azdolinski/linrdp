@@ -48,6 +48,8 @@ rcgen = "0.13"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 # MessageStream::next in the portal client.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+cliclack = "0.5.6"
+console = "0.16.6"
 
 [features]
 # Wayland capture path: xdg-desktop-portal + PipeWire + libei (see src/wayland).
