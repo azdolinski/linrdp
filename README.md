@@ -171,6 +171,15 @@ desktop can be reattached from a different monitor.
 and whether their programs exist, PAM, logind, screen lockers, and whether
 credential capture is wired.
 
+`sudo linrdp doctor <account>` asks the narrower question the machine report
+cannot answer: will *this* account work here? It reports the account's uid and
+home, whether its password is usable at all (a locked account refuses every
+login however the server is configured), which listener needs a captured
+password and which does not, and whether the account can have audio — with the
+commands to fix it when it cannot. A desktop served as root, for instance, has
+no sound at all, because systemd's own `pulseaudio.socket` carries
+`ConditionUser=!root` and never starts a sound server for uid 0.
+
 Upgrading in place is safe: replace `/usr/local/bin/linrdp` and the running
 supervisor execs the new binary for the next connection. (Restart the unit
 too if you want the supervisor itself on the new code.)

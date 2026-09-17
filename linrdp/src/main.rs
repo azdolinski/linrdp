@@ -71,6 +71,12 @@ Commands:
   doctor                report what this machine is and what linrdp may do on
                         it: X servers, desktop sessions (and whether their
                         programs actually exist), PAM, logind, screen lockers
+  doctor <account>      report whether that one account can be served here:
+                        uid and home, whether its password is usable at all,
+                        whether a password has been captured for NLA, and
+                        whether it can have audio — with what to do when it
+                        cannot. Run it as root; /etc/shadow is not world
+                        readable
 
 Multi-session:
   --supervisor          accept on the bind address and fork one worker per
@@ -98,8 +104,17 @@ fn main() -> anyhow::Result<()> {
     // `doctor` answers "what is this machine, and what may linrdp do on it?"
     // before anything is started, so a missing piece is a report rather than
     // a runtime failure with no explanation.
+    //
+    // With an account name it answers the narrower question instead — "will
+    // *this* account work here?" — which the machine report cannot, because
+    // everything that decides it is per-account: the runtime directory the
+    // session gets, whether the password is usable, and whether systemd will
+    // start a sound server for that uid at all.
     if std::env::args().nth(1).as_deref() == Some("doctor") {
-        return doctor::run();
+        return match std::env::args().nth(2) {
+            Some(account) => doctor::run_account(&account),
+            None => doctor::run(),
+        };
     }
     if std::env::args().any(|arg| arg == "--keeper") {
         return keeper_main();

@@ -43,6 +43,65 @@ impl ShadowValidator {
     }
 }
 
+/// What `/etc/shadow` holds for an account's password.
+///
+/// [`ShadowValidator::load_shadow`] cannot answer this: it drops every field
+/// shorter than three characters, which is exactly the set that means
+/// "locked" or "empty". A validator is right to treat those as "no verdict"
+/// and fall through to PAM; a diagnostic has to name them, because a locked
+/// account refuses every RDP login and no amount of configuration elsewhere
+/// will change that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PasswordState {
+    /// A usable hash — PAM can authenticate this account.
+    Set,
+    /// Locked (`!`, `!!`, `*`): password authentication is refused outright.
+    Locked,
+    /// The password field is empty, which PAM refuses by default.
+    Empty,
+    /// Not in `/etc/shadow` at all — an NSS-only account (LDAP, SSSD), where
+    /// PAM decides and shadow has no opinion to offer.
+    Absent,
+    /// `/etc/shadow` could not be read, so there is nothing to report.
+    Unreadable,
+}
+
+/// What `/etc/shadow` says about `username`.
+pub(crate) fn password_state(username: &str) -> PasswordState {
+    match std::fs::read_to_string("/etc/shadow") {
+        Ok(content) => classify_shadow(&content, username),
+        Err(_) => PasswordState::Unreadable,
+    }
+}
+
+/// Classify a shadow body directly, for tests in other modules.
+#[cfg(test)]
+pub(crate) fn classify_shadow_for_test(shadow: &str, username: &str) -> PasswordState {
+    classify_shadow(shadow, username)
+}
+
+/// The classification itself, separated from the file so that every shape of
+/// shadow entry can be tested without a machine that has one.
+fn classify_shadow(shadow: &str, username: &str) -> PasswordState {
+    for line in shadow.lines() {
+        let mut parts = line.splitn(9, ':');
+        let (Some(name), Some(field)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if name != username {
+            continue;
+        }
+        return if field.is_empty() {
+            PasswordState::Empty
+        } else if field.starts_with('!') || field.starts_with('*') {
+            PasswordState::Locked
+        } else {
+            PasswordState::Set
+        };
+    }
+    PasswordState::Absent
+}
+
 impl ShadowValidator {
     fn load_shadow() -> std::io::Result<HashMap<String, String>> {
         let content = std::fs::read_to_string("/etc/shadow")?;
