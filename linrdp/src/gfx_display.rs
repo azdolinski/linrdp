@@ -162,6 +162,63 @@ fn full_quality_kbit(pixels: f64) -> f64 {
 /// lossy 4:2:0) H.264 looks — the visible "pulsing". When the window
 /// lapses, one full lossless repaint snaps the whole screen crisp again,
 /// mirroring how Windows RDP presents video regions.
+/// Why a lossless repaint was armed.
+///
+/// Diagnostic only. A full-screen ClearCodec paint costs ~1 MB at 2880x1800,
+/// so a storm of them is the whole bandwidth of an idle session — but the
+/// stats line only showed `clear=N`, which cannot tell one 1 MB repaint from
+/// a handful of small partials, nor say which of the eleven call sites armed
+/// it. The per-cause tally is what turns "something repaints constantly" into
+/// a specific line of code.
+#[derive(Clone, Copy)]
+enum DebtCause {
+    ProducerBackpressure,
+    ProcessStall,
+    Generation,
+    SurfaceVanished,
+    PreFrameBackpressure,
+    LingerExit,
+    H264Skip,
+    MotionPartial,
+    ClearSendFailed,
+    NoEncoder,
+    H264SendFailed,
+}
+
+impl DebtCause {
+    const COUNT: usize = 11;
+
+    fn idx(self) -> usize {
+        match self {
+            Self::ProducerBackpressure => 0,
+            Self::ProcessStall => 1,
+            Self::Generation => 2,
+            Self::SurfaceVanished => 3,
+            Self::PreFrameBackpressure => 4,
+            Self::LingerExit => 5,
+            Self::H264Skip => 6,
+            Self::MotionPartial => 7,
+            Self::ClearSendFailed => 8,
+            Self::NoEncoder => 9,
+            Self::H264SendFailed => 10,
+        }
+    }
+
+    const NAMES: [&'static str; Self::COUNT] = [
+        "producer_bp",
+        "process_stall",
+        "generation",
+        "surface_vanished",
+        "preframe_bp",
+        "linger_exit",
+        "h264_skip",
+        "motion_partial",
+        "clear_send_failed",
+        "no_encoder",
+        "h264_send_failed",
+    ];
+}
+
 const MOTION_LINGER: Duration = Duration::from_millis(250);
 
 /// Cursor shape poll interval (XFixes GetCursorImage). Shape changes are
@@ -373,6 +430,11 @@ impl RdpServerDisplay for EgfxDisplay {
             stat_clear: 0,
             stat_bytes: 0,
             stat_last: Instant::now(),
+            stat_debt: [0; DebtCause::COUNT],
+            stat_motion_grabs: 0,
+            stat_damaged_grabs: 0,
+            stat_tiles_peak_pct: 0,
+            stat_full_paints: 0,
             rtt: Arc::clone(&self.rtt),
             rtt_baseline: Arc::clone(&self.rtt_baseline),
             bw_kbps: Arc::clone(&self.bw_kbps),
@@ -482,6 +544,15 @@ struct EgfxUpdates {
     stat_clear: u64,
     stat_bytes: u64,
     stat_last: Instant,
+    /// Diagnostic tallies, reset with every 10 s stats line: which call site
+    /// armed the lossless debt, how many damaged grabs crossed the motion
+    /// threshold, the peak changed-tile fraction, and how many lossless
+    /// paints covered the entire frame.
+    stat_debt: [u32; DebtCause::COUNT],
+    stat_motion_grabs: u32,
+    stat_damaged_grabs: u32,
+    stat_tiles_peak_pct: u32,
+    stat_full_paints: u32,
     /// Latest auto-detect RTT (ms, `u32::MAX` sentinel = not yet measured)
     /// and the session-minimum RTT, shared with the server's probe loop.
     rtt: Arc<AtomicU32>,
@@ -602,7 +673,7 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
                 if self.session.ready()
                     && Self::lock_handle(&handle).should_backpressure()
                 {
-                    self.owe_everything();
+                    self.owe_everything(DebtCause::ProducerBackpressure);
                     self.backpressure_events += 1;
                     tokio::time::sleep(POLL_INTERVAL).await;
                     continue;
@@ -716,7 +787,7 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
                 self.encoders = None;
                 self.enc_built = None;
                 self.in_motion = false;
-                self.owe_everything();
+                self.owe_everything(DebtCause::ProcessStall);
             }
 
             // Size the in-flight window from the bandwidth-delay product:
@@ -1001,7 +1072,7 @@ impl EgfxUpdates {
             if let Some(Encoders { h264: Some(enc), .. }) = self.encoders.as_mut() {
                 enc.force_intra();
             }
-            self.owe_everything();
+            self.owe_everything(DebtCause::Generation);
         }
 
         // mstsc re-advertises capabilities right after connecting (decoder
@@ -1034,7 +1105,7 @@ impl EgfxUpdates {
                     enc.force_intra();
                 }
                 self.ensure_surface(handle, grab.width, grab.height);
-                self.owe_everything();
+                self.owe_everything(DebtCause::SurfaceVanished);
                 self.caps_reset_until = Instant::now() + CAPS_SETTLE;
                 // Frames pushed during the client's reset are what trip
                 // mstsc into "protocol error 0xD06" and an RST (observed: a
@@ -1046,7 +1117,7 @@ impl EgfxUpdates {
         // Backpressure (MS-RDPEGFX 2.2.4.3): the client is behind — skip the
         // frame entirely; the full-frame send that follows covers this grab.
         if handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).should_backpressure() {
-            self.owe_everything();
+            self.owe_everything(DebtCause::PreFrameBackpressure);
             self.backpressure_events += 1;
             return;
         }
@@ -1090,7 +1161,7 @@ impl EgfxUpdates {
         if self.in_motion && Instant::now() >= self.motion_until {
             self.in_motion = false;
             if !self.avc444v2_enabled {
-                self.owe_everything();
+                self.owe_everything(DebtCause::LingerExit);
             }
         }
 
@@ -1129,12 +1200,25 @@ impl EgfxUpdates {
         let motion = !settling
             && u64::from(changed_tiles) * MOTION_DEN > u64::from(total_tiles) * MOTION_NUM;
 
+        // Diagnostic: the motion threshold is a fraction of the screen, so
+        // "is the screen really moving?" cannot be read from `damaged` alone.
+        self.stat_damaged_grabs += 1;
+        if motion {
+            self.stat_motion_grabs += 1;
+            // The fork in the road: `changed == total` means the baseline was
+            // dropped (a capture bug), anything less is a real screen change.
+            tracing::debug!(changed_tiles, total_tiles, dx, dy, dw, dh, "motion frame");
+        }
+        #[expect(clippy::arithmetic_side_effects, reason = "total_tiles is clamped to >= 1")]
+        let pct = u64::from(changed_tiles) * 100 / u64::from(total_tiles.max(1));
+        self.stat_tiles_peak_pct = self.stat_tiles_peak_pct.max(u32::try_from(pct).unwrap_or(100));
+
         if motion && !self.avc_disabled {
             if self.last_h264.elapsed() < H264_MIN_INTERVAL {
                 // Skip this encode to hold ~30 fps. The next H.264 frame is
                 // a FULL-frame encode, so this grab's content arrives with
                 // it — block lossless partials until then.
-                self.owe_region(dx, dy, dw, dh);
+                self.owe_region(dx, dy, dw, dh, DebtCause::H264Skip);
                 return;
             }
             // Motion mode only if the frame actually shipped: it suppresses
@@ -1150,7 +1234,7 @@ impl EgfxUpdates {
             // only for the next full-frame H.264 to re-lossy them — that
             // alternation is the visible pulse. The next motion frame (or
             // the linger-exit repaint) delivers these pixels consistently.
-            self.owe_region(dx, dy, dw, dh);
+            self.owe_region(dx, dy, dw, dh, DebtCause::MotionPartial);
         } else {
             let _delivered = self.send_clear(handle, data, width, height, dx, dy, dw, dh).await;
         }
@@ -1159,7 +1243,8 @@ impl EgfxUpdates {
 
     /// Record that `rect` owes a lossless paint, merging it with whatever is
     /// already owed. An existing whole-screen debt stays whole-screen.
-    fn owe_region(&mut self, x: u16, y: u16, w: u16, h: u16) {
+    fn owe_region(&mut self, x: u16, y: u16, w: u16, h: u16, cause: DebtCause) {
+        self.stat_debt[cause.idx()] += 1;
         if self.pending_full && self.debt_rect.is_none() {
             return; // already owe everything
         }
@@ -1172,7 +1257,8 @@ impl EgfxUpdates {
 
     /// Record that the whole screen owes a lossless paint (resize, surface
     /// rebuild, a frame that never reached the wire).
-    fn owe_everything(&mut self) {
+    fn owe_everything(&mut self, cause: DebtCause) {
+        self.stat_debt[cause.idx()] += 1;
         self.pending_full = true;
         self.debt_rect = None;
     }
@@ -1571,11 +1657,14 @@ impl EgfxUpdates {
             );
             self.clear_seq = self.clear_seq.wrapping_add(1);
             self.stat_clear += 1;
+            if x == 0 && y == 0 && w == frame_w && h == frame_h {
+                self.stat_full_paints += 1;
+            }
         } else {
             // Dropped (backpressure): this grab's pixels are already consumed
             // from the damage tracker, so only a later lossless paint can
             // deliver them — the region stays owed.
-            self.owe_region(x, y, w, h);
+            self.owe_region(x, y, w, h, DebtCause::ClearSendFailed);
             // See the matching note in send_h264: an actual rejection is the
             // strain signal the quality loop needs.
             self.backpressure_events += 1;
@@ -1707,7 +1796,7 @@ impl EgfxUpdates {
 
         let Some(luma_bitstream) = luma_bs else {
             // No encoder: recover with a lossless full paint.
-            self.owe_everything();
+            self.owe_everything(DebtCause::NoEncoder);
             return false;
         };
         if luma_bitstream.is_empty() {
@@ -1787,7 +1876,7 @@ impl EgfxUpdates {
             if let Some(Encoders { h264: Some(enc), .. }) = self.encoders.as_mut() {
                 enc.force_intra();
             }
-            self.owe_everything();
+            self.owe_everything(DebtCause::H264SendFailed);
             // A rejected send IS the strain signal. Counting only the
             // pre-encode `should_backpressure()` polls misses exactly the
             // drops that matter, so the adaptive quality loop never learns
@@ -1859,18 +1948,35 @@ impl EgfxUpdates {
                 .as_ref()
                 .map(|g| g.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).frames_in_flight())
                 .unwrap_or(0);
+            let debt: String = DebtCause::NAMES
+                .iter()
+                .zip(self.stat_debt.iter())
+                .filter(|(_, n)| **n > 0)
+                .map(|(name, n)| format!("{name}={n}"))
+                .collect::<Vec<_>>()
+                .join(" ");
             tracing::info!(
                 frames = self.stat_frames,
                 h264 = self.stat_h264,
                 clear = self.stat_clear,
+                full_paints = self.stat_full_paints,
                 bytes = self.stat_bytes,
                 in_flight,
+                damaged_grabs = self.stat_damaged_grabs,
+                motion_grabs = self.stat_motion_grabs,
+                tiles_peak_pct = self.stat_tiles_peak_pct,
+                debt = %debt,
                 "EGFX stats (10s window)"
             );
             self.stat_frames = 0;
             self.stat_h264 = 0;
             self.stat_clear = 0;
             self.stat_bytes = 0;
+            self.stat_debt = [0; DebtCause::COUNT];
+            self.stat_motion_grabs = 0;
+            self.stat_damaged_grabs = 0;
+            self.stat_tiles_peak_pct = 0;
+            self.stat_full_paints = 0;
             self.stat_last = Instant::now();
         }
     }

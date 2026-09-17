@@ -949,6 +949,15 @@ impl ScreenGrabber {
             self.prev_frame = None;
         }
 
+        // Diagnostic: a missing baseline makes `compute_tile_damage` report
+        // every tile changed, which reads downstream as full-screen motion.
+        // On a static screen that must happen once (first grab) and never
+        // again — so say it out loud rather than let it hide inside a 100%
+        // changed-tile count that looks like real motion.
+        if self.prev_frame.is_none() {
+            tracing::info!(width, height, "damage baseline absent — this grab reports full-screen change");
+        }
+
         let (damage, changed_tiles, total_tiles) = compute_tile_damage(self.prev_frame.as_deref(), &data, width, height);
 
         // Keep the frame as the diff baseline only when something changed —
@@ -1182,12 +1191,22 @@ impl RdpServerDisplayUpdates for Updates {
     }
 }
 
-/// Compare a tile against the same region of a previous full frame.
-fn tile_eq_same_pos(prev_frame: &[u8], tile: &[u8], stride: usize, x: u16, y: u16, w: u16, h: u16) -> bool {
+/// Compare one tile of two full frames at the same position.
+///
+/// Both sides are whole frames with the same `stride`, so both must be
+/// indexed by it. The previous version indexed `cur` as if it were a
+/// tightly-packed `w * h` tile (`row * w * 4`) while indexing `prev` with the
+/// full stride — so from the second row of every tile on it compared
+/// unrelated parts of the image. It reported every tile changed for two
+/// byte-identical frames, which made every grab the DAMAGE gate let through
+/// look like full-screen motion: H.264 on a still desktop, then a ~1 MB
+/// whole-screen lossless repaint on each motion-linger exit. No caller ever
+/// passed a packed tile.
+fn tile_eq_same_pos(prev_frame: &[u8], cur_frame: &[u8], stride: usize, x: u16, y: u16, w: u16, h: u16) -> bool {
     for row in 0..h {
         let start = usize::from(y + row) * stride + usize::from(x) * 4;
-        let t_start = usize::from(row) * usize::from(w) * 4;
-        if prev_frame[start..start + usize::from(w) * 4] != tile[t_start..t_start + usize::from(w) * 4] {
+        let end = start + usize::from(w) * 4;
+        if prev_frame[start..end] != cur_frame[start..end] {
             return false;
         }
     }
@@ -1400,8 +1419,72 @@ impl crate::gfx_display::FrameSource for X11Source {
 #[cfg(test)]
 mod tests {
     use super::{
-        GRAB_FAILURES_BEFORE_RECONNECT, GRAB_RECONNECT_RETRY_EVERY, GrabFailures, PollKind, argb_to_rdp_xor,
+        GRAB_FAILURES_BEFORE_RECONNECT, GRAB_RECONNECT_RETRY_EVERY, GrabFailures, PollKind, TILE, argb_to_rdp_xor,
+        compute_tile_damage,
     };
+
+    /// A frame wide enough to span several tiles in both directions, filled
+    /// with a position-dependent pattern so a misindexed comparison cannot
+    /// accidentally match.
+    fn frame(width: u16, height: u16) -> Vec<u8> {
+        let mut f = vec![0u8; usize::from(width) * usize::from(height) * 4];
+        for y in 0..usize::from(height) {
+            for x in 0..usize::from(width) {
+                let i = (y * usize::from(width) + x) * 4;
+                #[expect(clippy::cast_possible_truncation, reason = "a deliberate low-byte pattern")]
+                {
+                    f[i] = x as u8;
+                    f[i + 1] = y as u8;
+                    f[i + 2] = (x ^ y) as u8;
+                }
+                f[i + 3] = 0xFF;
+            }
+        }
+        f
+    }
+
+    #[test]
+    fn identical_frames_report_no_damage() {
+        // The whole point of tile damage: an unchanged screen costs nothing.
+        // This is what a static desktop hits on every grab the DAMAGE gate
+        // lets through, and reporting it as full-screen motion is what turned
+        // an idle session into ~12 Mbit/s of whole-screen repaints.
+        let (w, h) = (TILE * 3 + 5, TILE * 2 + 7);
+        let f = frame(w, h);
+        let (damage, changed, total) = compute_tile_damage(Some(&f), &f, w, h);
+        assert_eq!(damage, None, "identical frames must report no damage");
+        assert_eq!(changed, 0, "identical frames must change no tiles");
+        assert_eq!(total, 4 * 3); // ceil(197/64) x ceil(135/64)
+    }
+
+    #[test]
+    fn one_changed_pixel_damages_exactly_its_own_tile() {
+        let (w, h) = (TILE * 3, TILE * 2);
+        let prev = frame(w, h);
+        let mut cur = prev.clone();
+        // Middle tile of the bottom row: tile (1, 1), pixel (70, 70).
+        let i = (70 * usize::from(w) + 70) * 4;
+        cur[i] ^= 0xFF;
+        let (damage, changed, total) = compute_tile_damage(Some(&prev), &cur, w, h);
+        assert_eq!(changed, 1, "one pixel must dirty exactly one tile");
+        assert_eq!(total, 6);
+        assert_eq!(damage, Some((TILE, TILE, TILE, TILE)));
+    }
+
+    #[test]
+    fn damage_bounding_box_spans_only_the_changed_tiles() {
+        let (w, h) = (TILE * 4, TILE * 3);
+        let prev = frame(w, h);
+        let mut cur = prev.clone();
+        for (px, py) in [(10usize, 10usize), (200, 100)] {
+            let i = (py * usize::from(w) + px) * 4;
+            cur[i] ^= 0xFF;
+        }
+        let (damage, changed, _) = compute_tile_damage(Some(&prev), &cur, w, h);
+        assert_eq!(changed, 2);
+        // Tiles (0,0) and (3,1) -> box from (0,0) to (256,128).
+        assert_eq!(damage, Some((0, 0, TILE * 4, TILE * 2)));
+    }
 
     #[test]
     fn cursor_conversion_preserves_alpha_and_flips_rows() {
