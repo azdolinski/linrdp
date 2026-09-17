@@ -87,9 +87,35 @@ sudo linrdp doctor   # the account should now appear under "NLA accounts"
 What this costs, stated plainly: the password ends up stored recoverably in
 `/var/lib/linrdp/sam` (mode 0600, root-owned — the trust model of
 `/etc/shadow` itself, which does *not* store it recoverably). That is
-inherent to NLA. To avoid it, run with `--auth system` (TLS, credentials from
-the Client Info PDU straight to PAM, nothing stored) and use a client that
-sends credentials without NLA — mstsc does not.
+inherent to NLA. If that trade or the PAM edit is unacceptable, use the
+second option below instead.
+
+### Second option: `--auth system` — no PAM edit, nothing stored
+
+```sh
+sudo /usr/local/bin/linrdp --supervisor --auth system --bind-addr 0.0.0.0:3389
+```
+
+TLS instead of NLA. The client collects the credentials in its own window and
+sends them in the Client Info PDU (MS-RDPBCGR 2.2.1.11.1.1); linrdp checks
+them against `/etc/shadow` with PAM behind it and forgets them. Nothing is
+stored, no PAM stack is touched, nothing has to be provisioned, and a
+password change takes effect immediately.
+
+The catch is the client, not the server. Without NLA the client has to send
+credentials on its own:
+
+| client | works |
+|---|---|
+| FreeRDP (`xfreerdp /u: /p:`), Remmina, most mobile RDP apps | yes |
+| mstsc (Windows Remote Desktop) | **no** — without NLA it sends nothing and waits for a server-drawn logon screen, which linrdp does not have |
+
+MS-RDPBCGR offers no way to ask a client to prompt: `LOGON_FAILED_BAD_PASSWORD`
+(2.2.5.1.2) directs the user to the server's own logon screen. So with mstsc
+the choice is NLA plus the PAM capture above.
+
+`linrdp doctor` knows the difference: with `--auth system` configured in the
+unit it reports the missing capture as fine rather than as a blocker.
 
 ## Run
 

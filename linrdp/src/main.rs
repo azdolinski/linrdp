@@ -247,6 +247,32 @@ fn capture_credential() {
 }
 
 
+
+/// The `--auth` mode this machine is configured to run, when it can be told.
+///
+/// `doctor` runs as its own process and cannot see a running server's flags,
+/// so it asks systemd what the unit is set to start. Without systemd, or
+/// without the unit, the answer is unknown and the caller assumes the
+/// default. Only used to decide how loudly to report a missing PAM capture:
+/// required for `nla`, meaningless for `system`.
+fn configured_auth_mode() -> Option<String> {
+    let out = std::process::Command::new("systemctl")
+        .args(["show", "linrdp", "--property=ExecStart", "--value"])
+        .output()
+        .ok()?;
+    let exec = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() || exec.trim().is_empty() {
+        return None;
+    }
+    // ExecStart renders as a struct; the argv is in there verbatim, so a
+    // window search over the tokens is enough and needs no parser.
+    let tokens: Vec<&str> = exec.split_whitespace().collect();
+    tokens
+        .windows(2)
+        .find(|pair| pair[0] == "--auth")
+        .map(|pair| pair[1].trim_end_matches(&['"', '\''][..]).to_owned())
+}
+
 /// Whether the PAM stack is wired to hand linrdp the passwords it verifies.
 ///
 /// Looks for our `pam_exec` line in the files a Debian/Ubuntu-style stack
@@ -348,14 +374,23 @@ fn doctor() -> anyhow::Result<()> {
     // Not part of `verdicts`, which reports what the *machine* can do: this is
     // about how the machine is wired, and it is the difference between "NLA
     // works" and "every login is denied as invalid username".
+    let auth_mode = configured_auth_mode();
     if pam_capture_wired() {
         println!("  ok      PAM credential capture is wired — system passwords reach NLA by themselves");
+    } else if auth_mode.as_deref() == Some("system") {
+        println!(
+            "  ok      PAM credential capture is not wired, and `--auth system` does not need it \
+             — credentials come from the client and go straight to /etc/shadow + PAM"
+        );
     } else {
         blockers += 1;
         println!(
-            "  BLOCKER PAM credential capture is NOT wired. NLA cannot verify an /etc/shadow \
-             hash, so linrdp has to learn each account's system password from the system's own \
-             authentication. Install deploy/pam-capture (see its header) into the PAM stack."
+            "  BLOCKER PAM credential capture is NOT wired, and this machine runs the default \
+             `--auth nla`. NLA cannot verify an /etc/shadow hash, so linrdp has to learn each \
+             account's system password from the system's own authentication: install \
+             deploy/pam-capture into the PAM stack. The alternative, if you would rather not \
+             touch PAM, is `--auth system` — it stores nothing, but only works with clients \
+             that send credentials without NLA (FreeRDP, Remmina; mstsc does not)."
         );
     }
     if accounts.is_empty() {
