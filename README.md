@@ -12,8 +12,9 @@ redirection channel (MS-RDPEUSB/URBDRC) are all compiled in.
 ## Features (docs/target.md)
 
 1. Full RDP protocol implementation in Rust, no external libraries. ✅
-2. Login with username + password — verified against `/etc/shadow`
-   (YESCRYPT / SHA-512 / MD5-crypt), the same source SSH PAM uses. ✅
+2. Login with username + password — the account's own **system** password,
+   verified against `/etc/shadow` (YESCRYPT / SHA-512 / MD5-crypt) with the
+   system PAM stack behind it. Nothing to provision; see Authentication. ✅
 3. Real desktop streaming — X11 root window capture, ~10 fps, only changed
    frames. Input: keyboard, mouse buttons, motion, wheel via XTEST. ✅
 4. Audio in both directions — MS-RDPSND output (PCM 44.1 kHz stereo) and
@@ -21,7 +22,12 @@ redirection channel (MS-RDPEUSB/URBDRC) are all compiled in.
 5. USB redirection — URBDRC channel compiled in; device announcements
    accepted and logged with `--usb`. Real transfer forwarding needs a USB
    host stack + physical hardware. ⚠️
-6. Desktop resize — initial size negotiation + client layout requests. ✅
+6. Desktop resize — the session's screen is created at the largest desktop
+   served and scaled to each client over RandR, so the same desktop can be
+   reattached from a different monitor. ✅
+7. Multi-session — one worker and one desktop per connection, like Windows
+   RDP: each user gets their own `Xvfb`, cookie and PAM session, sessions
+   outlive the connection, and a disconnect locks them. ✅
 
 ## Build
 
@@ -30,22 +36,93 @@ cargo build --release -p linrdp
 # binary: target/release/linrdp
 ```
 
-## Run
-
-Needs read access to `/etc/shadow` (root) and the X display to serve:
+## Install
 
 ```sh
-sudo env DISPLAY=:99 XAUTHORITY=/home/user/.Xauthority \
-  LINRDP_LOG=info ./target/release/linrdp
-# options: --bind-addr 0.0.0.0:3389   --usb   (USB redirection)
-#          --lock-session       lock the logind session when the last client
-#                                disconnects, unlock on reconnect
-#          --switch-to-greeter  flip the seat to the greeter when a client
-#                                takes over (linrdp owns the seat)
-#          --fixed-size WxH     pin the desktop size (clients scale locally)
-#          --wayland            xdg-desktop-portal capture + libei input
-#                                (binary built with --features wayland)
+sudo install -m755 target/release/linrdp /usr/local/bin/linrdp
+sudo install -m644 deploy/pam.d-linrdp /etc/pam.d/linrdp
 ```
+
+## Authentication — one required step
+
+**Without this, every login is refused with "invalid username".**
+
+You log in with the account's own system password. There is no linrdp
+password, and no command that sets one. But RDP clients authenticate with NLA
+(CredSSP/NTLMv2) out of the box, and NTLM makes the *server* compute the
+expected response from the account secret (MS-NLMP) — a one-way
+`/etc/shadow` hash cannot produce it. That is the protocol, not a design
+choice; it is why xrdp offers no NLA for local accounts.
+
+So linrdp is handed each password by the system's own authentication, the way
+Samba's `pam_smbpass` kept its database in step. Add this line to the PAM
+stack (`deploy/pam-capture` explains every part of it, including how to undo
+it):
+
+```sh
+sudo sh -c 'cat deploy/pam-capture >> /etc/pam.d/common-auth'
+```
+
+```
+auth      optional  pam_exec.so expose_authtok quiet /usr/local/bin/linrdp --capture-credential
+```
+
+On RHEL/SUSE-style stacks the file is `/etc/pam.d/system-auth`. To follow
+password changes too, add the same call as a `password` line in
+`/etc/pam.d/common-password`.
+
+From then on, whenever an account authenticates (`su -`, `ssh`, console
+login) the password PAM just verified is handed to linrdp, **re-verified
+against `/etc/shadow`**, and kept for NLA. A mistyped password is discarded,
+not stored. The copy cannot drift from the system password, because it is the
+system password, refreshed on every login.
+
+Authenticate once so the account is known:
+
+```sh
+su -          # or log in over ssh
+sudo linrdp doctor   # the account should now appear under "NLA accounts"
+```
+
+What this costs, stated plainly: the password ends up stored recoverably in
+`/var/lib/linrdp/sam` (mode 0600, root-owned — the trust model of
+`/etc/shadow` itself, which does *not* store it recoverably). That is
+inherent to NLA. To avoid it, run with `--auth system` (TLS, credentials from
+the Client Info PDU straight to PAM, nothing stored) and use a client that
+sends credentials without NLA — mstsc does not.
+
+## Run
+
+Multi-session: one worker per connection, each serving its own user's desktop.
+
+```sh
+sudo /usr/local/bin/linrdp --supervisor --bind-addr 0.0.0.0:3389
+# or: sudo systemctl enable --now linrdp   (deploy/linrdp.service)
+```
+
+```
+--auth nla|system      how logins are verified (default nla; see above)
+--display-range L-H    X display numbers workers may allocate (default 10-99)
+--console              attach to $DISPLAY instead of a per-user session
+                       (the mstsc /admin equivalent, for a shared screen)
+--fixed-size WxH       pin every session's screen instead of following the
+                       connecting client
+--usb                  USB device redirection (MS-RDPEUSB)
+--lock-session         lock the logind session when the last client leaves
+--switch-to-greeter    flip the seat to the greeter when a client takes over
+--wayland              xdg-desktop-portal capture + libei input
+                       (binary built with --features wayland)
+```
+
+Each session gets its own `Xvfb`, its own MIT-MAGIC-COOKIE and its own PAM
+session, and outlives the connection: reconnecting returns to the same
+desktop, and disconnecting locks it. A session's screen is created at the
+largest desktop linrdp serves and scaled down to each client, so the same
+desktop can be reattached from a different monitor.
+
+`linrdp doctor` reports what the machine can do — X servers, desktop sessions
+and whether their programs exist, PAM, logind, screen lockers, and whether
+credential capture is wired.
 
 On first start it generates a self-signed TLS certificate
 (`linrdp-cert.pem` / `linrdp-key.pem` next to the crate) and reuses it.
@@ -55,7 +132,9 @@ On first start it generates a self-signed TLS certificate
 From any RDP client (mstsc on Windows):
 
 - address: the Linux machine's IP (port 3389)
-- credentials: any Linux system account (e.g. `root` / its password)
+- credentials: any Linux system account and its **system** password — the same
+  one `su -` accepts (see Authentication above; the account has to have
+  authenticated once on the machine)
 - accept the self-signed certificate warning on first connect
 
 You get the real Linux desktop: screen updates, keyboard, mouse, wheel;

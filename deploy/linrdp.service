@@ -1,24 +1,36 @@
-# Example systemd unit: linrdp serving a headless Xvfb desktop.
-# Install to /etc/systemd/system/linrdp.service, copy linrdp to
-# /usr/local/bin/, then: systemctl enable --now linrdp
+# Example systemd unit: linrdp serving per-user desktops.
 #
-# The X server is a separate unit (linrdp-xvfb.service) so linrdp survives
-# X crashes and reconnects on its own.
+# Install to /etc/systemd/system/linrdp.service, copy linrdp to
+# /usr/local/bin/, wire credential capture (deploy/pam-capture — without it
+# every login is refused), then: systemctl enable --now linrdp
+#
+# No DISPLAY or XAUTHORITY here, deliberately. Each connection gets its own
+# X server, started by a keeper process that owns the session for its whole
+# life, and an ambient display in this unit's environment is exactly what a
+# worker must never be able to fall back to: it is another user's screen.
+# The gate in linrdp refuses it, and this file does not offer it.
+#
+# For the single shared-screen mode (the mstsc /admin equivalent) add
+# --console and set DISPLAY/XAUTHORITY for the screen to serve.
 [Unit]
 Description=LinRDP - RDP server for Linux
-After=network-online.target linrdp-xvfb.service
+After=network-online.target
 Wants=network-online.target
-Requires=linrdp-xvfb.service
 
 [Service]
-ExecStart=/usr/local/bin/linrdp --bind-addr 0.0.0.0:3389
-Environment=DISPLAY=:99
-Environment=XAUTHORITY=/run/linrdp/Xauthority
+# --supervisor accepts on the bind address and forks one worker per
+# connection, so two people can work at once without sharing a desktop.
+ExecStart=/usr/local/bin/linrdp --supervisor --bind-addr 0.0.0.0:3389
 Environment=LINRDP_LOG=info
-# /etc/shadow verification (and PAM fallback) need root.
+# Root is needed to read /etc/shadow, open PAM sessions, and start each
+# session's X server as its own user.
 User=root
 Restart=on-failure
 RestartSec=2
+# Sessions outlive the connection that created them and are owned by keeper
+# processes re-parented to init; stopping this unit must not take the
+# desktops with it.
+KillMode=process
 
 [Install]
 WantedBy=multi-user.target
