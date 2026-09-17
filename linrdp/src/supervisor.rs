@@ -72,6 +72,31 @@ pub(crate) fn run(bind: SocketAddr, worker_argv: &[String]) -> anyhow::Result<()
     }
 }
 
+/// The path the supervisor should exec for each worker.
+///
+/// `/proc/self/exe` — which is what `current_exe` reads — keeps pointing at
+/// the *inode* this process was started from. Replace the binary in place
+/// (`install`, a package upgrade) and the link becomes
+/// `/usr/local/bin/linrdp (deleted)`, which `current_exe` hands back verbatim,
+/// suffix and all. `execv` on that fails with ENOENT, so every worker died
+/// between fork and its first line of code: connections were reset with
+/// nothing anywhere saying why, until the service happened to be restarted.
+///
+/// Stripping the suffix leaves the path the operator installed to, so a
+/// running supervisor picks up an upgraded binary on the next connection
+/// instead of breaking on it.
+fn worker_program(exe: &std::path::Path) -> std::path::PathBuf {
+    let raw = exe.as_os_str().as_encoded_bytes();
+    match raw.strip_suffix(b" (deleted)") {
+        // SAFETY: the bytes came from an OsStr and are a prefix of it, so they
+        // are still whatever encoding the platform uses for paths.
+        Some(trimmed) => std::path::PathBuf::from(unsafe {
+            std::ffi::OsString::from_encoded_bytes_unchecked(trimmed.to_vec())
+        }),
+        None => exe.to_path_buf(),
+    }
+}
+
 /// Move `stream` to fd 3 and exec the worker with `--serve-fd 3`.
 fn exec_worker(stream: std::net::TcpStream, argv: &[String]) {
     use std::os::fd::IntoRawFd as _;
@@ -80,10 +105,18 @@ fn exec_worker(stream: std::net::TcpStream, argv: &[String]) {
     // SAFETY: dup2 onto a fd the child does not otherwise use; dup2 clears
     // CLOEXEC on the copy, which is what lets it survive the exec.
     if unsafe { libc::dup2(fd, 3) } < 0 {
+        tracing::error!(error = %std::io::Error::last_os_error(), "worker: cannot place the socket on fd 3");
         return;
     }
-    let Ok(exe) = std::env::current_exe() else { return };
+    let exe = match std::env::current_exe() {
+        Ok(exe) => worker_program(&exe),
+        Err(error) => {
+            tracing::error!(%error, "worker: cannot locate the linrdp binary");
+            return;
+        }
+    };
     let Ok(exe_c) = std::ffi::CString::new(exe.as_os_str().as_encoded_bytes()) else {
+        tracing::error!(path = %exe.display(), "worker: binary path contains a NUL");
         return;
     };
 
@@ -103,11 +136,43 @@ fn exec_worker(stream: std::net::TcpStream, argv: &[String]) {
     ptrs.push(std::ptr::null());
     // SAFETY: NUL-terminated argv built above; execv only returns on failure.
     unsafe { libc::execv(exe_c.as_ptr(), ptrs.as_ptr()) };
+    // Only reachable on failure, and it must never be silent again: this is
+    // the process that was about to become the whole connection.
+    tracing::error!(
+        program = %exe.display(),
+        error = %std::io::Error::last_os_error(),
+        "worker: exec failed — the connection is being dropped"
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    /// A binary replaced underneath a running supervisor.
+    ///
+    /// Regression: `install` over `/usr/local/bin/linrdp` unlinks the old
+    /// inode, so `/proc/self/exe` — and therefore `current_exe` — reads
+    /// `/usr/local/bin/linrdp (deleted)`. `execv` on that returns ENOENT and
+    /// every worker died before its first line of code: connections reset,
+    /// nothing in the log but "forked worker".
+    #[test]
+    fn a_replaced_binary_is_exec_ed_at_its_real_path() {
+        assert_eq!(
+            worker_program(std::path::Path::new("/usr/local/bin/linrdp (deleted)")),
+            std::path::Path::new("/usr/local/bin/linrdp"),
+            "the suffix the kernel adds is not part of the path"
+        );
+    }
+
+    /// And a path that merely looks like one is left alone.
+    #[test]
+    fn an_ordinary_path_is_untouched() {
+        for path in ["/usr/local/bin/linrdp", "/opt/my (deleted) tools/linrdp", "linrdp"] {
+            assert_eq!(worker_program(std::path::Path::new(path)), std::path::Path::new(path));
+        }
+    }
 
     #[test]
     fn a_valid_range_parses() {
