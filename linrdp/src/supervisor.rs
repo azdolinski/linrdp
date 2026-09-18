@@ -9,9 +9,9 @@
 //! exactly one, which is why serving a second port meant a second systemd unit
 //! with a second copy of every setting in its `ExecStart`.
 
+use core::time::Duration;
 use std::net::TcpListener;
 use std::os::fd::AsRawFd as _;
-use std::time::Duration;
 
 use anyhow::Context as _;
 
@@ -138,12 +138,10 @@ pub(crate) fn run(mut live: Vec<Bound>) -> anyhow::Result<()> {
 
         let mut dead = Vec::new();
         for (index, pollfd) in fds.iter().enumerate() {
-            if pollfd.revents & (libc::POLLNVAL | libc::POLLERR | libc::POLLHUP) != 0 {
-                dead.push(index);
-                continue;
-            }
-            if pollfd.revents & libc::POLLIN != 0 {
-                accept_all(&live[index]);
+            match verdict(pollfd.revents) {
+                Verdict::Dead => dead.push(index),
+                Verdict::Ready => accept_all(&live[index]),
+                Verdict::Idle => {}
             }
         }
 
@@ -161,6 +159,29 @@ pub(crate) fn run(mut live: Vec<Bound>) -> anyhow::Result<()> {
             !live.is_empty(),
             "every listening socket is gone; there is nothing left to accept on"
         );
+    }
+}
+
+/// What one listener's `revents` means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// Somebody is waiting.
+    Ready,
+    /// Nothing happened on this one.
+    Idle,
+    /// The descriptor is no longer a listening socket. It has to leave the
+    /// set: `poll` reports an error condition again immediately, so a loop
+    /// that only logged it would spin at the speed of the disk.
+    Dead,
+}
+
+fn verdict(revents: i16) -> Verdict {
+    if revents & (libc::POLLNVAL | libc::POLLERR | libc::POLLHUP) != 0 {
+        Verdict::Dead
+    } else if revents & libc::POLLIN != 0 {
+        Verdict::Ready
+    } else {
+        Verdict::Idle
     }
 }
 
@@ -233,10 +254,11 @@ fn worker_argv(bind: &str) -> Vec<String> {
 fn worker_program(exe: &std::path::Path) -> std::path::PathBuf {
     let raw = exe.as_os_str().as_encoded_bytes();
     match raw.strip_suffix(b" (deleted)") {
-        // SAFETY: the bytes came from an OsStr and are a prefix of it, so they
-        // are still whatever encoding the platform uses for paths.
         Some(trimmed) => {
-            std::path::PathBuf::from(unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(trimmed.to_vec()) })
+            // SAFETY: the bytes came from an OsStr and are a prefix of it, so
+            // they are still whatever encoding the platform uses for paths.
+            let trimmed = unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(trimmed.to_vec()) };
+            std::path::PathBuf::from(trimmed)
         }
         None => exe.to_path_buf(),
     }
@@ -276,20 +298,20 @@ fn exec_worker(stream: std::net::TcpStream, argv: &[String]) {
         return;
     };
 
-    let mut args: Vec<std::ffi::CString> = vec![exe_c.clone()];
-    for a in argv {
-        if let Ok(c) = std::ffi::CString::new(a.as_str()) {
-            args.push(c);
+    let mut cstrings: Vec<std::ffi::CString> = vec![exe_c.clone()];
+    for arg in argv {
+        if let Ok(c) = std::ffi::CString::new(arg.as_str()) {
+            cstrings.push(c);
         }
     }
     for literal in ["--serve-fd", "3"] {
         if let Ok(c) = std::ffi::CString::new(literal) {
-            args.push(c);
+            cstrings.push(c);
         }
     }
 
-    let mut ptrs: Vec<*const std::ffi::c_char> = args.iter().map(|a| a.as_ptr()).collect();
-    ptrs.push(std::ptr::null());
+    let mut ptrs: Vec<*const core::ffi::c_char> = cstrings.iter().map(|c| c.as_ptr()).collect();
+    ptrs.push(core::ptr::null());
     // SAFETY: NUL-terminated argv built above; execv only returns on failure.
     unsafe { libc::execv(exe_c.as_ptr(), ptrs.as_ptr()) };
     // Only reachable on failure, and it must never be silent again: this is
@@ -311,6 +333,25 @@ mod tests {
             .map(|bind| format!("  - bind: {bind}\n    auth: both\n"))
             .collect::<String>();
         serde_norway::from_str(&format!("listeners:\n{listeners}")).expect("parses")
+    }
+
+    /// An error condition on a listening socket has to take it out of the
+    /// set. `poll` reports the same condition on the next call and every call
+    /// after it, so a loop that logged and carried on would spin — filling
+    /// /var/log/linrdp at the speed of the disk while serving nobody.
+    #[test]
+    fn a_broken_listener_leaves_the_set_rather_than_being_polled_again() {
+        for condition in [libc::POLLNVAL, libc::POLLERR, libc::POLLHUP] {
+            assert_eq!(verdict(condition), Verdict::Dead, "revents {condition:#x}");
+        }
+        // Even alongside readable data: the socket is going away either way.
+        assert_eq!(verdict(libc::POLLIN | libc::POLLERR), Verdict::Dead);
+    }
+
+    #[test]
+    fn a_readable_listener_is_accepted_on_and_a_quiet_one_is_left_alone() {
+        assert_eq!(verdict(libc::POLLIN), Verdict::Ready);
+        assert_eq!(verdict(0), Verdict::Idle);
     }
 
     /// A binary replaced underneath a running supervisor.
@@ -402,7 +443,7 @@ mod tests {
 
     #[test]
     fn a_configuration_that_binds_cleanly_yields_one_socket_per_listener() {
-        let ports: Vec<String> = std::iter::repeat_with(|| {
+        let ports: Vec<String> = core::iter::repeat_with(|| {
             let probe = TcpListener::bind("127.0.0.1:0").expect("port");
             probe.local_addr().expect("addr").to_string()
         })
