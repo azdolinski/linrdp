@@ -299,8 +299,11 @@ pub(crate) static FIELDS: &[Field] = &[
     },
     Field {
         path: "log.file",
-        description: "File to append to. Unset writes to the terminal, which under systemd \
-                      means the journal.",
+        description: "File to append to. Set, the log goes to BOTH this file and the \
+                      journal — the file at the level above, the journal capped at info, so \
+                      `systemctl status` is never empty and a per-frame `trace` never \
+                      evicts other services' logs from journald. Unset, the journal is the \
+                      whole log and gets the level above in full.",
         kind: Kind::Path,
         default: Some("/var/log/linrdp/linrdp.log"),
         overridable: Overridable::No(LOG_IS_GLOBAL),
