@@ -6,21 +6,8 @@
 //! unauthenticated and must never decide whose desktop someone reaches.
 
 use std::net::SocketAddr;
-use std::ops::RangeInclusive;
 
 use anyhow::Context as _;
-
-/// Parse `--display-range LOW-HIGH`.
-pub(crate) fn parse_display_range(spec: &str) -> anyhow::Result<RangeInclusive<u16>> {
-    let Some((low, high)) = spec.split_once('-') else {
-        anyhow::bail!("--display-range expects LOW-HIGH, e.g. 10-99");
-    };
-    let low: u16 = low.trim().parse().context("--display-range LOW")?;
-    let high: u16 = high.trim().parse().context("--display-range HIGH")?;
-    anyhow::ensure!(low >= 1, "--display-range must start at 1 or above (:0 is a physical seat)");
-    anyhow::ensure!(low <= high, "--display-range expects LOW-HIGH with LOW <= HIGH");
-    Ok(low..=high)
-}
 
 /// Accept connections and fork a worker for each.
 ///
@@ -149,7 +136,6 @@ fn exec_worker(stream: std::net::TcpStream, argv: &[String]) {
 mod tests {
     use super::*;
 
-
     /// A binary replaced underneath a running supervisor.
     ///
     /// Regression: `install` over `/usr/local/bin/linrdp` unlinks the old
@@ -172,30 +158,5 @@ mod tests {
         for path in ["/usr/local/bin/linrdp", "/opt/my (deleted) tools/linrdp", "linrdp"] {
             assert_eq!(worker_program(std::path::Path::new(path)), std::path::Path::new(path));
         }
-    }
-
-    #[test]
-    fn a_valid_range_parses() {
-        let range = parse_display_range("10-99").expect("valid");
-        assert_eq!(*range.start(), 10);
-        assert_eq!(*range.end(), 99);
-    }
-
-    #[test]
-    fn an_inverted_range_is_rejected() {
-        let err = parse_display_range("99-10").expect_err("inverted");
-        assert!(err.to_string().contains("LOW-HIGH"), "got: {err}");
-    }
-
-    #[test]
-    fn display_zero_is_rejected() {
-        let err = parse_display_range("0-9").expect_err("zero");
-        assert!(err.to_string().contains("must start at 1"), "got: {err}");
-    }
-
-    #[test]
-    fn garbage_is_rejected() {
-        parse_display_range("ten to ninety").expect_err("not a range");
-        parse_display_range("10").expect_err("missing the dash");
     }
 }

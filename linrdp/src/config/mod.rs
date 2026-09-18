@@ -524,6 +524,20 @@ pub(crate) fn load_or_default(path: &Path) -> anyhow::Result<Loaded> {
     }
 }
 
+/// The configuration as far as it can be read, for a report rather than for a
+/// decision.
+///
+/// `doctor` exists to be run on a machine that is broken, so it must not be
+/// the one command that refuses to run when something is wrong with the file.
+/// The complaint comes back alongside the defaults so the report can show it
+/// as a finding. Nothing that decides how a connection is served may use this.
+pub(crate) fn load_for_diagnostics(path: &Path) -> (Config, Option<String>) {
+    match load_or_default(path) {
+        Ok(loaded) => (loaded.config, None),
+        Err(error) => (Config::builtin_default(), Some(format!("{error:#}"))),
+    }
+}
+
 /// Read the configuration. A missing file is an error like any other.
 ///
 /// There is no defaults branch in this function and there must not be one.

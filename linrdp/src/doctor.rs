@@ -578,11 +578,18 @@ fn probe_account(name: &str) -> AccountProbe {
         cookie_exists: ids
             .as_ref()
             .is_some_and(|ids| Path::new(&ids.home).join(".config/pulse/cookie").exists()),
-        // The same default range the supervisor uses when none is given.
+        // The range the service is actually configured with — the third
+        // independent copy of `10..=99` used to live right here, and a machine
+        // whose sessions sat outside it reported every account as having no
+        // live display at all.
         live_display: crate::session::registry::find(
             Path::new(crate::session::runtime_dir::STATE_DIR),
             name,
-            10..=99,
+            crate::config::load_for_diagnostics(crate::config::path())
+                .0
+                .session
+                .display_range
+                .range(),
         )
         .map(|record| record.display),
         sound_policy,

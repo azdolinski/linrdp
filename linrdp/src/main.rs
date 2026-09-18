@@ -82,7 +82,6 @@ Commands:
 Multi-session:
   --supervisor          accept on the bind address and fork one worker per
                         connection; each worker serves its user's own desktop
-  --display-range L-H   X display numbers workers may allocate (default 10-99)
   --console             attach to $DISPLAY instead of a per-user session
                         (the mstsc /admin equivalent, for the shared screen)
   --serve-fd N          internal: serve the connection the supervisor handed
@@ -316,16 +315,9 @@ fn supervisor_main() -> anyhow::Result<()> {
     // Whatever happened to the previous supervisor, the desktops it left
     // behind must not be reachable unlocked: the process that would have
     // locked them on disconnect is precisely the one that went away.
-    let display_range = match std::env::args()
-        .position(|a| a == "--display-range")
-        .and_then(|i| std::env::args().nth(i + 1))
-    {
-        Some(spec) => supervisor::parse_display_range(&spec)?,
-        None => 10..=99,
-    };
     let locked = session::registry::lock_all(
         std::path::Path::new(session::runtime_dir::STATE_DIR),
-        display_range,
+        loaded.config.session.display_range.range(),
     );
     if locked > 0 {
         tracing::info!(sessions = locked, "locked sessions inherited from a previous supervisor");
@@ -385,10 +377,6 @@ async fn serve() -> anyhow::Result<()> {
     // $DISPLAY (the shared screen) instead of a per-user session.
     let serve_fd: Option<i32> = args.opt_value_from_str("--serve-fd")?;
     let console_mode = args.contains("--console");
-    let display_range = match args.opt_value_from_str::<_, String>("--display-range")? {
-        Some(spec) => supervisor::parse_display_range(&spec)?,
-        None => 10..=99,
-    };
 
     let bind_addr: SocketAddr = args
         .opt_value_from_str("--bind-addr")?
@@ -435,6 +423,8 @@ async fn serve() -> anyhow::Result<()> {
         loaded.config
     };
     setup_logging(&config.log);
+
+    let display_range = config.session.display_range.range();
 
     // Seal a legacy cleartext store, once. In `--supervisor` mode the migration
     // already ran there before any worker forked (see `supervisor_main`); only
