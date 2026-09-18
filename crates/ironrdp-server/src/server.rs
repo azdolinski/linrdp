@@ -712,6 +712,16 @@ pub struct RdpServer {
     credential_validator: Option<Arc<dyn CredentialValidator>>,
     credential_resolver: Option<std::sync::Arc<dyn Fn(&str) -> std::io::Result<Credentials> + Send + Sync>>,
     enable_ainput: bool,
+    /// How long a connection may take to get from the first byte to a
+    /// finished handshake, if the embedder set a deadline.
+    ///
+    /// Nothing in the negotiation has a deadline of its own: it waits for the
+    /// client's first PDU, then for a TLS handshake, then for CredSSP, each
+    /// for as long as the client likes. A client that connects and says
+    /// nothing therefore held its connection — and, for embedders that fork
+    /// per connection, its process — indefinitely. The timeouts that do exist
+    /// (preemption candidate, finalize) all start after this.
+    handshake_timeout: Option<Duration>,
     local_addr: Option<SocketAddr>,
     autodetect: Option<AutoDetectManager>,
     /// Sender half of the UDP multitransport tunnel, installed by
@@ -1515,6 +1525,9 @@ impl RdpServer {
             creds: None,
             credential_resolver,
             enable_ainput,
+            // The embedder sets this; the library keeps its previous
+            // behaviour (wait forever) unless it does.
+            handshake_timeout: None,
             credential_validator: None,
             local_addr: None,
             autodetect: None,
@@ -1795,6 +1808,18 @@ impl RdpServer {
         self.auto_reconnect_sent = true;
 
         Ok(())
+    }
+
+    /// Bound how long a connection may spend before it is authenticated.
+    ///
+    /// Covers everything from the first byte to the end of the acceptor
+    /// sequence: the X.224 exchange, the TLS handshake and CredSSP. A
+    /// connection that has not finished by then is dropped. `None` (the
+    /// default) waits forever, which is what let silent clients accumulate.
+    ///
+    /// Applies to connections started after this call.
+    pub fn set_handshake_timeout(&mut self, timeout: Option<Duration>) {
+        self.handshake_timeout = timeout;
     }
 
     /// Replace the multitransport request parameters (see
@@ -2264,7 +2289,25 @@ impl RdpServer {
 
         self.attach_channels(pending.acceptor_mut());
 
-        let Some(negotiated) = pending.negotiate_and_authenticate(stream, tls).await? else {
+        // The whole pre-authentication phase under one deadline. Putting it
+        // here, around `negotiate_and_authenticate`, is the point: the waits
+        // inside it — for the client's first PDU, for TLS, for CredSSP — have
+        // no deadlines of their own, and the timeouts further down the
+        // connection all begin only once this has returned.
+        let negotiated = match self.handshake_timeout {
+            Some(limit) => match tokio::time::timeout(limit, pending.negotiate_and_authenticate(stream, tls)).await {
+                Ok(result) => result?,
+                Err(_elapsed) => {
+                    warn!(?limit, "client did not finish the handshake in time — dropping it");
+                    return Err(ServerError::reason(
+                        "handshake",
+                        "the client did not finish negotiating before the deadline",
+                    ));
+                }
+            },
+            None => pending.negotiate_and_authenticate(stream, tls).await?,
+        };
+        let Some(negotiated) = negotiated else {
             return Ok(());
         };
 

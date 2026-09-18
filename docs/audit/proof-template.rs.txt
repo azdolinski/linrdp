@@ -1,0 +1,43 @@
+#![allow(dead_code,unused_mut)]
+use std::path::Path;
+#[path = "__REPO__/linrdp/src/session/privilege.rs"] mod privilege;
+#[path = "__REPO__/linrdp/src/session/xauth.rs"] mod xauth;
+#[path = "__REPO__/linrdp/src/session/registry.rs"] mod registry;
+#[path = "__REPO__/linrdp/src/session/display_alloc.rs"] mod display_alloc;
+pub(crate) fn wait_for_record(
+    base: &Path,
+    display: u16,
+    timeout: core::time::Duration,
+) -> anyhow::Result<registry::SessionRecord> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if let Some(rec) = registry::read_one(base, display) {
+            return Ok(rec);
+        }
+        std::thread::sleep(core::time::Duration::from_millis(50));
+    }
+    anyhow::bail!("the session keeper for :{display} did not become ready within {timeout:?}")
+}
+
+fn main() -> anyhow::Result<()> {
+ let base=std::env::temp_dir().join(format!("linrdp-audit-proof-{}",std::process::id()));
+ std::fs::create_dir_all(&base)?;
+ let runtime=base.join("runtime");
+ std::fs::create_dir_all(runtime.join("linrdp"))?;
+ let target=base.join("sentinel"); std::fs::write(&target,b"DO NOT OVERWRITE")?;
+ std::os::unix::fs::symlink(&target,runtime.join("linrdp/Xauthority"))?;
+ let ids=privilege::UserIds{uid:unsafe{libc::getuid()},gid:unsafe{libc::getgid()},name:"audit".into(),home:base.display().to_string()};
+ xauth::write_cookie(runtime.to_str().unwrap(),42,&ids)?;
+ assert_ne!(std::fs::read(&target)?,b"DO NOT OVERWRITE");
+ println!("CONFIRMED: production write_cookie follows symlink and overwrites sentinel");
+ let a={display_alloc::allocate(&base,10..=20)?.number};
+ let b={display_alloc::allocate(&base,10..=20)?.number};
+ assert_eq!(a,b);
+ let _winner=display_alloc::allocate(&base,b..=b)?;
+ assert!(display_alloc::allocate(&base,a..=a).is_err());
+ registry::write_record(&base,&registry::SessionRecord{user:"bob".into(),display:b,runtime_dir:"/run/user/1002".into(),xauthority:"/run/user/1002/linrdp/Xauthority".into(),locked:false})?;
+ let accepted=wait_for_record(&base,a,std::time::Duration::from_millis(100))?;
+ assert_eq!(accepted.user,"bob");
+ println!("CONFIRMED: both probes choose same display; losing request accepts winner's identity");
+ drop(_winner); std::fs::remove_dir_all(base)?; Ok(())
+}

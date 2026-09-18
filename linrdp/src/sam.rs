@@ -45,6 +45,13 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 
 const SAM_DIR: &str = "/var/lib/linrdp";
 const SAM_FILE: &str = "/var/lib/linrdp/sam";
+/// The file every writer of the store locks before reading it.
+///
+/// Separate from the store itself because the store is replaced by `rename`:
+/// a lock taken on the old inode would mean nothing to the next writer, which
+/// opens the new one. A fixed path nobody renames is what two processes can
+/// agree on.
+const SAM_LOCK: &str = "/var/lib/linrdp/sam.lock";
 
 /// Current sealed-blob version. Bump when the wire format or cipher changes so
 /// old entries can still be recognised (and refused) rather than misread.
@@ -314,10 +321,65 @@ pub(crate) fn load() -> std::io::Result<HashMap<String, String>> {
     Ok(parse_body(&content, machine_key_for))
 }
 
+/// An exclusive claim on the store, held for a whole read–modify–write.
+///
+/// `flock` rather than anything of our own, for the same reason the display
+/// allocator uses it: the kernel releases it when the holder dies, so a
+/// crashed writer cannot wedge the store.
+struct StoreLock {
+    /// Held purely for its `flock`; closing it releases the claim.
+    _file: std::fs::File,
+}
+
+impl StoreLock {
+    /// Take the lock, waiting for whoever holds it.
+    ///
+    /// Blocking on purpose. The writers are PAM capture helpers, each of
+    /// which runs once per login and holds this for the length of one small
+    /// file rewrite; giving up instead would silently drop the password the
+    /// login just proved, which is exactly the update that matters.
+    fn acquire() -> std::io::Result<Self> {
+        Self::at(Path::new(SAM_LOCK))
+    }
+
+    /// The mechanism itself, on a named file, so it can be exercised without
+    /// writing to `/var/lib`.
+    fn at(path: &Path) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)?;
+        // SAFETY: a valid open fd; LOCK_EX without LOCK_NB waits its turn.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { _file: file })
+    }
+}
+
 /// Set (or update) one user's password in the SAM, sealed to this machine.
 /// Creates the store with root-only permissions when missing.
+///
+/// The read, the change and the write are one locked step. They were three
+/// unsynchronised ones, and two captures finishing together — two logins, or
+/// one login on each of two listeners — each read the same map, each added
+/// its own account, and whichever renamed last threw the other's entry away.
+/// The atomic rename kept the file from ever being half-written; it could do
+/// nothing about an update that was simply gone.
 pub(crate) fn set_password(username: &str, password: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(SAM_DIR)?;
+    let _lock = StoreLock::acquire()?;
+    set_password_locked(username, password)
+}
+
+/// The read–modify–write itself, with the lock already held.
+fn set_password_locked(username: &str, password: &str) -> std::io::Result<()> {
     let mut map = load().unwrap_or_default();
     map.insert(username.to_owned(), password.to_owned());
 
@@ -346,12 +408,28 @@ pub(crate) fn lookup(username: &str) -> std::io::Result<Option<String>> {
 /// Rewrite a legacy cleartext store in sealed form. A no-op when the file is
 /// missing or already sealed, so it is safe to call unconditionally at startup.
 pub(crate) fn migrate_plaintext() {
+    // Cheap check first: the common case is a store that is already sealed,
+    // or absent, and neither is worth taking the lock for.
+    match std::fs::read_to_string(SAM_FILE) {
+        Ok(content) if body_has_legacy(&content) => {}
+        _ => return,
+    }
+    // Under the same lock as every other rewrite: two supervisors starting
+    // together (port 3389 and 3390) both migrate, and without this the second
+    // one's rewrite could land on top of a capture that happened in between.
+    let _lock = match StoreLock::acquire() {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!(%error, "could not lock the SAM to migrate it — leaving it as it is");
+            return;
+        }
+    };
     let content = match std::fs::read_to_string(SAM_FILE) {
         Ok(content) => content,
         Err(_) => return, // missing or unreadable here — nothing to migrate
     };
     if !body_has_legacy(&content) {
-        return;
+        return; // somebody else migrated it while we waited for the lock
     }
     let map = parse_body(&content, machine_key_for); // legacy → cleartext
     let (ikm, mode) = machine_ikm();
@@ -370,6 +448,54 @@ pub(crate) fn migrate_plaintext() {
 
 #[cfg(test)]
 mod tests {
+    /// Two writers must not be able to lose each other's update.
+    ///
+    /// Regression: `set_password` was an unsynchronised read–modify–write of
+    /// the whole map. Two captures finishing together — two logins, or one on
+    /// each of two listeners — each read the same state, each added its own
+    /// account, and whichever renamed last discarded the other's entry. The
+    /// atomic rename kept the file from ever being half-written; it could do
+    /// nothing about an update that was simply gone.
+    ///
+    /// The store's own path is `/var/lib/linrdp`, which a test may not write,
+    /// so this drives the lock the rewrite now runs under.
+    #[test]
+    fn the_store_lock_lets_only_one_writer_in_at_a_time() {
+        let dir = std::env::temp_dir().join(format!("linrdp-samlock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let lock_path = dir.join("sam.lock");
+
+        let inside = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let overlapped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let (path, inside, overlapped) =
+                    (lock_path.clone(), inside.clone(), overlapped.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        let _guard = StoreLock::at(&path).expect("lock");
+                        if inside.fetch_add(1, core::sync::atomic::Ordering::SeqCst) != 0 {
+                            overlapped.store(true, core::sync::atomic::Ordering::SeqCst);
+                        }
+                        std::thread::yield_now();
+                        inside.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("worker");
+        }
+
+        assert!(
+            !overlapped.load(core::sync::atomic::Ordering::SeqCst),
+            "two writers were inside the read-modify-write at once, which is how an update gets lost"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     // A fixed key so the crypto core can be exercised without touching /sys.

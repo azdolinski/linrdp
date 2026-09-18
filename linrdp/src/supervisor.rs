@@ -9,13 +9,15 @@
 //! exactly one, which is why serving a second port meant a second systemd unit
 //! with a second copy of every setting in its `ExecStart`.
 
+use core::net::IpAddr;
 use core::time::Duration;
+use std::collections::HashMap;
 use std::net::TcpListener;
 use std::os::fd::AsRawFd as _;
 
 use anyhow::Context as _;
 
-use crate::config::{self, Config};
+use crate::config::{self, Config, Limits};
 
 /// A listening socket and the configuration line that produced it.
 #[derive(Debug)]
@@ -82,14 +84,110 @@ pub(crate) fn bind_all(config: &Config) -> anyhow::Result<Vec<Bound>> {
     Ok(bound)
 }
 
+/// Which worker is serving whom, so a budget can be enforced on it.
+///
+/// Every accepted connection used to become a `fork` with nothing counting
+/// the result. A client that opened sockets and then said nothing therefore
+/// cost a process each, indefinitely — the negotiation they were stuck in had
+/// no deadline — until the host ran out of processes, memory or descriptors.
+/// Neither the total nor the per-address share was bounded, and neither could
+/// be, because nothing knew what was running.
+#[derive(Debug)]
+struct Workers {
+    /// pid → the address it is serving.
+    live: HashMap<i32, IpAddr>,
+    limits: Limits,
+    /// Refusals since the last time one was reported, so a flood becomes one
+    /// line and a count rather than a log the size of the attack.
+    refused: u64,
+    last_report: Option<std::time::Instant>,
+}
+
+impl Workers {
+    /// How often a refusal is reported while one is ongoing.
+    const REPORT_EVERY: Duration = Duration::from_secs(10);
+
+    fn new(limits: Limits) -> Self {
+        Self {
+            live: HashMap::new(),
+            limits,
+            refused: 0,
+            last_report: None,
+        }
+    }
+
+    /// Reap every worker that has exited, freeing its share of both budgets.
+    ///
+    /// This is why SIGCHLD is no longer `SIG_IGN`: auto-reaping meant a child
+    /// vanished without the supervisor ever learning it had, so a registry
+    /// would only ever have grown.
+    fn reap(&mut self) {
+        loop {
+            let mut status = 0;
+            // SAFETY: waiting on our own children; WNOHANG never blocks.
+            let dead = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+            if dead <= 0 {
+                return; // 0 = children but none finished, -1 = no children
+            }
+            self.live.remove(&dead);
+        }
+    }
+
+    /// Whether another connection from `peer` may be served, and why not.
+    fn admit(&mut self, peer: IpAddr) -> Result<(), String> {
+        let total = u32::try_from(self.live.len()).unwrap_or(u32::MAX);
+        if total >= self.limits.max_workers {
+            return Err(format!(
+                "{total} connections are already in flight (limits.max_workers)"
+            ));
+        }
+        let from_peer = u32::try_from(self.live.values().filter(|ip| **ip == peer).count()).unwrap_or(u32::MAX);
+        if from_peer >= self.limits.max_per_client {
+            return Err(format!(
+                "{peer} already holds {from_peer} connections (limits.max_per_client)"
+            ));
+        }
+        Ok(())
+    }
+
+    fn record(&mut self, pid: i32, peer: IpAddr) {
+        self.live.insert(pid, peer);
+    }
+
+    /// Note a refusal, reporting at most one line per [`Self::REPORT_EVERY`].
+    fn note_refusal(&mut self, peer: IpAddr, reason: &str) {
+        self.refused += 1;
+        let now = std::time::Instant::now();
+        if self.last_report.is_some_and(|at| now.duration_since(at) < Self::REPORT_EVERY) {
+            return;
+        }
+        self.last_report = Some(now);
+        tracing::warn!(
+            %peer,
+            %reason,
+            refused = self.refused,
+            live = self.live.len(),
+            "refusing a connection — the host's connection budget is full"
+        );
+        self.refused = 0;
+    }
+}
+
 /// Accept on every listener and fork a worker for each connection.
 ///
 /// One thread, `poll`, and no async runtime: `fork` in a multi-threaded tokio
 /// runtime is a footgun — only the calling thread survives in the child, so
 /// any runtime state is poisoned. That constraint is why this is a hand-rolled
 /// poll loop rather than anything built on mio.
-pub(crate) fn run(mut live: Vec<Bound>) -> anyhow::Result<()> {
+pub(crate) fn run(mut live: Vec<Bound>, limits: Limits) -> anyhow::Result<()> {
     anyhow::ensure!(!live.is_empty(), "no listeners to accept on");
+    let mut workers = Workers::new(limits);
+    tracing::info!(
+        max_workers = limits.max_workers,
+        max_per_client = limits.max_per_client,
+        handshake_seconds = limits.handshake_seconds,
+        "connection budget"
+    );
 
     for bound in &live {
         // Not an optimisation. A connection reset between `poll` reporting
@@ -103,26 +201,27 @@ pub(crate) fn run(mut live: Vec<Bound>) -> anyhow::Result<()> {
         tracing::info!(bind = %bound.bind, "listening");
     }
 
-    // Reap children without blocking: a worker that exits must not become a
-    // zombie, and the supervisor never waits on a specific child.
+    // Children are reaped by hand, not by `SIGCHLD = SIG_IGN`.
     //
-    // This disposition belongs to the supervisor ALONE. An ignored SIGCHLD is
-    // inherited across fork *and* across exec, so every worker, keeper, X
-    // server and desktop process would otherwise inherit auto-reaping and see
-    // its own `waitpid` calls fail with ECHILD. Each forked child restores the
-    // default before exec — see `session::keeper::restore_default_sigchld`,
-    // which documents what that cost us.
+    // Auto-reaping was simpler and is why nothing could be counted: a worker
+    // vanished without the supervisor ever learning it had, so [`Workers`]
+    // would only ever have grown and the budget above would have closed the
+    // service down after `max_workers` connections in total rather than at
+    // once. Explicit `waitpid(WNOHANG)` is what makes the registry true.
     //
-    // It also keeps a finished worker from waking `poll`, which is why this
-    // loop needs no child bookkeeping at all. Anyone who later wants per-
-    // listener worker counts will need a real SIGCHLD handler, and with it the
-    // EINTR that is handled below.
+    // The disposition still belongs to the supervisor alone — it is inherited
+    // across fork *and* exec — so each forked child restores the default
+    // before exec; see `session::keeper::restore_default_sigchld`.
     //
-    // SAFETY: setting SIGCHLD to SIG_IGN is async-signal-safe and documented
-    // on Linux to auto-reap.
-    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
+    // SAFETY: SIG_DFL is the disposition every process starts with; setting it
+    // is async-signal-safe.
+    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
 
     loop {
+        // Before polling, so a worker that exited while we were blocked has
+        // already given its share back by the time the next client asks.
+        workers.reap();
+
         let mut fds: Vec<libc::pollfd> = live
             .iter()
             .map(|bound| libc::pollfd {
@@ -133,9 +232,15 @@ pub(crate) fn run(mut live: Vec<Bound>) -> anyhow::Result<()> {
             .collect();
         let count = libc::nfds_t::try_from(fds.len()).expect("a handful of listeners");
 
+        // A timeout rather than an indefinite wait: a child's exit no longer
+        // interrupts `poll` (SIGCHLD is SIG_DFL, which is ignored without a
+        // handler), so this is what brings the loop back to `reap` on a quiet
+        // port. One second is far below any timescale a client notices and far
+        // above any cost worth counting.
+        //
         // SAFETY: `fds` holds `count` initialised pollfd values for the whole
         // call, and nothing else touches it meanwhile.
-        let ready = unsafe { libc::poll(fds.as_mut_ptr(), count, -1) };
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), count, 1_000) };
 
         if ready < 0 {
             let error = std::io::Error::last_os_error();
@@ -156,7 +261,7 @@ pub(crate) fn run(mut live: Vec<Bound>) -> anyhow::Result<()> {
         for (index, pollfd) in fds.iter().enumerate() {
             match verdict(pollfd.revents) {
                 Verdict::Dead => dead.push(index),
-                Verdict::Ready => accept_all(&live[index]),
+                Verdict::Ready => accept_all(&live[index], &mut workers),
                 Verdict::Idle => {}
             }
         }
@@ -206,10 +311,22 @@ fn verdict(revents: i16) -> Verdict {
 /// Level-triggered poll would report the socket again, but draining keeps one
 /// busy port from having to wait a full poll cycle per connection while a
 /// quiet one is checked.
-fn accept_all(bound: &Bound) {
+fn accept_all(bound: &Bound, workers: &mut Workers) {
     loop {
         match bound.listener.accept() {
             Ok((stream, peer)) => {
+                // Anything that finished while this listener was draining
+                // counts against the budget until it is reaped.
+                workers.reap();
+                if let Err(reason) = workers.admit(peer.ip()) {
+                    // Closing is the refusal. There is nothing to say in RDP
+                    // before a connection has negotiated anything, and
+                    // forking a worker to say it would spend exactly the
+                    // resource being protected.
+                    workers.note_refusal(peer.ip(), &reason);
+                    drop(stream);
+                    continue;
+                }
                 // SAFETY: the supervisor is single-threaded here (no tokio
                 // runtime), so the child inherits a consistent address space.
                 match unsafe { libc::fork() } {
@@ -225,7 +342,14 @@ fn accept_all(bound: &Bound) {
                         std::process::exit(1);
                     }
                     pid => {
-                        tracing::debug!(%peer, pid, bind = %bound.bind, "forked worker");
+                        workers.record(pid, peer.ip());
+                        tracing::debug!(
+                            %peer,
+                            pid,
+                            bind = %bound.bind,
+                            live = workers.live.len(),
+                            "forked worker"
+                        );
                         drop(stream); // the child owns it now
                     }
                 }
@@ -357,6 +481,65 @@ mod tests {
             .map(|bind| format!("  - bind: {bind}\n    auth: both\n"))
             .collect::<String>();
         serde_norway::from_str(&format!("listeners:\n{listeners}")).expect("parses")
+    }
+
+    fn limits(max_workers: u32, max_per_client: u32) -> Limits {
+        Limits {
+            max_workers,
+            max_per_client,
+            handshake_seconds: 30,
+        }
+    }
+
+    fn ip(last: u8) -> IpAddr {
+        IpAddr::from([10, 0, 0, last])
+    }
+
+    /// Every accepted connection is a `fork`, and nothing counted them.
+    ///
+    /// Regression: a client could open sockets and say nothing — the
+    /// negotiation they were stuck in had no deadline — and each one cost a
+    /// process for as long as it stayed open, until the host ran out of
+    /// processes, memory or descriptors. Unauthenticated, and from one
+    /// address.
+    #[test]
+    fn the_host_stops_forking_once_its_budget_is_full() {
+        let mut workers = Workers::new(limits(3, 3));
+        for pid in 1..=3 {
+            workers.admit(ip(pid as u8)).expect("under the limit");
+            workers.record(pid, ip(pid as u8));
+        }
+        let refusal = workers.admit(ip(9)).expect_err("the fourth must be refused");
+        assert!(refusal.contains("max_workers"), "the refusal names the limit: {refusal}");
+    }
+
+    /// One address must not be able to spend the whole host's budget.
+    #[test]
+    fn one_client_cannot_take_more_than_its_share() {
+        let mut workers = Workers::new(limits(100, 2));
+        for pid in 1..=2 {
+            workers.admit(ip(1)).expect("under the per-client limit");
+            workers.record(pid, ip(1));
+        }
+        let refusal = workers.admit(ip(1)).expect_err("a third from the same address");
+        assert!(refusal.contains("max_per_client"), "got: {refusal}");
+
+        // And a different client is unaffected — the limit is per address,
+        // not a way for one attacker to close the service to everybody.
+        workers.admit(ip(2)).expect("another address still gets in");
+    }
+
+    /// A budget that is never given back is a service that stops serving.
+    /// Reaping is what makes the registry a count of what is *live*.
+    #[test]
+    fn a_finished_worker_gives_its_share_back() {
+        let mut workers = Workers::new(limits(1, 1));
+        workers.record(4242, ip(1));
+        assert!(workers.admit(ip(1)).is_err(), "full while it is running");
+
+        // What `reap` does when waitpid reports this pid.
+        workers.live.remove(&4242);
+        workers.admit(ip(1)).expect("the number is free again once the worker is gone");
     }
 
     /// An error condition on a listening socket has to take it out of the

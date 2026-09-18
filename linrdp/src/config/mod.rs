@@ -190,6 +190,8 @@ pub(crate) struct Config {
     pub(crate) tls: Tls,
     #[serde(default)]
     pub(crate) log: Log,
+    #[serde(default)]
+    pub(crate) limits: Limits,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -226,6 +228,37 @@ pub(crate) struct Features {
     pub(crate) udp: bool,
     pub(crate) avc444v2: bool,
     pub(crate) wayland: bool,
+}
+
+/// What one unauthenticated client may cost this host.
+///
+/// Every accepted TCP connection forks a worker, and a worker that never
+/// finishes negotiating never exits — so without these a client that opens
+/// sockets and then says nothing consumed processes, memory and descriptors
+/// until the host ran out of one of them. Nothing here applies to a session
+/// that has authenticated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub(crate) struct Limits {
+    pub(crate) max_workers: u32,
+    pub(crate) max_per_client: u32,
+    pub(crate) handshake_seconds: u32,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            // Comfortably above what a real deployment serves at once, and
+            // far below what a host will fork before it stops working.
+            max_workers: 128,
+            // A client legitimately opens a second connection while the first
+            // is still tearing down; it does not open eight.
+            max_per_client: 8,
+            // Long enough for a slow link and a CredSSP round trip, short
+            // enough that a silent socket is not a permanent tenant.
+            handshake_seconds: 30,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -373,6 +406,9 @@ pub(crate) struct Effective {
     pub(crate) features: Features,
     pub(crate) tls: Tls,
     pub(crate) log: Log,
+    /// Global, never per-listener: these bound what the *host* spends, and a
+    /// budget one port could raise for itself would not be a budget.
+    pub(crate) limits: Limits,
 }
 
 impl Config {
@@ -391,6 +427,7 @@ impl Config {
             features: Features::default(),
             tls: Tls::default(),
             log: Log::default(),
+            limits: Limits::default(),
         }
     }
 
@@ -421,6 +458,8 @@ impl Config {
             tls: self.tls.clone(),
             // Never overridable: one process writes one log.
             log: self.log.clone(),
+            // Never overridable either: a per-port budget is not a budget.
+            limits: self.limits,
         };
 
         let Some(overrides) = &listener.overrides else {

@@ -281,6 +281,54 @@ pub(crate) static FIELDS: &[Field] = &[
         overridable: Overridable::Yes,
     },
     Field {
+        path: "limits",
+        description: "What one unauthenticated client may cost this host. Nothing here \
+                      applies once a connection has authenticated.",
+        kind: Kind::Block,
+        default: None,
+        default_means: None,
+        overridable: Overridable::No(
+            "these bound what the machine spends in total, and a budget one port could raise \
+             for itself would not be a budget",
+        ),
+    },
+    Field {
+        path: "limits.max_workers",
+        description: "How many connections may be in flight at once. Every accepted \
+                      connection is a forked process, so this is the ceiling on what the \
+                      machine will fork for clients it has not yet authenticated. Reaching \
+                      it refuses new connections; it never disturbs one already running.",
+        kind: Kind::Text("a whole number of processes, at least 1"),
+        default: Some("128"),
+        default_means: None,
+        overridable: Overridable::No(
+            "one supervisor forks every worker, so the ceiling is the machine's and not a \
+             port's",
+        ),
+    },
+    Field {
+        path: "limits.max_per_client",
+        description: "How many connections one client address may hold at once. A real \
+                      client opens a second while the first is tearing down; it does not \
+                      open dozens.",
+        kind: Kind::Text("a whole number of connections, at least 1"),
+        default: Some("8"),
+        default_means: None,
+        overridable: Overridable::No("counted across every listener, because the host is one host"),
+    },
+    Field {
+        path: "limits.handshake_seconds",
+        description: "How long a connection may take to get from `accept` to an \
+                      authenticated session. A client that connects and then says nothing \
+                      used to hold its worker forever, because the negotiation this covers \
+                      had no deadline of its own. Generous enough for a slow link and a \
+                      CredSSP round trip.",
+        kind: Kind::Text("a whole number of seconds, at least 1"),
+        default: Some("30"),
+        default_means: None,
+        overridable: Overridable::No("the deadline protects the host, not one port's clients"),
+    },
+    Field {
         path: "tls",
         description: "The certificate clients see. Unset means linrdp keeps a self-signed \
                       one of its own in /etc/linrdp/cert and reuses it across restarts, so a \

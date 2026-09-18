@@ -32,6 +32,9 @@ pub(crate) enum Setting {
     Udp,
     Avc444v2,
     Wayland,
+    MaxWorkers,
+    MaxPerClient,
+    HandshakeSeconds,
     TlsCert,
     TlsKey,
     LogLevel,
@@ -54,6 +57,9 @@ impl Setting {
             Self::Udp => "features.udp",
             Self::Avc444v2 => "features.avc444v2",
             Self::Wayland => "features.wayland",
+            Self::MaxWorkers => "limits.max_workers",
+            Self::MaxPerClient => "limits.max_per_client",
+            Self::HandshakeSeconds => "limits.handshake_seconds",
             Self::TlsCert => "tls.cert",
             Self::TlsKey => "tls.key",
             Self::LogLevel => "log.level",
@@ -79,6 +85,9 @@ impl Setting {
             Self::Udp => config.features.udp.to_string(),
             Self::Avc444v2 => config.features.avc444v2.to_string(),
             Self::Wayland => config.features.wayland.to_string(),
+            Self::MaxWorkers => config.limits.max_workers.to_string(),
+            Self::MaxPerClient => config.limits.max_per_client.to_string(),
+            Self::HandshakeSeconds => config.limits.handshake_seconds.to_string(),
             Self::TlsCert => opt(path(config.tls.cert.as_ref())),
             Self::TlsKey => opt(path(config.tls.key.as_ref())),
             Self::LogLevel => config.log.level.clone(),
@@ -99,6 +108,11 @@ impl Setting {
             Self::Udp => config.features.udp = parse_bool(raw)?,
             Self::Avc444v2 => config.features.avc444v2 = parse_bool(raw)?,
             Self::Wayland => config.features.wayland = parse_bool(raw)?,
+            Self::MaxWorkers => config.limits.max_workers = parse_limit(raw, "limits.max_workers")?,
+            Self::MaxPerClient => config.limits.max_per_client = parse_limit(raw, "limits.max_per_client")?,
+            Self::HandshakeSeconds => {
+                config.limits.handshake_seconds = parse_limit(raw, "limits.handshake_seconds")?;
+            }
             Self::TlsCert => config.tls.cert = unset_or(raw).map(PathBuf::from),
             Self::TlsKey => config.tls.key = unset_or(raw).map(PathBuf::from),
             Self::LogLevel => config.log.level = raw.trim().to_owned(),
@@ -151,7 +165,12 @@ impl Setting {
                 .clone()
                 .map(|value| opt(value.map(|p| p.display().to_string()))),
             // Never overridable; `overridable()` keeps these out of the tree.
-            Self::DisplayRange | Self::LogLevel | Self::LogFile => None,
+            Self::DisplayRange
+            | Self::LogLevel
+            | Self::LogFile
+            | Self::MaxWorkers
+            | Self::MaxPerClient
+            | Self::HandshakeSeconds => None,
         }
     }
 }
@@ -323,6 +342,11 @@ impl Model {
             &mut rows,
             "features",
             &[Setting::Usb, Setting::Udp, Setting::Avc444v2, Setting::Wayland],
+        );
+        self.push_block(
+            &mut rows,
+            "limits",
+            &[Setting::MaxWorkers, Setting::MaxPerClient, Setting::HandshakeSeconds],
         );
         self.push_block(&mut rows, "tls", &[Setting::TlsCert, Setting::TlsKey]);
         self.push_block(&mut rows, "log", &[Setting::LogLevel, Setting::LogFile]);
@@ -565,7 +589,12 @@ fn set_override(config: &mut Config, index: usize, key: Setting, raw: Option<&st
             overrides.tls.get_or_insert_with(Default::default).key =
                 raw.map(|value| unset_or(value).map(PathBuf::from));
         }
-        Setting::DisplayRange | Setting::LogLevel | Setting::LogFile => {
+        Setting::DisplayRange
+        | Setting::LogLevel
+        | Setting::LogFile
+        | Setting::MaxWorkers
+        | Setting::MaxPerClient
+        | Setting::HandshakeSeconds => {
             anyhow::bail!("{}", meta::override_refusal(key.schema()).unwrap_or("service-wide"))
         }
     }
@@ -635,6 +664,18 @@ fn parse_opt<T: core::str::FromStr<Err = anyhow::Error>>(raw: &str) -> anyhow::R
         Some(value) => Ok(Some(value.parse()?)),
         None => Ok(None),
     }
+}
+
+/// A limit is a count, and a count of zero is not "unlimited" — it is a
+/// service that accepts nothing. Refusing it here is kinder than a port that
+/// binds and then turns everybody away.
+fn parse_limit(raw: &str, path: &str) -> anyhow::Result<u32> {
+    let value: u32 = raw
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{path} takes a whole number, got `{}`", raw.trim()))?;
+    anyhow::ensure!(value >= 1, "{path} must be at least 1; 0 would refuse every connection");
+    Ok(value)
 }
 
 fn parse_bool(raw: &str) -> anyhow::Result<bool> {

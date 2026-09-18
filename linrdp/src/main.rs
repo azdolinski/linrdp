@@ -429,7 +429,7 @@ fn supervisor_main(mut args: pico_args::Arguments) -> anyhow::Result<()> {
     // claiming it is running.
     daemon::write_pid_file();
 
-    supervisor::run(bound)
+    supervisor::run(bound, loaded.config.limits)
 }
 
 async fn serve() -> anyhow::Result<()> {
@@ -867,6 +867,14 @@ async fn serve() -> anyhow::Result<()> {
         None
     };
     server.set_multitransport(multitransport);
+
+    // The deadline for everything before authentication. Without it a client
+    // could connect, send nothing, and hold this worker — one process, its
+    // memory and its descriptors — for as long as it cared to, which is the
+    // other half of the connection budget the supervisor enforces.
+    server.set_handshake_timeout(Some(core::time::Duration::from_secs(u64::from(
+        effective.limits.handshake_seconds,
+    ))));
 
     if let Some(fd) = serve_fd {
         // Worker: the supervisor already accepted this connection and handed

@@ -51,6 +51,19 @@ const FILE_CHUNK_SIZE: u32 = 512 * 1024;
 const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 /// Refuse whole file lists larger than this.
 const MAX_TOTAL_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+/// The largest RANGE response this server will ever build (MS-RDPECLIP
+/// 2.2.5.3).
+///
+/// `requested_size` is a `u32` straight off the wire, and it used to size the
+/// buffer directly: a client that asked for `u32::MAX` got a four-gigabyte
+/// allocation attempt for one chunk. `MAX_FILE_SIZE` and `MAX_TOTAL_SIZE` do
+/// not help — they bound what we *download from* a client, not what we serve
+/// to one, and a genuinely large file made the request legitimate-looking.
+///
+/// Same size as [`FILE_CHUNK_SIZE`], which is what our own requests ask for;
+/// a client wanting more simply asks again from the next offset, which is how
+/// the protocol is meant to be driven anyway.
+const MAX_RANGE_RESPONSE: u32 = FILE_CHUNK_SIZE;
 
 /// What we asked the client for with our last `initiate_paste`, so
 /// `on_format_data_response` knows how to interpret the payload.
@@ -1088,16 +1101,33 @@ impl CliprdrBackend for X11CliprdrBackend {
     fn on_unlock(&mut self, _id: LockDataId) {}
 }
 
+/// How many bytes a RANGE request may actually be answered with.
+///
+/// Three bounds, all applied before a single byte is allocated: the chunk
+/// ceiling, what is left of the file past `position`, and — for a position
+/// beyond the file — nothing at all.
+fn range_response_len(offered_size: u64, position: u64, requested: u32) -> usize {
+    let remaining = offered_size.saturating_sub(position);
+    let capped = u64::from(requested.min(MAX_RANGE_RESPONSE)).min(remaining);
+    usize::try_from(capped).unwrap_or(0)
+}
+
 /// Serve a RANGE FileContentsRequest from a local file.
 fn read_file_range(file: &OfferedFile, request: &FileContentsRequest) -> FileContentsResponse<'static> {
     use std::io::{Read, Seek};
+    let want = range_response_len(file.size, request.position, request.requested_size);
+    if want == 0 {
+        // Either the client asked past the end of what we offered, or for
+        // nothing. Both are answered, never allocated for.
+        return FileContentsResponse::new_data_response(request.stream_id, Vec::new());
+    }
     let Ok(mut f) = std::fs::File::open(&file.linux_path) else {
         return FileContentsResponse::new_error(request.stream_id);
     };
     if f.seek(std::io::SeekFrom::Start(request.position)).is_err() {
         return FileContentsResponse::new_error(request.stream_id);
     }
-    let mut buf = vec![0u8; request.requested_size as usize];
+    let mut buf = vec![0u8; want];
     let mut total = 0usize;
     while total < buf.len() {
         match f.read(&mut buf[total..]) {
@@ -1189,6 +1219,43 @@ impl ironrdp_server::CliprdrServerFactory for X11CliprdrServerFactory {}
 
 #[cfg(test)]
 mod tests {
+    /// A RANGE request is remote input, and it used to size an allocation on
+    /// its own word.
+    ///
+    /// Regression: `vec![0u8; request.requested_size as usize]` with no
+    /// ceiling. A client that offered a large file and then asked for one
+    /// `u32::MAX` chunk made the worker try to allocate four gigabytes for a
+    /// single response — enough to take the session, and the host's memory,
+    /// down. MAX_FILE_SIZE and MAX_TOTAL_SIZE never applied here: they bound
+    /// what we download from a client, not what we serve to one.
+    #[test]
+    fn a_range_request_cannot_ask_for_more_than_one_chunk() {
+        let huge = 8 * 1024 * 1024 * 1024u64;
+        assert_eq!(
+            range_response_len(huge, 0, u32::MAX),
+            MAX_RANGE_RESPONSE as usize,
+            "the chunk ceiling is what bounds the allocation, not the client"
+        );
+        assert_eq!(
+            range_response_len(huge, 0, 4096),
+            4096,
+            "a modest request is still served in full"
+        );
+    }
+
+    /// Past the end of what was offered there is nothing to send, and nothing
+    /// to allocate.
+    #[test]
+    fn a_range_past_the_end_of_the_file_yields_nothing() {
+        assert_eq!(range_response_len(1000, 1000, u32::MAX), 0);
+        assert_eq!(range_response_len(1000, 5000, 4096), 0, "an offset beyond the file");
+        assert_eq!(
+            range_response_len(1000, 900, u32::MAX),
+            100,
+            "only what is actually left of the file"
+        );
+    }
+
     use super::*;
     use ironrdp_cliprdr::pdu::ClipboardFormatName;
 

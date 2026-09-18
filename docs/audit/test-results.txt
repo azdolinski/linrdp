@@ -1,0 +1,10 @@
+Commit: 5f6fb9cdeec2819dc2c7b2c8fbcfdde372be99c6
+Date: 2026-09-18
+rustc 1.98.1 (48a229cea 2026-09-01)
+cargo test -p linrdp --offline --no-default-features
+Sandbox: 265 passed, 8 failed (TCP PermissionDenied and X11 assertions).
+Outside sandbox: 273 unit tests passed; 2 integration tests passed; exit 0.
+Security harness: production xauth, privilege, registry, display_alloc modules plus verbatim wait_for_record function.
+CONFIRMED: production write_cookie follows symlink and overwrites sentinel
+CONFIRMED: both probes choose same display; losing request accepts winner's identity
+No end-to-end exploit or cross-UID takeover executed.

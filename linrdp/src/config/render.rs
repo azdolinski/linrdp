@@ -119,6 +119,13 @@ pub(crate) fn render(config: &Config) -> String {
     leaf(&mut out, "features.wayland", &config.features.wayland.to_string(), 2);
     out.push('\n');
 
+    block(&mut out, "limits", 0);
+    out.push_str("limits:\n");
+    leaf(&mut out, "limits.max_workers", &config.limits.max_workers.to_string(), 2);
+    leaf(&mut out, "limits.max_per_client", &config.limits.max_per_client.to_string(), 2);
+    leaf(&mut out, "limits.handshake_seconds", &config.limits.handshake_seconds.to_string(), 2);
+    out.push('\n');
+
     block(&mut out, "tls", 0);
     out.push_str("tls:\n");
     leaf(
