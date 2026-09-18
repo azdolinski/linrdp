@@ -6,6 +6,7 @@
 
 #![allow(clippy::print_stdout)]
 
+mod atomic;
 mod auth;
 mod capture;
 mod clipboard;
@@ -18,6 +19,7 @@ mod input;
 mod mic;
 mod pam;
 mod sam;
+mod service;
 mod sound;
 mod sound_real;
 mod tls;
@@ -106,6 +108,9 @@ fn main() -> anyhow::Result<()> {
             Some(account) => doctor::run_account(&account),
             None => doctor::run(),
         };
+    }
+    if std::env::args().nth(1).as_deref() == Some("service") {
+        return service::run(std::env::args().nth(2).as_deref());
     }
     if std::env::args().any(|arg| arg == "--keeper") {
         return keeper_main();

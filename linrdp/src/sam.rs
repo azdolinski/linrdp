@@ -290,26 +290,7 @@ fn machine_key_for(mode: KeyMode) -> [u8; 32] {
 /// share one temp file and race each other's rename. Whichever renames last
 /// wins with identical content; nobody trips over a vanished temp.
 fn write_private(path: &Path, body: &str) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    let write = || -> std::io::Result<()> {
-        let mut file = {
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt as _;
-                opts.mode(0o600);
-            }
-            opts.open(&tmp)?
-        };
-        file.write_all(body.as_bytes())?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, path)
-    };
-    write().inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp); // best-effort: no stray temp on failure
-    })
+    crate::atomic::write(path, body, 0o600)
 }
 
 /// The usernames present in a store body, in file order, without decrypting
