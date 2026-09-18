@@ -118,15 +118,31 @@ pub(crate) fn path_in(unit_dir: &Path, name: &str) -> PathBuf {
 /// Missing systemd is not an error: `install` is also run in containers and
 /// build images where the files are what matter and nothing is started.
 pub(crate) fn systemctl(args: &[&str]) -> Option<bool> {
-    let output = std::process::Command::new("systemctl").args(args).output().ok()?;
-    if !output.status.success() {
-        tracing::debug!(
-            args = ?args,
-            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-            "systemctl reported a failure"
-        );
+    let (ok, said) = spoke_to_systemd(args)?;
+    if !ok {
+        tracing::debug!(args = ?args, stderr = %said, "systemctl reported a failure");
     }
-    Some(output.status.success())
+    Some(ok)
+}
+
+/// The same call, with what systemd said about it.
+///
+/// `start` and `restart` are asked for by a person standing at a prompt, and
+/// "it did not work" without systemd's own sentence sends them to the journal
+/// to find out something systemctl already printed.
+pub(crate) fn spoke_to_systemd(args: &[&str]) -> Option<(bool, String)> {
+    let output = std::process::Command::new("systemctl").args(args).output().ok()?;
+    let said = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    Some((output.status.success(), said))
+}
+
+/// Run systemctl with this terminal's own stdout, for the one verb whose
+/// output *is* the answer. Reformatting `systemctl status` would mean keeping
+/// up with a format systemd owns, and losing the colour and the log tail that
+/// make it worth reading.
+pub(crate) fn systemctl_on_this_terminal(args: &[&str]) -> Option<bool> {
+    let status = std::process::Command::new("systemctl").args(args).status().ok()?;
+    Some(status.success())
 }
 
 #[cfg(test)]

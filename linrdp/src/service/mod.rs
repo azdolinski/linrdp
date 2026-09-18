@@ -80,19 +80,121 @@ session    required   pam_unix.so
 session    optional   pam_systemd.so
 ";
 
-/// `linrdp service <verb>`.
-pub(crate) fn run(verb: Option<&str>) -> anyhow::Result<()> {
-    let layout = Layout::system();
+/// What `linrdp service <verb>` does, decided before anything is done to the
+/// machine. Named in one place so the refusal can list every verb there is.
+#[derive(Debug)]
+enum Verb {
+    Install,
+    Uninstall,
+    /// A verb handed straight to systemd, with the past tense to report it
+    /// by — English does not get it from the verb, and `stop` + `ed` is
+    /// `stoped`.
+    Control { verb: &'static str, done: &'static str },
+    Status,
+}
+
+/// Every verb, in the order the help lists them.
+const VERBS: [&str; 6] = ["install", "uninstall", "start", "stop", "restart", "status"];
+
+fn parse(verb: Option<&str>) -> anyhow::Result<Verb> {
     match verb {
-        Some("install") => install(&layout),
-        Some("uninstall") => uninstall(&layout),
-        Some(other) => anyhow::bail!("`linrdp service {other}` — expected `install` or `uninstall`"),
-        None => anyhow::bail!("`linrdp service` expects `install` or `uninstall`"),
+        Some("install") => Ok(Verb::Install),
+        Some("uninstall") => Ok(Verb::Uninstall),
+        Some("start") => Ok(Verb::Control { verb: "start", done: "started" }),
+        Some("stop") => Ok(Verb::Control { verb: "stop", done: "stopped" }),
+        Some("restart") => Ok(Verb::Control { verb: "restart", done: "restarted" }),
+        Some("status") => Ok(Verb::Status),
+        Some(other) => anyhow::bail!("`linrdp service {other}` — expected {}", VERBS.join(", ")),
+        None => anyhow::bail!("`linrdp service` expects one of: {}", VERBS.join(", ")),
     }
 }
 
+/// `linrdp service <verb>`.
+pub(crate) fn run(verb: Option<&str>) -> anyhow::Result<()> {
+    let layout = Layout::system();
+    match parse(verb)? {
+        Verb::Install => install(&layout),
+        Verb::Uninstall => uninstall(&layout),
+        Verb::Control { verb, done } => control(&layout, verb, done),
+        Verb::Status => status(&layout),
+    }
+}
+
+/// `start`, `stop` and `restart` — systemd's own verbs, spelled the way the
+/// command that installed the unit is spelled.
+///
+/// They carry no behaviour of their own beyond naming the unit. That is the
+/// point: `linrdp service install` is what put the unit there, so needing
+/// `systemctl restart linrdp` to use it means remembering a unit name that is
+/// linrdp's business rather than the operator's.
+fn control(layout: &Layout, verb: &str, done: &str) -> anyhow::Result<()> {
+    require_root(verb, "asks systemd to change a system unit")?;
+    ensure_the_unit_is_installed(layout)?;
+
+    match unit::spoke_to_systemd(&[verb, unit::UNIT_NAME]) {
+        Some((true, _)) => {
+            println!("{done} {}", unit::UNIT_NAME);
+            // Not a claim that it is serving: `systemctl start` returns when
+            // the unit is started, and a config the supervisor refuses fails
+            // after that. `status` is where the answer actually is.
+            if verb != "stop" {
+                println!("`linrdp service status` says whether it stayed up.");
+            }
+            Ok(())
+        }
+        Some((false, said)) if said.is_empty() => {
+            anyhow::bail!("systemctl {verb} {} failed; `linrdp service status` says more", unit::UNIT_NAME)
+        }
+        Some((false, said)) => anyhow::bail!("{said}"),
+        None => anyhow::bail!("systemd is not available here, so there is no unit to {verb}"),
+    }
+}
+
+/// `status` — systemd's view, then the part of it systemd cannot see.
+///
+/// The unit deliberately carries no parameters, so `systemctl cat linrdp` no
+/// longer answers "which ports, and how do they authenticate". That answer
+/// moved into the configuration file, and this is where the two halves are
+/// put back together.
+fn status(layout: &Layout) -> anyhow::Result<()> {
+    let ran = unit::systemctl_on_this_terminal(&["status", "--no-pager", unit::UNIT_NAME]);
+    if ran.is_none() {
+        println!("systemd is not available here; nothing is managing linrdp.");
+    }
+
+    let config_file = layout.config_file();
+    println!();
+    match crate::config::load_for_diagnostics(&config_file) {
+        (_, Some(problem)) => {
+            println!("Configuration {} is not usable:", config_file.display());
+            println!("  {problem}");
+            println!("  The service refuses to start on a file it cannot read, so this is");
+            println!("  the first thing to fix. `linrdp config` edits it.");
+        }
+        (config, None) => {
+            println!("Configuration {}", config_file.display());
+            for listener in &config.listeners {
+                println!("  {}  auth: {}", listener.bind, listener.auth);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a verb that would be handed to systemd when there is no unit for it
+/// to act on, naming the command that writes one.
+fn ensure_the_unit_is_installed(layout: &Layout) -> anyhow::Result<()> {
+    let path = unit::path_in(&layout.unit_dir, unit::UNIT_NAME);
+    anyhow::ensure!(
+        path.exists(),
+        "there is no {} — `sudo linrdp service install` writes it",
+        path.display()
+    );
+    Ok(())
+}
+
 fn install(layout: &Layout) -> anyhow::Result<()> {
-    require_root("install")?;
+    require_root("install", "writes to /etc and /var")?;
 
     println!("linrdp service install");
     println!();
@@ -208,7 +310,7 @@ fn install(layout: &Layout) -> anyhow::Result<()> {
 }
 
 fn uninstall(layout: &Layout) -> anyhow::Result<()> {
-    require_root("uninstall")?;
+    require_root("uninstall", "writes to /etc and /var")?;
 
     println!("linrdp service uninstall");
     println!();
@@ -239,10 +341,8 @@ fn uninstall(layout: &Layout) -> anyhow::Result<()> {
     println!();
     println!("Left alone, because they are yours and not ours:");
     println!("  {}", layout.config_file().display());
-    println!(
-        "  {} (the TLS identity and the captured passwords)",
-        layout.state.display()
-    );
+    println!("  {} (the self-signed TLS identity)", layout.cert.display());
+    println!("  {} (the captured passwords)", layout.state.display());
     println!("  {}", layout.log.display());
     Ok(())
 }
@@ -273,12 +373,12 @@ fn is_a_system_path(binary: &Path) -> bool {
 
 /// Writing to /etc and editing the PAM stack both need it, and failing at step
 /// six with half the work done is worse than not starting.
-fn require_root(verb: &str) -> anyhow::Result<()> {
+fn require_root(verb: &str, why: &str) -> anyhow::Result<()> {
     // SAFETY: geteuid takes no arguments, touches no memory and cannot fail.
     let euid = unsafe { libc::geteuid() };
     anyhow::ensure!(
         euid == 0,
-        "`linrdp service {verb}` writes to /etc and /var, so it has to run as root: \
+        "`linrdp service {verb}` {why}, so it has to run as root: \
          try `sudo linrdp service {verb}`"
     );
     Ok(())
@@ -411,6 +511,30 @@ mod tests {
         assert!(pam::looks_like_a_stack(PAM_SERVICE));
     }
 
+    /// Every verb the help lists is a verb `run` will take. A name that only
+    /// exists in the help text is a command that does not work, and the same
+    /// list writes both the dispatch and the refusal, so a new verb cannot be
+    /// added to one without the other.
+    #[test]
+    fn every_verb_there_is_parses_and_the_refusal_names_them_all() {
+        for verb in VERBS {
+            let parsed = parse(Some(verb)).unwrap_or_else(|_| panic!("`linrdp service {verb}` is not accepted"));
+            // English does not conjugate from the verb: `stop` + `ed` is
+            // `stoped`, and it went out in a release saying exactly that.
+            if let Verb::Control { done, .. } = parsed {
+                assert!(done.ends_with("ed") && !done.ends_with("oped"), "`{verb}` reports as `{done}`");
+            }
+        }
+        for message in [
+            format!("{:#}", parse(Some("frobnicate")).expect_err("refused")),
+            format!("{:#}", parse(None).expect_err("refused")),
+        ] {
+            for verb in VERBS {
+                assert!(message.contains(verb), "`{verb}` is not offered by: {message}");
+            }
+        }
+    }
+
     /// Half an install is worse than none, so it refuses before the first
     /// write rather than at the PAM step with the unit already replaced.
     #[test]
@@ -419,7 +543,7 @@ mod tests {
         if unsafe { libc::geteuid() } == 0 {
             return; // running as root; the refusal cannot be provoked
         }
-        let error = require_root("install").expect_err("refused");
+        let error = require_root("install", "writes to /etc and /var").expect_err("refused");
         assert!(
             format!("{error:#}").contains("sudo linrdp service install"),
             "got: {error:#}"

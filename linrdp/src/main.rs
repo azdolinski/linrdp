@@ -50,6 +50,9 @@ USAGE:
   linrdp doctor [<account>]    report what this machine, or one account, can do
   linrdp service install       install the systemd unit and the config file
   linrdp service uninstall     remove what `service install` put there
+  linrdp service start|stop    start or stop the service
+  linrdp service restart       restart it, picking up a changed configuration
+  linrdp service status        what systemd says, plus the listeners in effect
   linrdp config [--print]      browse and edit the configuration
 
 Serves a real Linux desktop over RDP.

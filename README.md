@@ -51,6 +51,21 @@ settings alone), installs `/etc/pam.d/linrdp`, creates `/etc/linrdp/cert`,
 uninstall` takes back exactly that and leaves the configuration, the TLS
 identity and the logs where they are.
 
+Day to day:
+
+| | |
+|---|---|
+| `sudo linrdp service start` | start it |
+| `sudo linrdp service stop` | stop it — running desktops survive, see `KillMode=process` |
+| `sudo linrdp service restart` | restart it, picking up a changed configuration |
+| `linrdp service status` | what systemd says, then the listeners in effect |
+
+`status` is worth the extra line over `systemctl status linrdp`: the unit
+carries no arguments, so systemd cannot tell you which ports are served or how
+they authenticate. That answer is in the configuration file, and `status`
+prints both halves — including the parse error, when there is one, which is the
+usual reason the service came up and stopped again.
+
 ## Configuration
 
 Everything is in `/etc/linrdp/config.yaml`. The unit takes no arguments and
