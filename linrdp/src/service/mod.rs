@@ -126,6 +126,19 @@ fn install(layout: &Layout) -> anyhow::Result<()> {
         println!("  config        {} (left as it is)", config_file.display());
     }
 
+    // A unit pointing into somebody's build directory works until the next
+    // `cargo clean`, and then the machine stops serving RDP for a reason that
+    // has nothing to do with linrdp. `current_exe` is right when the binary
+    // has been installed first, as the README says; say so when it has not.
+    if !is_a_system_path(&layout.binary) {
+        println!();
+        println!("  note          the unit will start {}", layout.binary.display());
+        println!("                which is not a system location. Install the binary first:");
+        println!("                  sudo install -m755 {} /usr/local/bin/linrdp", layout.binary.display());
+        println!("                  sudo /usr/local/bin/linrdp service install");
+        println!();
+    }
+
     // 4. Units that are about to stop applying, named with what they started.
     let new_exec = layout.binary.display().to_string();
     let displaced = unit::displaced(&layout.unit_dir, &new_exec);
@@ -241,6 +254,12 @@ fn ensure_config(path: &Path) -> anyhow::Result<bool> {
     crate::atomic::write(path, &crate::config::render(&fresh), 0o644)
         .with_context(|| format!("write {}", path.display()))?;
     Ok(true)
+}
+
+/// Whether this binary lives somewhere a service can rely on finding it.
+fn is_a_system_path(binary: &Path) -> bool {
+    const SYSTEM_DIRS: [&str; 5] = ["/usr/local/bin", "/usr/bin", "/usr/sbin", "/opt", "/bin"];
+    SYSTEM_DIRS.iter().any(|dir| binary.starts_with(dir))
 }
 
 /// Writing to /etc and editing the PAM stack both need it, and failing at step
@@ -361,6 +380,17 @@ mod tests {
             body.contains("# How a login is verified"),
             "the keys are described: {body}"
         );
+    }
+
+    /// A unit that starts a binary out of somebody's build directory works
+    /// until the next `cargo clean`, and then the machine stops serving RDP
+    /// for a reason that has nothing to do with linrdp.
+    #[test]
+    fn a_binary_outside_a_system_location_is_worth_a_word() {
+        assert!(is_a_system_path(Path::new("/usr/local/bin/linrdp")));
+        assert!(is_a_system_path(Path::new("/usr/bin/linrdp")));
+        assert!(!is_a_system_path(Path::new("/home/user/src/linrdp/target/debug/linrdp")));
+        assert!(!is_a_system_path(Path::new("/tmp/linrdp")));
     }
 
     /// The PAM service file is what gives a session its /run/user/<uid>, and
