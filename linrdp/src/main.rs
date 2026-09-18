@@ -588,6 +588,13 @@ async fn serve() -> anyhow::Result<()> {
     // (CredSSP's SAM lookup) and turned into a session in
     // `on_connection_info`, which only runs once CredSSP has succeeded.
     let multi_session = serve_fd.is_some() && !console_mode;
+    // The router is installed for every worker, console mode included. Console
+    // creates no per-user session and binds no display — but it still has to
+    // ask whether the account that just authenticated is allowed in, and it is
+    // the only place that can: nothing downstream of it opens a PAM session.
+    // Leaving it out is why console was the one route to a desktop with no
+    // policy check on it at all.
+    let route_connections = serve_fd.is_some();
     let pending_identity = Arc::new(session::router::PendingIdentity::default());
 
     // The validator feeds the session router in `system` mode: there is no
@@ -814,7 +821,7 @@ async fn serve() -> anyhow::Result<()> {
         .with_connection_handler(Some({
             let lifecycle: Box<dyn ironrdp_server::ConnectionHandler> =
                 Box::new(session_ctl::SessionController::new(lock_session, switch_to_greeter));
-            if multi_session {
+            if route_connections {
                 Box::new(session::router::SessionRouter::new(
                     lifecycle,
                     Arc::clone(&pending_identity),

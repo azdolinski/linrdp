@@ -37,6 +37,10 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 /// says it here.
 static CONSOLE: Mutex<Option<ConsoleScreen>> = Mutex::new(None);
 
+/// The account a console connection authenticated as. Console binds no
+/// session, so this is the only record of whose login it is.
+static CONSOLE_USER: Mutex<Option<String>> = Mutex::new(None);
+
 #[derive(Debug, Clone)]
 struct ConsoleScreen {
     display: String,
@@ -212,11 +216,24 @@ pub(crate) fn bind(
 /// The logon screen has no user, so file transfer there has nobody to act as
 /// and does not happen.
 pub(crate) fn session_user() -> Option<String> {
-    BOUND
+    if let Some(user) = BOUND
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .as_ref()
         .and_then(|bound| bound.user.clone())
+    {
+        return Some(user);
+    }
+    // Console mode binds nothing — it serves a screen somebody else's session
+    // owns — but the connection is still authenticated as an account, and that
+    // account is whose credentials file operations must use. Without this,
+    // console was the one mode where the clipboard had nobody to act as.
+    CONSOLE_USER.lock().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+/// Record whose login this console connection is, for [`session_user`].
+pub(crate) fn set_console_user(user: &str) {
+    *CONSOLE_USER.lock().unwrap_or_else(|p| p.into_inner()) = Some(user.to_owned());
 }
 
 /// This session's audio target, or `None` with the reason in the log.

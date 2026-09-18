@@ -42,6 +42,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 
+/// The largest frame either side will read.
+///
+/// A frame is a path or a nine-byte answer; anything larger is a protocol
+/// error, not a request to allocate.
+const MAX_FRAME: u32 = 64 * 1024;
+
 /// The descriptor the helper finds its socket on.
 ///
 /// 0, 1 and 2 are the standard streams and 3 is where the supervisor puts a
@@ -133,7 +139,18 @@ impl FileAgent {
 
         let mut pair = [0i32; 2];
         // SAFETY: a two-element array, which is what socketpair(2) fills in.
-        let paired = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, pair.as_mut_ptr()) };
+        // SOCK_CLOEXEC on both ends. Without it the helper inherits a copy of
+        // the *worker's* end, which would keep its own end from ever reporting
+        // EOF: a worker that died without running `Drop` would leave a helper
+        // waiting for a request that can never come.
+        let paired = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                0,
+                pair.as_mut_ptr(),
+            )
+        };
         anyhow::ensure!(
             paired == 0,
             "socketpair for the file helper: {}",
@@ -271,9 +288,6 @@ fn read_frame(source: &mut UnixStream) -> std::io::Result<(u8, Vec<u8>)> {
     let mut header = [0u8; 5];
     source.read_exact(&mut header)?;
     let len = u32::from_le_bytes(header[1..5].try_into().expect("four bytes"));
-    // A frame is a path or a nine-byte answer; anything larger is a protocol
-    // error, not a request to allocate.
-    const MAX_FRAME: u32 = 64 * 1024;
     if len > MAX_FRAME {
         return Err(std::io::Error::other(format!("frame of {len} bytes is beyond the limit")));
     }
@@ -289,18 +303,21 @@ fn read_reply(source: &mut UnixStream, expect_fd: bool) -> anyhow::Result<(u8, V
         let (status, body) = read_frame(source).context("read the helper's reply")?;
         return Ok((status, body, None));
     }
-    // The header carries the descriptor, so it has to be read with recvmsg
-    // rather than by `Read`: ancillary data belongs to a message, and a plain
-    // read would discard it.
-    let mut header = [0u8; 5];
-    let fd = recv_with_fd(source, &mut header)?;
-    let len = u32::from_le_bytes(header[1..5].try_into().expect("four bytes"));
-    anyhow::ensure!(len <= 64 * 1024, "reply of {len} bytes is beyond the limit");
+    // The descriptor rides on the FIRST byte of the message, so exactly one
+    // byte is taken with `recvmsg` — ancillary data belongs to a message, and
+    // a plain read would discard it. One byte also cannot come back short,
+    // which a five-byte `recvmsg` on a stream socket could.
+    let mut status = [0u8; 1];
+    let fd = recv_with_fd(source, &mut status)?;
+    let mut len_bytes = [0u8; 4];
+    source.read_exact(&mut len_bytes).context("read the helper's reply length")?;
+    let len = u32::from_le_bytes(len_bytes);
+    anyhow::ensure!(len <= MAX_FRAME, "reply of {len} bytes is beyond the limit");
     let mut body = vec![0u8; len as usize];
     if len > 0 {
         source.read_exact(&mut body).context("read the helper's reply body")?;
     }
-    Ok((header[0], body, fd))
+    Ok((status[0], body, fd))
 }
 
 /// `sendmsg` with `buf` as the payload and `fd`, if given, as `SCM_RIGHTS`.
@@ -437,10 +454,11 @@ enum Answer {
 }
 
 fn reply_ok(socket: &mut UnixStream, body: &[u8], fd: Option<RawFd>) -> anyhow::Result<()> {
-    let mut header = [0u8; 5];
-    header[0] = 0;
-    header[1..5].copy_from_slice(&u32::try_from(body.len()).unwrap_or(0).to_le_bytes());
-    send_with_fd(socket, &header, fd).context("send the reply header")?;
+    // The status byte alone carries the descriptor (see `read_reply`); the
+    // length and the body follow as ordinary stream bytes.
+    send_with_fd(socket, &[0u8], fd).context("send the reply status")?;
+    let len = u32::try_from(body.len()).unwrap_or(0);
+    socket.write_all(&len.to_le_bytes()).context("send the reply length")?;
     if !body.is_empty() {
         socket.write_all(body).context("send the reply body")?;
     }

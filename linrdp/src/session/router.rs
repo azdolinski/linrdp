@@ -290,6 +290,10 @@ impl ironrdp_server::ConnectionHandler for SessionRouter {
                         tracing::error!(error = format!("{error:#}"), "console mode: refusing this login");
                         std::process::exit(1);
                     }
+                    // Whose credentials the clipboard's file helper uses. The
+                    // shared screen belongs to whoever started it; the login
+                    // does not, and file operations follow the login.
+                    crate::session::gate::set_console_user(&user);
                     tracing::info!(
                         user,
                         display = %std::env::var("DISPLAY").unwrap_or_default(),
