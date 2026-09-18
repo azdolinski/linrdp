@@ -89,38 +89,122 @@ pub(crate) fn cookie_for(path: &Path, display: u16) -> anyhow::Result<(Vec<u8>, 
 }
 
 /// Generate a fresh cookie and write it where only `owner` can read it.
+///
+/// The write happens in a forked child that has become `owner` first, never
+/// as root.
+///
+/// Root doing it was a local privilege escalation. `$XDG_RUNTIME_DIR` belongs
+/// to the user, so the user can put anything they like at
+/// `linrdp/Xauthority` — including a symlink to a root-owned file. The old
+/// code opened it with `truncate(true)`, which follows the link, and then
+/// `chown`ed the result, which follows it again: starting a session
+/// overwrote the target and handed its ownership to the user. Replacing the
+/// *directory* with a symlink did the same for a check that only looked at
+/// the file.
+///
+/// With the child running as the user, the kernel's own permission checks are
+/// the guard, and there is no chown to hijack: whatever the path resolves to,
+/// the user could already have written it themselves. `O_NOFOLLOW` and
+/// `O_EXCL` on the final open stay, so a stale link is reported rather than
+/// followed even within the user's own files.
 pub(crate) fn write_cookie(runtime_dir: &str, display: u16, owner: &UserIds) -> anyhow::Result<PathBuf> {
     let path = cookie_path(runtime_dir);
-    let dir = path.parent().context("cookie path has no parent")?;
-    fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("chmod 0700 {}", dir.display()))?;
+    let entry = xauthority_entry(display, &random_cookie()?);
 
-    let cookie = random_cookie()?;
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(&path)
-        .with_context(|| format!("open {}", path.display()))?;
-    file.write_all(&xauthority_entry(display, &cookie))
-        .with_context(|| format!("write {}", path.display()))?;
-    drop(file);
+    // A pipe carries the child's failure back: the child cannot return an
+    // error, and a session that starts with no cookie is a desktop nobody
+    // can connect to, reported as "Authorization required" much later.
+    let mut pipe = [0i32; 2];
+    // SAFETY: a two-element array, which is what pipe(2) writes into.
+    anyhow::ensure!(
+        unsafe { libc::pipe(pipe.as_mut_ptr()) } == 0,
+        "pipe for the cookie writer: {}",
+        std::io::Error::last_os_error()
+    );
+    let (read_fd, write_fd) = (pipe[0], pipe[1]);
 
-    // The keeper writes this as root before dropping privileges, so hand
-    // ownership to the session user explicitly.
-    chown_to(&path, owner)?;
-    chown_to(dir, owner)?;
+    // SAFETY: the keeper is single-threaded here — it has not started the X
+    // server or any runtime — so the child inherits a consistent state.
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        // SAFETY: the child does nothing but write the file and _exit.
+        unsafe {
+            libc::close(read_fd);
+            let message = write_as_user(&path, &entry, owner).err().map(|e| format!("{e:#}"));
+            if let Some(message) = message {
+                let bytes = message.as_bytes();
+                libc::write(write_fd, bytes.as_ptr().cast(), bytes.len());
+                libc::close(write_fd);
+                libc::_exit(1);
+            }
+            libc::close(write_fd);
+            // _exit, not exit: this copy shares the keeper's atexit handlers
+            // and buffers.
+            libc::_exit(0);
+        }
+    }
+    // SAFETY: closing descriptors this function created.
+    unsafe { libc::close(write_fd) };
+    if child < 0 {
+        // SAFETY: as above.
+        unsafe { libc::close(read_fd) };
+        anyhow::bail!("fork the cookie writer: {}", std::io::Error::last_os_error());
+    }
+
+    let mut reason = String::new();
+    // SAFETY: a descriptor this function owns, handed to File to be closed.
+    let mut reader = unsafe { <fs::File as std::os::fd::FromRawFd>::from_raw_fd(read_fd) };
+    let _ = reader.read_to_string(&mut reason);
+    drop(reader);
+
+    let mut status = 0;
+    // SAFETY: waiting on the child forked above.
+    unsafe { libc::waitpid(child, &mut status, 0) };
+    let ok = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+    anyhow::ensure!(
+        ok,
+        "writing {} as {} failed: {}",
+        path.display(),
+        owner.name,
+        if reason.is_empty() { "the writer exited without a reason".to_owned() } else { reason }
+    );
     Ok(path)
 }
 
-fn chown_to(path: &Path, owner: &UserIds) -> anyhow::Result<()> {
-    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).context("path NUL")?;
-    // SAFETY: valid NUL-terminated path and ids from getpwnam.
-    if unsafe { libc::chown(c_path.as_ptr(), owner.uid, owner.gid) } != 0 {
-        anyhow::bail!("chown {} failed: {}", path.display(), std::io::Error::last_os_error());
+/// The child half of [`write_cookie`]: become `owner`, then write the file.
+///
+/// Runs after `fork` in a process that does nothing else, so the irreversible
+/// `setuid` costs nothing and the keeper keeps its own privileges.
+fn write_as_user(path: &Path, entry: &[u8], owner: &UserIds) -> anyhow::Result<()> {
+    super::privilege::drop_to(owner).context("become the session user")?;
+
+    let dir = path.parent().context("cookie path has no parent")?;
+    match fs::create_dir(dir) {
+        Ok(()) => {}
+        // Already there: the user's own directory from an earlier session.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(anyhow::Error::from(e).context(format!("create {}", dir.display()))),
     }
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod 0700 {}", dir.display()))?;
+
+    // Replace rather than truncate, and refuse to follow a link on the way
+    // in: O_EXCL after an unlink means the file this process writes is the
+    // file this process created.
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow::Error::from(e).context(format!("remove {}", path.display()))),
+    }
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("create {}", path.display()))?;
+    file.write_all(entry)
+        .with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
@@ -193,6 +277,63 @@ mod tests {
             std::path::Path::new("/run/user/1000/linrdp/Xauthority"),
             "the cookie belongs in the user's own 0700 tmpfs, never /tmp or $HOME"
         );
+    }
+
+    /// A symlink at the cookie path must never be followed.
+    ///
+    /// Regression, and a local privilege escalation: `$XDG_RUNTIME_DIR`
+    /// belongs to the user, so the user could leave a symlink at
+    /// `linrdp/Xauthority` pointing at a root-owned file. Writing it as root
+    /// with `truncate(true)` followed the link and destroyed the target, and
+    /// the `chown` that came next handed the target to the user. Starting a
+    /// session was all it took.
+    #[test]
+    fn a_symlink_at_the_cookie_path_is_not_followed() {
+        let dir = std::env::temp_dir().join(format!("linrdp-xauth-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let runtime = dir.join("runtime");
+        fs::create_dir_all(runtime.join("linrdp")).expect("runtime dir");
+
+        let target = dir.join("precious");
+        fs::write(&target, b"must survive").expect("target");
+        std::os::unix::fs::symlink(&target, cookie_path(runtime.to_str().expect("utf8")))
+            .expect("plant the link");
+
+        // SAFETY: getuid is always safe.
+        let me = unsafe { libc::getuid() };
+        let account = if me == 0 { "root".to_owned() } else { whoami() };
+        let name = super::super::privilege::lookup_user(&account).expect("lookup");
+        let result = write_cookie(runtime.to_str().expect("utf8"), 11, &name);
+
+        assert_eq!(
+            fs::read(&target).expect("target still there"),
+            b"must survive",
+            "the file the link pointed at must be untouched"
+        );
+        if result.is_ok() {
+            let written = cookie_path(runtime.to_str().expect("utf8"));
+            let meta = fs::symlink_metadata(&written).expect("cookie file");
+            assert!(
+                !meta.file_type().is_symlink(),
+                "the cookie must be a real file the writer created, not a link it followed"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The account this test process is running as, for the symlink test —
+    /// which needs a user it can actually become (itself).
+    #[cfg(test)]
+    fn whoami() -> String {
+        // SAFETY: getpwuid returns a pointer into a static buffer, read
+        // immediately; getuid is always safe.
+        unsafe {
+            let pw = libc::getpwuid(libc::getuid());
+            if pw.is_null() {
+                return "root".to_owned();
+            }
+            std::ffi::CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned()
+        }
     }
 
     /// Two sessions must never share a secret.

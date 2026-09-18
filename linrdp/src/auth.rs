@@ -1,6 +1,19 @@
-//! System authentication: verify a username/password pair against
-//! `/etc/shadow` (SHA-512 / YESCRYPT / MD5 crypt), the same source SSH PAM
-//! uses. Pure Rust — reads the shadow database directly; no external binaries.
+//! The one place a login decision is made.
+//!
+//! Every route to a desktop — NLA, the Client Info PDU, the server-drawn
+//! logon screen, a reconnect to a session that is already running, console
+//! mode — ends up in [`decide`]. That is the point: a correct secret is only
+//! half of a login, and the other half (is this account still allowed to log
+//! in *right now*?) used to be asked on some paths and not others.
+//!
+//! PAM first, `/etc/shadow` only when PAM is unavailable. The order is the
+//! fix: verifying the hash ourselves and stopping there skipped `pam_acct_mgmt`
+//! entirely, so an expired, disabled or `pam_access`-refused account kept
+//! working as long as its old password still hashed correctly — and failed
+//! attempts never reached `pam_faillock`, which counts them. The pure-Rust
+//! `/etc/shadow` verifier (SHA-256 / SHA-512 / YESCRYPT / MD5 crypt) remains
+//! for hosts with no libpam, and it now checks shadow's own expiry fields
+//! rather than the hash alone.
 
 use std::collections::HashMap;
 
@@ -125,24 +138,18 @@ impl CredentialValidator for ShadowValidator {
         credentials: &Credentials,
     ) -> Result<CredentialDecision, CredentialValidationError> {
         let username = credentials.username.clone();
-        let username2 = username.clone();
-        let password = credentials.password.clone();
+        let (user, pass) = (username.clone(), credentials.password.clone());
 
-        // Read + verify off the async path (file I/O + cost of the KDF).
-        // The Ok(...) payload says whether PAM should be consulted as a
-        // fallback: the shadow file is authoritative when it answers
-        // definitively, but an unreadable file, an unknown user (SSSD/LDAP
-        // accounts live outside /etc/shadow) or an unsupported hash scheme
-        // is exactly the case the system PAM stack handles for us.
-        let result = tokio::task::spawn_blocking(move || shadow_verdict(&username2, &password))
-        .await
-        .map_err(CredentialValidationError::new)?; // join error only
+        // Off the async path: PAM is blocking, and so is the cost of a KDF.
+        let outcome = tokio::task::spawn_blocking(move || decide(&user, &pass))
+            .await
+            .map_err(CredentialValidationError::new)?; // join error only
 
         // Greeter mode: never reject here. Record only what verified, so the
         // router can skip the form for a client that already sent something
         // correct, and show it to everyone else.
         if self.defer_to_greeter {
-            if matches!(result, Ok(true)) {
+            if matches!(outcome, Login::Accept) {
                 tracing::info!(%username, "credentials sent and verified — skipping the logon screen");
                 self.accepted(&username, &credentials.password);
             } else {
@@ -151,18 +158,13 @@ impl CredentialValidator for ShadowValidator {
             return Ok(CredentialDecision::Accept);
         }
 
-        match result {
-            Ok(true) => {
+        match outcome {
+            Login::Accept => {
                 tracing::info!(%username, "authentication accepted");
                 self.accepted(&username, &credentials.password);
                 Ok(CredentialDecision::Accept)
             }
-            Ok(false) => {
-                tracing::warn!(%username, "authentication rejected");
-                Ok(CredentialDecision::Reject)
-            }
-
-            Err(reason) if username.is_empty() => {
+            Login::Deny(reason) if username.is_empty() => {
                 // No username at all: the client connected without sending
                 // credentials. That is what mstsc does on a non-NLA server —
                 // it waits for a logon screen linrdp does not draw. Say so,
@@ -177,28 +179,157 @@ impl CredentialValidator for ShadowValidator {
                 );
                 Ok(CredentialDecision::Reject)
             }
-            Err(reason) => {
-                // Shadow could not answer — fall back to the system PAM
-                // stack (KRdp's primary path, our safety net). A PAM outage
-                // is a backend error, not a rejection.
-                let reason = reason.as_deref().unwrap_or("user not in /etc/shadow");
-                tracing::info!(%username, %reason, "shadow lookup inconclusive - trying PAM");
-                let (user, pass) = (username.clone(), credentials.password.clone());
-                let pam = tokio::task::spawn_blocking(move || crate::pam::authenticate(&user, &pass))
-                    .await
-                    .map_err(CredentialValidationError::new)? // join error
-                    .map_err(|e| CredentialValidationError::new(std::io::Error::other(e)))?;
-                if pam {
-                    tracing::info!(%username, "authentication accepted via PAM");
-                    self.accepted(&username, &credentials.password);
-                    Ok(CredentialDecision::Accept)
-                } else {
-                    tracing::warn!(%username, "authentication rejected (shadow+PAM)");
-                    Ok(CredentialDecision::Reject)
-                }
+            Login::Deny(reason) => {
+                tracing::warn!(%username, %reason, "authentication rejected");
+                Ok(CredentialDecision::Reject)
+            }
+            // Nothing could decide. Refusing is the only safe answer: the
+            // alternative is letting a broken PAM stack plus an unreadable
+            // /etc/shadow add up to an open door.
+            Login::Unavailable(reason) => {
+                tracing::error!(%username, %reason, "no authentication backend could decide — refusing");
+                Ok(CredentialDecision::Reject)
             }
         }
     }
+}
+
+/// What the login-policy point decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Login {
+    /// The secret is right and the account is allowed to log in now.
+    Accept,
+    /// Refused, with the reason for the log — never for the client, which is
+    /// told only that the login failed.
+    Deny(String),
+    /// Neither PAM nor `/etc/shadow` could answer. Not a verdict: callers
+    /// must refuse, not guess.
+    Unavailable(String),
+}
+
+/// The single login-policy point: is this secret right, **and** is this
+/// account allowed to log in at this moment?
+///
+/// PAM answers both halves in one pass (`pam_authenticate` then
+/// `pam_acct_mgmt`) and is therefore asked first, so failed attempts land in
+/// whatever counts them and account state is honoured. `/etc/shadow` is the
+/// fallback for a host with no libpam, and it checks shadow's own ageing and
+/// expiry fields — not just the hash.
+pub(crate) fn decide(username: &str, password: &str) -> Login {
+    if username.is_empty() {
+        return Login::Deny("no user name".to_owned());
+    }
+
+    match crate::pam::authenticate(username, password) {
+        Ok(true) => return Login::Accept,
+        Ok(false) => return Login::Deny(format!("PAM ({}) refused", crate::pam::login_service())),
+        Err(reason) => {
+            tracing::warn!(
+                %username,
+                %reason,
+                "PAM is unavailable — falling back to /etc/shadow, which cannot apply \
+                 pam_access, pam_time or pam_faillock"
+            );
+        }
+    }
+
+    match shadow_verdict(username, password) {
+        Ok(false) => Login::Deny("/etc/shadow: wrong password".to_owned()),
+        Ok(true) => match shadow_account_policy(username) {
+            Ok(()) => Login::Accept,
+            Err(reason) => Login::Deny(format!("/etc/shadow: {reason}")),
+        },
+        Err(reason) => Login::Unavailable(
+            reason.unwrap_or_else(|| format!("{username} is not in /etc/shadow and PAM is unavailable")),
+        ),
+    }
+}
+
+/// Re-check an account that already authenticated at the protocol level.
+///
+/// NLA verifies the client's password against the copy in linrdp's own SAM,
+/// which is a *stored* secret: it says nothing about whether the system
+/// account has since been locked, expired, or had its password changed. The
+/// same applies to attaching to a session that is already running, where no
+/// new PAM session is opened and nothing else would ask. So every path to a
+/// desktop asks here, with the credentials the client actually presented.
+pub(crate) fn authorize_for_desktop(username: &str, password: &str) -> anyhow::Result<()> {
+    match decide(username, password) {
+        Login::Accept => Ok(()),
+        Login::Deny(reason) => {
+            anyhow::bail!("{username} is not allowed to log in: {reason}")
+        }
+        Login::Unavailable(reason) => {
+            anyhow::bail!("cannot check whether {username} may log in ({reason}) — refusing")
+        }
+    }
+}
+
+/// Days since the epoch, the unit `/etc/shadow` ages accounts in.
+fn today_in_shadow_days() -> Option<i64> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    i64::try_from(secs / 86_400).ok()
+}
+
+/// Whether `/etc/shadow`'s ageing fields still allow this account to log in.
+///
+/// Only consulted when PAM is unavailable, so this is a stand-in for
+/// `pam_unix`'s `account` phase rather than a second opinion on it.
+fn shadow_account_policy(username: &str) -> Result<(), String> {
+    let Ok(content) = std::fs::read_to_string("/etc/shadow") else {
+        return Err("unreadable".to_owned());
+    };
+    let Some(today) = today_in_shadow_days() else {
+        return Err("the system clock is before the epoch".to_owned());
+    };
+    account_policy_in(&content, username, today)
+}
+
+/// The rule itself, separated from the file so every shape of entry can be
+/// tested on a machine that has none of them.
+fn account_policy_in(shadow: &str, username: &str, today: i64) -> Result<(), String> {
+    for line in shadow.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.first() != Some(&username) {
+            continue;
+        }
+        let num = |index: usize| -> Option<i64> { fields.get(index)?.trim().parse().ok() };
+        let last_change = num(2);
+        let max_age = num(4);
+        let inactive = num(6);
+        let expire = num(7);
+
+        if let Some(expire) = expire.filter(|v| *v >= 0) && today >= expire {
+            return Err("the account expired".to_owned());
+        }
+        if last_change == Some(0) {
+            return Err("the password must be changed before the next login".to_owned());
+        }
+        if let (Some(last), Some(max)) = (last_change, max_age)
+            && last > 0
+            && max >= 0
+        {
+            let must_change_by = last + max;
+            if today > must_change_by {
+                // Past `max` the password is expired; `inactive` is the grace
+                // period pam_unix allows for changing it, and there is no way
+                // to change a password over RDP.
+                let grace = inactive.filter(|v| *v >= 0).unwrap_or(0);
+                if today > must_change_by + grace {
+                    return Err("the password expired".to_owned());
+                }
+                return Err("the password expired and can only be changed outside RDP".to_owned());
+            }
+        }
+        return Ok(());
+    }
+    // Not in /etc/shadow at all: an NSS-only account (LDAP, SSSD) whose
+    // policy lives where PAM would have read it. Without PAM there is nothing
+    // to check and nothing to claim.
+    Err("the account is not in /etc/shadow, so its policy cannot be checked without PAM".to_owned())
 }
 
 impl ShadowValidator {
@@ -210,25 +341,36 @@ impl ShadowValidator {
     }
 }
 
-/// Verify `password` against the account's system password, blocking.
+/// Verify `password` against the account's system password **and** its
+/// current policy, blocking. `Err` means "no verdict", never "wrong
+/// password".
 ///
-/// `/etc/shadow` first, then the system PAM stack for everything shadow
-/// cannot answer for: an unreadable file, an account that lives in LDAP or
-/// SSSD, or a hash scheme this build does not implement. `Err` means "no
-/// verdict", never "wrong password".
-///
-/// The same core the RDP credential validator runs on, exposed so
-/// provisioning can hold an NLA password to the system password it is
-/// supposed to mirror.
+/// The same [`decide`] the RDP credential validator runs on, exposed so the
+/// logon screen and provisioning hold an NLA password to exactly the system
+/// password — and the system policy — it is supposed to mirror.
 pub(crate) fn verify_system_password(username: &str, password: &str) -> Result<bool, String> {
-    match shadow_verdict(username, password) {
-        Ok(verdict) => Ok(verdict),
-        Err(reason) => {
-            let reason = reason.unwrap_or_else(|| "user not in /etc/shadow".to_owned());
-            tracing::debug!(%username, %reason, "shadow lookup inconclusive - trying PAM");
-            crate::pam::authenticate(username, password).map_err(|e| format!("PAM: {e}"))
+    match decide(username, password) {
+        Login::Accept => Ok(true),
+        Login::Deny(reason) => {
+            tracing::debug!(%username, %reason, "login refused");
+            Ok(false)
         }
+        Login::Unavailable(reason) => Err(reason),
     }
+}
+
+/// Whether `password` is the one `/etc/shadow` holds for `username` — the
+/// hash comparison alone, with no policy attached.
+///
+/// This is deliberately NOT a login decision, and callers must not use it as
+/// one. It exists for credential capture, which runs *inside* a PAM `auth`
+/// stack via `pam_exec`: asking [`decide`] there would re-enter PAM for the
+/// account PAM is in the middle of authenticating, double-counting the
+/// attempt in `pam_faillock`. All capture needs to know is whether the token
+/// it was handed is the account's real password, which is exactly this.
+pub(crate) fn password_matches_shadow(username: &str, password: &str) -> Result<bool, String> {
+    shadow_verdict(username, password)
+        .map_err(|reason| reason.unwrap_or_else(|| format!("{username} is not in /etc/shadow")))
 }
 
 /// `/etc/shadow`'s verdict alone. `Err(reason)` = shadow cannot decide.
@@ -264,16 +406,14 @@ fn verify_crypt(password: &str, hash: &str) -> bool {
     let scheme = hash.trim_start_matches('$').split('$').next().unwrap_or_default();
 
     let verdict = match scheme {
-        "1" | "5" | "6" => {
-            // sha-crypt's check handles $5$/$6$ (and the legacy $1$ mapping onto
-            // the same SHA-crypt verifier is intentionally not used; MD5 falls
-            // back to the plain check below).
-            if scheme == "1" {
-                verify_md5(password, hash)
-            } else {
-                sha_crypt::sha512_check(password, hash).is_ok()
-            }
-        }
+        "1" => verify_md5(password, hash),
+        // `$5$` and `$6$` are different algorithms, not one with two labels:
+        // SHA-256-crypt and SHA-512-crypt. Verifying a `$5$` entry with
+        // `sha512_check` never matches, so every correct password on a
+        // SHA-256-crypt host was rejected — and because that is a definitive
+        // `Ok(false)`, PAM was never consulted to catch it.
+        "5" => sha_crypt::sha256_check(password, hash).is_ok(),
+        "6" => sha_crypt::sha512_check(password, hash).is_ok(),
         "y" => use_yescrypt(password, hash),
         other => {
             tracing::warn!(scheme = other, "unsupported shadow hash scheme");
@@ -386,4 +526,107 @@ fn verify_md5(password: &str, hash: &str) -> bool {
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `$5$` is SHA-256-crypt and `$6$` is SHA-512-crypt — two algorithms,
+    /// not one with two labels.
+    ///
+    /// Regression: both were verified with `sha512_check`, so every correct
+    /// password on a SHA-256-crypt host was rejected. And because a shadow
+    /// mismatch is a *definitive* "wrong password", nothing downstream ever
+    /// got the chance to notice: the account simply could not log in.
+    #[test]
+    fn each_shadow_hash_scheme_is_verified_with_its_own_algorithm() {
+        // Published SHA-crypt test vectors (Drepper's specification).
+        let sha256 = "$5$saltstring$5B8vYYiY.CVt1RlTTf8KbXBH3hsxY/GNooZaBBGWEc5";
+        let sha512 = "$6$saltstring$svn8UoSVapNtMuq1ukKS4tPQd8iKwSMHWjl/O817G3uBnIFNjnQJu\
+                      esI68u4OTLiBFdcbYEdFCoEOfaS35inz1";
+
+        assert!(verify_crypt("Hello world!", sha256), "$5$ must verify with SHA-256-crypt");
+        assert!(!verify_crypt("wrong", sha256), "a wrong password must not verify");
+
+        assert!(verify_crypt("Hello world!", sha512), "$6$ must verify with SHA-512-crypt");
+        assert!(!verify_crypt("wrong", sha512), "a wrong password must not verify");
+
+        // And neither scheme may be checked with the other's verifier, which
+        // is what made the two indistinguishable before.
+        assert!(
+            !sha_crypt::sha512_check("Hello world!", sha256).is_ok(),
+            "the bug: SHA-512-crypt cannot verify a SHA-256-crypt hash"
+        );
+    }
+
+    /// A correct password is only half of a login. `/etc/shadow`'s ageing
+    /// fields are the other half on the PAM-less fallback path, and they used
+    /// to be ignored entirely.
+    #[test]
+    fn shadow_ageing_fields_can_refuse_an_account_with_the_right_password() {
+        // Fields: name:hash:lastchg:min:max:warn:inactive:expire:flag
+        let today = 20_000i64;
+        let shadow = "\
+alice:$6$x$y:19000:0:99999:7:::
+expired:$6$x$y:19000:0:99999:7::19500:
+mustchange:$6$x$y:0:0:99999:7:::
+aged:$6$x$y:19000:0:30:7::: 
+future:$6$x$y:19000:0:99999:7::20500:
+";
+        assert_eq!(account_policy_in(shadow, "alice", today), Ok(()), "an ordinary account logs in");
+        assert!(
+            account_policy_in(shadow, "expired", today).is_err(),
+            "an expired account must be refused however right its password is"
+        );
+        assert!(
+            account_policy_in(shadow, "mustchange", today).is_err(),
+            "lastchg=0 means the password must be changed, which RDP cannot do"
+        );
+        assert!(
+            account_policy_in(shadow, "aged", today).is_err(),
+            "a password past its maximum age must be refused"
+        );
+        assert_eq!(
+            account_policy_in(shadow, "future", today),
+            Ok(()),
+            "an expiry date still ahead is not an expiry"
+        );
+    }
+
+    /// An account nothing knows about must not be waved through.
+    #[test]
+    fn an_account_outside_shadow_is_not_approved_without_pam() {
+        assert!(
+            account_policy_in("alice:$6$x$y:19000:0:99999:7:::\n", "bob", 20_000).is_err(),
+            "no record and no PAM means no basis to allow the login"
+        );
+    }
+
+    /// Nothing may be accepted on a "cannot tell".
+    #[test]
+    fn an_undecidable_login_is_refused_rather_than_guessed() {
+        let unavailable = Login::Unavailable("no backend".to_owned());
+        assert!(
+            authorize_for_desktop_from(unavailable).is_err(),
+            "a backend outage must close the door, not open it"
+        );
+        assert!(authorize_for_desktop_from(Login::Deny("locked".to_owned())).is_err());
+        assert!(authorize_for_desktop_from(Login::Accept).is_ok());
+    }
+
+    /// The decision-to-verdict mapping, without a PAM stack to drive.
+    fn authorize_for_desktop_from(outcome: Login) -> anyhow::Result<()> {
+        match outcome {
+            Login::Accept => Ok(()),
+            Login::Deny(reason) => anyhow::bail!("not allowed to log in: {reason}"),
+            Login::Unavailable(reason) => anyhow::bail!("cannot check ({reason}) — refusing"),
+        }
+    }
+
+    /// An empty user name is a refusal, never a lookup.
+    #[test]
+    fn a_login_without_a_user_name_is_refused_before_any_backend() {
+        assert!(matches!(decide("", "whatever"), Login::Deny(_)));
+    }
 }

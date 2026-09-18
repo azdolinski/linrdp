@@ -407,6 +407,7 @@ mod tests {
             runtime_dir: "/run/user/1001".to_owned(),
             xauthority: "/run/user/1001/linrdp/Xauthority".to_owned(),
             locked: false,
+            logind_id: Some("7".to_owned()),
         };
         let user = UserIds { uid: 1001, gid: 1001, name: "alice".to_owned(), home: "/home/alice".to_owned() };
 

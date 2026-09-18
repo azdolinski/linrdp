@@ -197,6 +197,62 @@ unsafe fn libc_calloc(count: usize) -> *mut PamResponse {
     block as *mut PamResponse
 }
 
+/// Which PAM service a login decision is made against.
+///
+/// `/etc/pam.d/linrdp` is the stack `linrdp service install` writes, and the
+/// one every session already opens — so authentication and the session that
+/// follows go through the same rules, the same `pam_faillock` counters and
+/// the same `account` modules. `login` is only for a host where that file was
+/// never installed; picking it by looking at the file, rather than by reading
+/// a failure code, keeps "the stack said no" distinguishable from "there was
+/// no stack".
+pub(crate) fn login_service() -> &'static str {
+    if std::path::Path::new("/etc/pam.d").join(PAM_SERVICE_LINRDP).is_file() {
+        PAM_SERVICE_LINRDP
+    } else {
+        PAM_SERVICE_LOGIN
+    }
+}
+
+/// Whether the account is currently allowed to log in at all — `pam_acct_mgmt`
+/// with no password involved.
+///
+/// This is the half of the decision a correct password says nothing about:
+/// an expired account, a disabled one, or one an access rule (`pam_access`,
+/// `pam_time`, `pam_nologin`) refuses. `Err` means PAM itself is unavailable,
+/// never "denied".
+pub(crate) fn account_valid(username: &str) -> Result<bool, String> {
+    let user = CString::new(username).map_err(|_| "username contains NUL".to_owned())?;
+
+    let api = match PAM.get_or_init(load_pam) {
+        Ok(api) => api,
+        Err(reason) => return Err((*reason).to_owned()),
+    };
+
+    // SAFETY: the handle is created, used and ended within this call; the
+    // conversation callback is never reached, because pam_acct_mgmt asks for
+    // no credentials — but it is given valid data anyway.
+    unsafe {
+        let service = CString::new(login_service()).expect("static, no NUL");
+        let data = ConvData {
+            user,
+            password: CString::new("").expect("empty, no NUL"),
+        };
+        let conv_struct = PamConv {
+            conv,
+            appdata_ptr: (&raw const data).cast::<c_void>().cast_mut(),
+        };
+        let mut handle: *mut c_void = std::ptr::null_mut();
+        let status = (api.pam_start)(service.as_ptr(), data.user.as_ptr(), &conv_struct, &mut handle);
+        if status != PAM_SUCCESS {
+            return Err(format!("pam_start: {status}"));
+        }
+        let acct = (api.pam_acct_mgmt)(handle, 0);
+        (api.pam_end)(handle, acct);
+        Ok(acct == PAM_SUCCESS)
+    }
+}
+
 /// Verify a username/password pair through the system PAM stack.
 ///
 /// Returns `Ok(true/false)` = authenticated/not, `Err(reason)` = PAM itself
@@ -216,7 +272,7 @@ pub(crate) fn authenticate(username: &str, password: &str) -> Result<bool, Strin
     // SAFETY: the handle is created, used and destroyed within this call;
     // the conversation callback only touches the ConvData alive here.
     unsafe {
-        let service = CString::new(PAM_SERVICE_LOGIN).expect("static, no NUL");
+        let service = CString::new(login_service()).expect("static, no NUL");
         let data = ConvData { user, password: pass };
         let conv = PamConv {
             conv,

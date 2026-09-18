@@ -24,6 +24,16 @@ pub(crate) struct SessionRecord {
     /// a restart must never leave a desktop unlocked, because the process
     /// that could have locked it is exactly the one that went away.
     pub(crate) locked: bool,
+    /// The logind session id (`XDG_SESSION_ID`) PAM gave the keeper, when it
+    /// gave one.
+    ///
+    /// Recorded because `loginctl lock-session` with no argument locks the
+    /// *calling* process's session, and a worker has none — so the signal
+    /// went nowhere and the desktop it was meant for was never told. The
+    /// keeper is the only process that ever sees this value, and only for as
+    /// long as its PAM session is open, so the record is where it has to
+    /// live.
+    pub(crate) logind_id: Option<String>,
 }
 
 pub(crate) fn record_path(base: &Path, display: u16) -> PathBuf {
@@ -32,10 +42,13 @@ pub(crate) fn record_path(base: &Path, display: u16) -> PathBuf {
 
 pub(crate) fn write_record(base: &Path, rec: &SessionRecord) -> anyhow::Result<()> {
     let path = record_path(base, rec.display);
-    let body = format!(
+    let mut body = format!(
         "user={}\ndisplay={}\nruntime_dir={}\nxauthority={}\nlocked={}\n",
         rec.user, rec.display, rec.runtime_dir, rec.xauthority, rec.locked
     );
+    if let Some(id) = &rec.logind_id {
+        body.push_str(&format!("logind_id={id}\n"));
+    }
     fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod {}", path.display()))?;
@@ -56,6 +69,7 @@ fn read_record(base: &Path, display: u16) -> Option<SessionRecord> {
         // A record without the field predates it; treat it as locked, because
         // assuming unlocked is the unsafe direction.
         locked: field("locked").is_none_or(|v| v == "true"),
+        logind_id: field("logind_id").filter(|id| !id.is_empty()),
     })
 }
 
@@ -130,6 +144,7 @@ mod tests {
             runtime_dir: format!("/run/user/{}", 1000 + u32::from(display)),
             xauthority: format!("/run/user/{}/linrdp/Xauthority", 1000 + u32::from(display)),
             locked: false,
+            logind_id: Some(format!("{display}")),
         }
     }
 
@@ -216,6 +231,10 @@ mod tests {
         assert_eq!(found.display, rec.display);
         assert_eq!(found.runtime_dir, rec.runtime_dir);
         assert_eq!(found.xauthority, rec.xauthority);
+        assert_eq!(
+            found.logind_id, rec.logind_id,
+            "without the logind id there is no session to point `loginctl lock-session` at"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }

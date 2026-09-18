@@ -307,6 +307,47 @@ pub(crate) fn run_form(
     }
 }
 
+/// Rate limit for logon-screen attempts.
+///
+/// The form reads key events as fast as the client can send them, so without
+/// this a client could walk a password list through it at network speed. PAM
+/// counts failures when it is the backend, but the `/etc/shadow` fallback
+/// counts nothing at all, and neither one slows down the *first* few guesses.
+///
+/// A flat delay before every attempt plus a growing one after each failure:
+/// the first login costs a fraction of a second, the twentieth guess costs
+/// seconds. Successful logins reset it, so a user who mistypes once is not
+/// punished for the rest of the session.
+#[derive(Debug, Default)]
+pub(crate) struct AttemptThrottle {
+    failures: std::cell::Cell<u32>,
+}
+
+impl AttemptThrottle {
+    /// The floor: applied even to the first attempt, so a single round trip
+    /// is never free.
+    const FLOOR: core::time::Duration = core::time::Duration::from_millis(300);
+    /// The ceiling, so a long-lived connection cannot be made to hold a
+    /// thread forever.
+    const CEILING: core::time::Duration = core::time::Duration::from_secs(5);
+
+    /// Wait out this attempt's share of the delay. Call before verifying.
+    pub(crate) fn before_attempt(&self) {
+        std::thread::sleep(Self::delay(self.failures.get()));
+    }
+
+    /// Record how the attempt went.
+    pub(crate) fn after_attempt(&self, accepted: bool) {
+        self.failures.set(if accepted { 0 } else { self.failures.get().saturating_add(1) });
+    }
+
+    /// The delay owed after `failures` consecutive failures.
+    fn delay(failures: u32) -> core::time::Duration {
+        let scaled = Self::FLOOR.saturating_mul(1u32 << failures.min(8));
+        scaled.min(Self::CEILING)
+    }
+}
+
 /// The largest core font that is certainly present (`xfonts-base`), falling
 /// back to whatever the server offers.
 fn open_font(conn: &x11rb::rust_connection::RustConnection) -> Option<xproto::Font> {
@@ -409,6 +450,35 @@ fn draw(
 
 #[cfg(test)]
 mod tests {
+    /// Guessing must cost more each time. Without this the form accepted
+    /// attempts as fast as a client could type them, and on the /etc/shadow
+    /// fallback path nothing anywhere counted them.
+    #[test]
+    fn repeated_failures_cost_progressively_more() {
+        use super::AttemptThrottle;
+        assert!(AttemptThrottle::delay(0) >= AttemptThrottle::FLOOR, "even the first attempt waits");
+        assert!(
+            AttemptThrottle::delay(3) > AttemptThrottle::delay(0),
+            "a fourth guess must cost more than the first"
+        );
+        assert_eq!(
+            AttemptThrottle::delay(64),
+            AttemptThrottle::CEILING,
+            "the delay is capped, so a client cannot pin the thread forever"
+        );
+    }
+
+    /// A user who mistypes once and then succeeds starts clean.
+    #[test]
+    fn a_successful_login_clears_the_penalty() {
+        use super::AttemptThrottle;
+        let throttle = AttemptThrottle::default();
+        throttle.after_attempt(false);
+        throttle.after_attempt(false);
+        throttle.after_attempt(true);
+        assert_eq!(throttle.failures.get(), 0);
+    }
+
     use super::*;
 
     /// The password must never reach the screen.

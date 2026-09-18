@@ -29,6 +29,13 @@ use anyhow::Context as _;
 /// the maximum the acceptor advertises with `honor_client_desktop_size`.
 pub(crate) const SESSION_SCREEN_MAX: (u16, u16) = (3840, 2160);
 
+/// The descriptor a keeper finds its display claim on.
+///
+/// 0, 1 and 2 are the password pipe and the two null streams; 3 is where the
+/// supervisor puts an accepted socket for a worker, and a keeper is spawned
+/// by a worker, so 4 is the first number nothing else has a claim on.
+pub(crate) const KEEPER_LOCK_FD: std::os::fd::RawFd = 4;
+
 /// The user's session, if one is recorded.
 pub(crate) fn attach_existing(
     base: &Path,
@@ -111,12 +118,14 @@ pub(crate) fn create(
     range: RangeInclusive<u16>,
     size: (u16, u16),
 ) -> anyhow::Result<registry::SessionRecord> {
-    // Pick a free number without keeping the claim: the keeper takes its own
-    // lock, and holding one here would make the keeper's claim fail.
-    let display = {
-        let probe = display_alloc::allocate(base, range)?;
-        probe.number
-    };
+    // Claim a number and KEEP the claim, then hand the descriptor holding it
+    // to the keeper. The claim is never released in between, so the number
+    // cannot be handed to a second login the way it could when this probed
+    // and let go: two connections then chose the same display, and the one
+    // whose keeper lost the lock still read — and bound to — the winner's
+    // session.
+    let lease = display_alloc::allocate(base, range)?;
+    let display = lease.number;
 
     let caps = detect::probe();
     let session_exec = detect::choose_session(&caps.sessions, None)
@@ -129,10 +138,24 @@ pub(crate) fn create(
         );
     }
 
-    spawn_keeper(base, user, password, display, size, &session_exec)
-        .with_context(|| format!("start the session keeper for {user}"))?;
+    // From here the keeper owns the claim. On failure the lease is dropped
+    // below, which releases it and frees the number again.
+    let lock_fd = lease.into_handoff_fd();
+    let spawned = spawn_keeper(base, user, password, display, size, &session_exec, lock_fd)
+        .with_context(|| format!("start the session keeper for {user}"));
+    // This process's copy of the descriptor has done its job: `flock` belongs
+    // to the open file description, which the keeper inherited, so closing
+    // this copy does not release anything the keeper is holding.
+    //
+    // SAFETY: a descriptor this function opened, used by nothing else here.
+    unsafe { libc::close(lock_fd) };
+    if let Err(error) = spawned {
+        // Nobody inherited the claim, so put the number back rather than
+        // leaving it locked by a descriptor that is already closed.
+        return Err(error);
+    }
 
-    keeper_main::wait_for_record(base, display, core::time::Duration::from_secs(20))
+    keeper_main::wait_for_record(base, display, user, core::time::Duration::from_secs(20))
         .with_context(|| format!("session for {user} on :{display}"))
 }
 
@@ -144,8 +167,10 @@ fn spawn_keeper(
     display: u16,
     size: (u16, u16),
     session_exec: &str,
+    lock_fd: std::os::fd::RawFd,
 ) -> anyhow::Result<()> {
     use std::io::Write as _;
+    use std::os::unix::process::CommandExt as _;
     use std::process::{Command, Stdio};
 
     let exe = std::env::current_exe().context("locate the linrdp binary")?;
@@ -156,7 +181,7 @@ fn spawn_keeper(
     if !crate::config::path_is_default() {
         command.arg("--config").arg(crate::config::path());
     }
-    let mut child = command
+    let mut child = unsafe { command
         .arg("--keeper")
         .arg("--keeper-user")
         .arg(user)
@@ -168,10 +193,33 @@ fn spawn_keeper(
         .arg(format!("{}x{}", size.0, size.1))
         .arg("--keeper-exec")
         .arg(session_exec)
+        .arg("--keeper-lock-fd")
+        .arg(KEEPER_LOCK_FD.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        // Place the display claim on a fixed descriptor and clear
+        // close-on-exec, so the keeper inherits the very open file
+        // description whose `flock` is the claim.
+        //
+        // SAFETY: the closure runs between fork and exec and calls only
+        // async-signal-safe functions — no allocation, no locks.
+        .pre_exec(move || {
+            // SAFETY: runs in the forked child between fork and exec; dup2
+            // and fcntl are async-signal-safe.
+            unsafe {
+                if libc::dup2(lock_fd, KEEPER_LOCK_FD) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // dup2 clears FD_CLOEXEC on the copy — except when the two
+                // numbers are equal, where POSIX says it does nothing at all.
+                if libc::fcntl(KEEPER_LOCK_FD, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        })
+        .spawn() }
         .context("spawn the session keeper")?;
 
     child
@@ -205,43 +253,61 @@ pub(crate) fn attach_or_create(
 }
 
 
-/// Lock a session: record it, and ask logind to tell the desktop.
+/// Lock a session: record it, and ask logind to tell that desktop.
 ///
 /// The record is the part linrdp enforces. The logind signal is what a screen
 /// locker in the session listens for — without one installed the lock is
 /// bookkeeping only, which `linrdp doctor` warns about rather than letting
 /// anyone believe the desktop is protected.
-pub(crate) fn lock(base: &Path, display: u16) -> anyhow::Result<()> {
+pub(crate) fn lock(base: &Path, display: u16, logind_id: Option<&str>) -> anyhow::Result<()> {
     registry::set_locked(base, display, true)?;
-    signal_logind_lock(true);
+    signal_logind_lock(true, logind_id);
     Ok(())
 }
 
 /// Release the lock after the user has authenticated for this session.
 pub(crate) fn unlock(base: &Path, rec: &registry::SessionRecord) -> anyhow::Result<()> {
     registry::set_locked(base, rec.display, false)?;
-    signal_logind_lock(false);
+    signal_logind_lock(false, rec.logind_id.as_deref());
     Ok(())
 }
 
-/// Best-effort `loginctl lock-session` / `unlock-session` for this process's
-/// own logind session.
+/// Best-effort `loginctl lock-session <id>` / `unlock-session <id>`.
 ///
-/// Best-effort on purpose: the lock that matters for access control is the
-/// recorded one, which linrdp enforces itself. This only drives whatever
-/// locker the desktop happens to run, and desktops without one are common.
-fn signal_logind_lock(lock: bool) {
+/// The session id is not optional in practice, only in the type. `loginctl
+/// lock-session` with no argument acts on the *calling* process's logind
+/// session, and the caller here is a worker — a forked RDP connection that
+/// has no logind session of its own. So the argument-less form either failed
+/// or, worse, signalled whatever session the supervisor happened to be in;
+/// either way the desktop that was actually being locked was never told. With
+/// no recorded id there is nothing to signal, and saying so is more honest
+/// than a call that appears to succeed.
+///
+/// Best-effort on purpose beyond that: the lock that matters for access
+/// control is the recorded one, which linrdp enforces itself. This only
+/// drives whatever locker the desktop happens to run, and desktops without
+/// one are common.
+fn signal_logind_lock(lock: bool, logind_id: Option<&str>) {
     let verb = if lock { "lock-session" } else { "unlock-session" };
+    let Some(id) = logind_id.filter(|id| !id.is_empty()) else {
+        tracing::debug!(
+            %verb,
+            "no logind session id recorded — the lock is enforced by linrdp, but no screen \
+             locker in the desktop can be told about it"
+        );
+        return;
+    };
     match std::process::Command::new("loginctl")
         .arg(verb)
+        .arg(id)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
     {
-        Ok(status) if status.success() => {}
-        Ok(status) => tracing::debug!(%verb, ?status, "loginctl did not accept the lock signal"),
-        Err(error) => tracing::debug!(%verb, %error, "loginctl unavailable — lock is recorded only"),
+        Ok(status) if status.success() => tracing::debug!(%verb, %id, "logind signalled"),
+        Ok(status) => tracing::debug!(%verb, %id, ?status, "loginctl did not accept the lock signal"),
+        Err(error) => tracing::debug!(%verb, %id, %error, "loginctl unavailable — lock is recorded only"),
     }
 }
 
@@ -265,6 +331,7 @@ mod tests {
                 runtime_dir: "/run/user/1001".to_owned(),
                 xauthority: "/run/user/1001/linrdp/Xauthority".to_owned(),
                 locked: false,
+                logind_id: None,
             },
         )
         .expect("seed");

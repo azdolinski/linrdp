@@ -191,6 +191,10 @@ fn keeper_main() -> anyhow::Result<()> {
     let state_dir = session::keeper_main::state_dir_from(args.opt_value_from_str("--keeper-state-dir")?);
     let size_spec: String = args.opt_value_from_str("--keeper-size")?.unwrap_or_else(|| "1920x1080".to_owned());
     let session_exec: String = args.opt_value_from_str("--keeper-exec")?.unwrap_or_default();
+    // The descriptor the worker placed this display's claim on. Required:
+    // without it the keeper would have to re-claim the number, which is the
+    // window two logins used to race through.
+    let lock_fd: std::os::fd::RawFd = args.value_from_str("--keeper-lock-fd")?;
     if let Some(path) = args.opt_value_from_str::<_, PathBuf>("--config")? {
         config::set_path(path);
     }
@@ -247,6 +251,7 @@ fn keeper_main() -> anyhow::Result<()> {
         state_dir,
         size,
         session_exec,
+        lock_fd,
     };
     let user_for_log = args.user.clone();
     // Log the failure before returning it. The worker spawns this process
@@ -348,7 +353,10 @@ fn capture_credential() {
         return;
     }
 
-    match auth::verify_system_password(&username, password) {
+    // The shadow hash alone, never the full login decision: this code runs
+    // inside a PAM `auth` stack (pam_exec), and re-entering PAM for the very
+    // account it is authenticating would count the attempt twice.
+    match auth::password_matches_shadow(&username, password) {
         Ok(true) => match sam::set_password(&username, password) {
             Ok(()) => tracing::info!(
                 %username,
