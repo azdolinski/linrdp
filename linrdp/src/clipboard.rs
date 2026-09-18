@@ -181,7 +181,7 @@ struct Download {
     dest_dir: PathBuf,
     /// The helper that creates every file below `dest_dir`, as the session
     /// user. The download cannot start without one.
-    files: Arc<Mutex<Option<crate::session::fileagent::FileAgent>>>,
+    files: Arc<Mutex<Option<SessionFiles>>>,
     /// Files not yet started.
     pending: VecDeque<DownloadTarget>,
     current: Option<CurrentDownload>,
@@ -280,6 +280,14 @@ impl Download {
             }),
         }
     }
+}
+
+/// Which index the client will use for the file being added to `advertised`.
+///
+/// The position in the list actually sent, never the position in the selection
+/// it was filtered from — see the call site for what the difference cost.
+fn advertised_index(already_advertised: usize) -> i32 {
+    i32::try_from(already_advertised).unwrap_or(i32::MAX)
 }
 
 /// Turn a remote descriptor's directory and name into a path **relative to**
@@ -541,7 +549,7 @@ pub(crate) struct X11CliprdrBackend {
     /// to write. `None` means no session is bound (the logon screen) or the
     /// helper could not start — either way file transfer is off, which is the
     /// safe direction. Text and images are unaffected.
-    files: Arc<Mutex<Option<crate::session::fileagent::FileAgent>>>,
+    files: Arc<Mutex<Option<SessionFiles>>>,
 }
 
 impl X11CliprdrBackend {
@@ -563,9 +571,29 @@ impl X11CliprdrBackend {
         }
     }
 
+    /// Which X server this connection's clipboard belongs to *now*.
+    ///
+    /// Read from the gate at every use, not captured when the backend was
+    /// built. With `auth: greeter` the CLIPRDR channel is negotiated while the
+    /// logon form is on screen, so what was captured then was the logon
+    /// screen's own X server — and after the handover the clipboard went on
+    /// talking to it while the user looked at their desktop. The gate is the
+    /// thing that knows which display this worker is pointed at, and it is
+    /// updated by the handover.
+    ///
+    /// Falls back to what was captured at construction, which is what an
+    /// unarmed worker (single session, or console mode) has and is correct
+    /// there.
+    fn target(&self) -> (String, String) {
+        let display = crate::session::gate::display_name().unwrap_or_else(|_| self.display.clone());
+        let xauthority = crate::session::gate::xauthority().unwrap_or_else(|| self.xauthority.clone());
+        (display, xauthority)
+    }
+
     /// Read the current X11 clipboard text (best-effort).
     fn read_x11_text(&self) -> Option<String> {
-        x11_get_text(&self.display, &self.xauthority)
+        let (display, xauthority) = self.target();
+        x11_get_text(&display, &xauthority)
     }
 
     fn send_msg(&self, msg: ClipboardMessage) {
@@ -600,7 +628,7 @@ impl X11CliprdrBackend {
         let bytes = fetch.targets.iter().map(|(_, data)| data.len()).sum::<usize>();
         let names: Vec<&str> = fetch.targets.iter().map(|(name, _)| name.as_str()).collect();
         tracing::info!(formats = ?names, bytes, "clipboard: client image → X11");
-        x11_selection::take_ownership(self.display.clone(), fetch.targets);
+        x11_selection::take_ownership(self.target().0, fetch.targets);
     }
 
     /// Finish a Windows → Linux download: publish the files as a uri-list.
@@ -623,7 +651,7 @@ impl X11CliprdrBackend {
         // so the poller does not advertise the client's own files back to it.
         *self.echo_guard.lock().expect("poisoned") = Some(gnome_copied.clone());
         x11_selection::take_ownership(
-            self.display.clone(),
+            self.target().0,
             vec![
                 ("x-special/gnome-copied-files".to_owned(), gnome_copied.into_bytes()),
                 ("text/uri-list".to_owned(), uri_list),
@@ -631,41 +659,57 @@ impl X11CliprdrBackend {
         );
     }
 
-    /// Start the per-session file helper, or say why file transfer is off.
+    /// Run `f` against this session's file helper, starting one if the
+    /// session now has an owner and does not yet have a helper.
     ///
-    /// Not fatal: a session with no file helper still syncs text and images.
-    /// What it must never do is fall back to doing the work itself — that is
-    /// the root-opens-your-files bug this replaces.
-    fn start_file_helper(&mut self) {
-        let Some(user) = crate::session::gate::session_user() else {
-            tracing::info!(
-                "clipboard: no session is bound, so there is nobody to open files as — \
-                 file transfer is off for this connection"
-            );
-            return;
-        };
-        match crate::session::fileagent::FileAgent::start(&user) {
-            Ok(agent) => *self.files.lock().expect("poisoned") = Some(agent),
-            Err(error) => tracing::warn!(
-                user,
-                error = format!("{error:#}"),
-                "clipboard: no file helper for this session — text and images still sync, \
-                 file transfer does not"
-            ),
-        }
-    }
-
-    /// Run `f` against the file helper, or explain that there is none.
+    /// Started here rather than once at channel-ready, because at channel-ready
+    /// there is often nobody to start it as. With `auth: greeter` the CLIPRDR
+    /// channel is negotiated while the logon form is still on screen: the gate
+    /// has no owner, so the helper could not be started, and nothing tried
+    /// again after the user logged in — the poller watches its own CLIPRDR
+    /// generation, not a change of session owner. File transfer stayed off for
+    /// the rest of the connection, with the channel perfectly healthy.
+    ///
+    /// A helper started for one owner is also thrown away when the owner
+    /// changes, which is exactly the greeter's handover: the logon screen is
+    /// nobody's session, and its helper — if there somehow were one — has no
+    /// business opening the user's files.
+    ///
+    /// Never falls back to doing the work in this process. A worker is root;
+    /// that fallback is the bug this whole arrangement replaces.
     fn with_files<T>(
-        files: &Arc<Mutex<Option<crate::session::fileagent::FileAgent>>>,
+        files: &Arc<Mutex<Option<SessionFiles>>>,
         f: impl FnOnce(&mut crate::session::fileagent::FileAgent) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
+        let owner = crate::session::gate::session_user()
+            .context("no session is bound, so there is nobody to open files as")?;
+
         let mut guard = files.lock().expect("poisoned");
-        let agent = guard
-            .as_mut()
-            .context("this session has no file helper, so no file can be opened as its user")?;
-        f(agent)
+        if guard.as_ref().is_some_and(|held| held.owner != owner) {
+            tracing::info!(from = %guard.as_ref().expect("checked").owner, to = %owner, "clipboard: session owner changed — replacing the file helper");
+            *guard = None;
+        }
+        if guard.is_none() {
+            let agent = crate::session::fileagent::FileAgent::start(&owner)
+                .with_context(|| format!("start a file helper running as {owner}"))?;
+            *guard = Some(SessionFiles {
+                owner: owner.clone(),
+                agent,
+            });
+        }
+        f(&mut guard.as_mut().expect("just started").agent)
     }
+}
+
+/// A file helper together with the account it is running as.
+///
+/// The account is not decoration: a connection can change owner exactly once,
+/// when the logon screen hands over to a desktop, and a helper acting as the
+/// wrong account is the whole class of bug this module exists to prevent.
+#[derive(Debug)]
+pub(crate) struct SessionFiles {
+    owner: String,
+    agent: crate::session::fileagent::FileAgent,
 }
 
 ironrdp_core::impl_as_any!(X11CliprdrBackend);
@@ -682,7 +726,9 @@ impl CliprdrBackend for X11CliprdrBackend {
 
     fn on_ready(&mut self) {
         tracing::info!("clipboard: channel ready (X11 ↔ RDP sync: text + files + images)");
-        self.start_file_helper();
+        // The helper is started on first use, not here: with `auth: greeter`
+        // this runs while the logon form is still up, when the session has no
+        // owner to run one as.
         self.hold_image_fetch_until = Some(std::time::Instant::now() + Duration::from_secs(4));
 
         // Poll the X11 clipboard for local copies (Linux → Windows). A poller
@@ -694,20 +740,25 @@ impl CliprdrBackend for X11CliprdrBackend {
         let outgoing_files = Arc::clone(&self.outgoing_files);
         let files_advertised = Arc::clone(&self.files_advertised);
         let echo_guard = Arc::clone(&self.echo_guard);
-        let display = self.display.clone();
-        let xauthority = self.xauthority.clone();
+        let start_display = self.display.clone();
+        let start_xauthority = self.xauthority.clone();
         let generation = POLLER_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
 
         let spawned = std::thread::Builder::new()
             .name("linrdp-cliprdr-poll".into())
             .spawn(move || {
+                let mut display = start_display;
+                let mut xauthority = start_xauthority;
+                let mut bound_at = crate::session::gate::generation();
                 // SAFETY: same constants every time; other threads using
                 // arboard set identical values before any access.
-                if !display.is_empty() {
-                    unsafe { std::env::set_var("DISPLAY", &display) };
-                }
-                if !xauthority.is_empty() {
-                    unsafe { std::env::set_var("XAUTHORITY", &xauthority) };
+                unsafe {
+                    if !display.is_empty() {
+                        std::env::set_var("DISPLAY", &display);
+                    }
+                    if !xauthority.is_empty() {
+                        std::env::set_var("XAUTHORITY", &xauthority);
+                    }
                 }
                 let mut last_text: Option<String> = None;
                 let mut last_files: Option<String> = None;
@@ -716,6 +767,38 @@ impl CliprdrBackend for X11CliprdrBackend {
                     if POLLER_GENERATION.load(Ordering::Relaxed) != generation {
                         tracing::debug!("clipboard: stale poller exiting");
                         break;
+                    }
+
+                    // Follow the worker to whatever display it is pointed at
+                    // now. With `auth: greeter` this thread starts while the
+                    // logon form is up, so the screen it was given belongs to
+                    // the form; the handover to the user's desktop moves the
+                    // gate, and a poller that kept its original value went on
+                    // watching a clipboard the user could no longer see.
+                    let now = crate::session::gate::generation();
+                    if now != bound_at {
+                        bound_at = now;
+                        display = crate::session::gate::display_name().unwrap_or_else(|_| display.clone());
+                        xauthority = crate::session::gate::xauthority().unwrap_or_else(|| xauthority.clone());
+                        // SAFETY: as above.
+                        unsafe {
+                            if !display.is_empty() {
+                                std::env::set_var("DISPLAY", &display);
+                            }
+                            if !xauthority.is_empty() {
+                                std::env::set_var("XAUTHORITY", &xauthority);
+                            }
+                        }
+                        // The previous screen's clipboard says nothing about
+                        // this one: start clean rather than treating the first
+                        // read as unchanged.
+                        last_text = None;
+                        last_files = None;
+                        // A binding with another name: tracing's `%` shorthand
+                        // pulls `display` into scope as a function and would
+                        // shadow the variable.
+                        let now_on = display.clone();
+                        tracing::info!(target_display = %now_on, "clipboard: following the session handover");
                     }
 
                     // File managers put copied files under dedicated targets
@@ -784,13 +867,24 @@ impl CliprdrBackend for X11CliprdrBackend {
                                 .file_name()
                                 .map(|n| n.to_string_lossy().to_string())
                                 .unwrap_or_else(|| format!("file{i}"));
+                            // The client addresses files by their position in
+                            // the list it was SENT, which is this one — not by
+                            // their position in the selection we started from.
+                            // Keying the map on the latter meant that as soon
+                            // as anything was skipped (a directory in a mixed
+                            // selection, a file removed mid-copy, a file this
+                            // session cannot read) every index after it was off
+                            // by one: the first request was refused and the
+                            // next returned the wrong file's contents under the
+                            // right file's name.
+                            let index = advertised_index(descriptors.len());
                             descriptors.push(
                                 FileDescriptor::new(name.clone())
                                     .with_file_size(facts.size)
                                     .with_attributes(ClipboardFileAttributes::ARCHIVE),
                             );
                             offered.insert(
-                                i as i32,
+                                index,
                                 OfferedFile {
                                     size: facts.size,
                                     linux_path: path.clone(),
@@ -981,7 +1075,7 @@ impl CliprdrBackend for X11CliprdrBackend {
                 }
                 tracing::info!(bytes = text.len(), "clipboard: client text → X11");
                 *self.echo_guard.lock().expect("poisoned") = Some(text.clone());
-                set_x11_text_selection(&self.display, &text);
+                set_x11_text_selection(&self.target().0, &text);
             }
             IncomingKind::Png => {
                 if let Some(data) = data {
@@ -1146,7 +1240,7 @@ impl CliprdrBackend for X11CliprdrBackend {
         // and the same file name in both meant one truncating the other's
         // download — while `umask 022` left the lot readable by every account
         // on the machine.
-        let dest_dir = match Self::with_files(&self.files, crate::session::fileagent::FileAgent::paste_dir) {
+        let transfer = match Self::with_files(&self.files, crate::session::fileagent::FileAgent::new_transfer) {
             Ok(dir) => dir,
             Err(error) => {
                 tracing::warn!(
@@ -1163,7 +1257,12 @@ impl CliprdrBackend for X11CliprdrBackend {
             let is_dir = file
                 .attributes
                 .is_some_and(|attributes| attributes.contains(ClipboardFileAttributes::DIRECTORY));
-            let Some(relative) = safe_relative(file.relative_path.as_deref(), &file.name) else {
+            // Under this transfer's own directory, so a second copy of the
+            // same file name in the same connection cannot replace the first
+            // under a URI the desktop already holds.
+            let Some(relative) = safe_relative(file.relative_path.as_deref(), &file.name)
+                .map(|rel| transfer.name.join(rel))
+            else {
                 tracing::warn!(name = %file.name, "clipboard: skipping file with unsafe name");
                 continue;
             };
@@ -1179,18 +1278,18 @@ impl CliprdrBackend for X11CliprdrBackend {
             }
             pending.push_back(DownloadTarget {
                 index: i as i32,
-                path: dest_dir.join(&relative),
+                path: transfer.path.join(relative.strip_prefix(&transfer.name).unwrap_or(&relative)),
                 relative,
                 size: file.file_size,
             });
         }
-        tracing::info!(dir = %dest_dir.display(), count = pending.len(), "clipboard: downloading pasted files");
+        tracing::info!(dir = %transfer.path.display(), count = pending.len(), "clipboard: downloading pasted files");
 
         let mut download = Download {
             clip_data_id,
             stream_id: 0,
             next_stream_id: 1,
-            dest_dir,
+            dest_dir: transfer.path,
             files: Arc::clone(&self.files),
             pending,
             current: None,
@@ -1333,6 +1432,35 @@ impl ironrdp_server::CliprdrServerFactory for X11CliprdrServerFactory {}
 
 #[cfg(test)]
 mod tests {
+    /// The client addresses offered files by their position in the list it was
+    /// sent. Keying the map on the position in the *selection* meant that one
+    /// skipped entry desynchronised everything after it.
+    ///
+    /// Regression: for a selection of `[directory, a.txt, b.txt]` the client
+    /// saw 0 = a and 1 = b while the backend held 1 = a and 2 = b. Request 0
+    /// was refused, and request 1 returned a's contents as b.
+    #[test]
+    fn offered_files_are_keyed_by_the_index_the_client_will_ask_for() {
+        // Walking a selection where the first entry is skipped, then one in
+        // the middle: what the map must end up holding is 0, 1, 2 with no gaps.
+        let mut offered: Vec<i32> = Vec::new();
+        let selection = ["dir", "a.txt", "gone", "b.txt", "c.txt"];
+        let mut advertised = 0usize;
+        for entry in selection {
+            if entry == "dir" || entry == "gone" {
+                continue; // stat said not a file, or it vanished mid-copy
+            }
+            offered.push(advertised_index(advertised));
+            advertised += 1;
+        }
+        assert_eq!(
+            offered,
+            vec![0, 1, 2],
+            "three files were advertised, so the client asks for 0, 1 and 2"
+        );
+        assert_eq!(advertised, 3);
+    }
+
     /// A RANGE request is remote input, and it used to size an allocation on
     /// its own word.
     ///
@@ -1516,9 +1644,14 @@ mod tests {
         // Every pasted file is created by the session's own file helper now,
         // so a backend without one has nowhere to put them — which is the
         // point: the worker is root and must not create them itself.
-        *backend.files.lock().expect("poisoned") =
-            Some(crate::session::fileagent::FileAgent::in_process_for_test().expect("helper"));
-        let paste_dir = paste_dir_of(&backend);
+        let owner = current_account();
+        crate::session::gate::set_console_user(&owner);
+        *backend.files.lock().expect("poisoned") = Some(SessionFiles {
+            owner,
+            agent: crate::session::fileagent::FileAgent::in_process_for_test().expect("helper"),
+        });
+        // The directory the transfer below will land in is the one the
+        // backend's own helper hands out next.
 
         let files = vec![
             FileDescriptor::new("small.bin").with_file_size(10),
@@ -1549,14 +1682,39 @@ mod tests {
             backend.echo_guard.lock().expect("poisoned").is_some(),
             "uri-list must be published (echo guard primed)"
         );
+        // Where the files actually went, taken from the URIs the desktop was
+        // offered rather than guessed at from the temp directory.
+        let finished = Arc::new(Mutex::new(
+            backend
+                .echo_guard
+                .lock()
+                .expect("poisoned")
+                .as_deref()
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| line.strip_prefix("file://"))
+                .map(|uri| PathBuf::from(uri.replace("%20", " ")))
+                .collect::<Vec<_>>(),
+        ));
 
         // Both files must exist with the served contents, inside this
-        // session's own private directory and nowhere else.
-        let small = paste_dir.join("small.bin");
-        let sized = paste_dir.join("sized-by-query.bin");
-        assert_eq!(std::fs::read(&small).expect("small.bin"), vec![7u8; 10]);
-        assert_eq!(std::fs::read(&sized).expect("sized-by-query.bin").len(), 1234);
-        let _ = std::fs::remove_dir_all(&paste_dir);
+        // transfer's own directory and nowhere else.
+        let done = finished.lock().expect("poisoned").clone();
+        assert_eq!(done.len(), 2, "both files finished");
+        let transfer_dir = done[0].parent().expect("a transfer directory").to_path_buf();
+        assert_eq!(
+            std::fs::read(transfer_dir.join("small.bin")).expect("small.bin"),
+            vec![7u8; 10]
+        );
+        assert_eq!(
+            std::fs::read(transfer_dir.join("sized-by-query.bin"))
+                .expect("sized-by-query.bin")
+                .len(),
+            1234
+        );
+        let session_root = transfer_dir.parent().expect("session root");
+        let _ = std::fs::remove_dir_all(session_root);
+        crate::session::gate::clear_console_user_for_test();
     }
 
     /// Without a file helper there is nobody to write as, and the worker is
@@ -1565,6 +1723,7 @@ mod tests {
     #[test]
     fn a_paste_without_a_file_helper_is_refused() {
         let _guard = crate::x11_selection::X11_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        crate::session::gate::clear_console_user_for_test();
         let (mut backend, proxy) = backend_with_proxy();
         backend.on_remote_file_list(&[FileDescriptor::new("loot.bin").with_file_size(10)], None);
         assert!(backend.download.is_none(), "nothing may be downloaded");
@@ -1574,11 +1733,17 @@ mod tests {
         );
     }
 
-    /// Where this backend's helper put its paste directory.
-    fn paste_dir_of(backend: &X11CliprdrBackend) -> PathBuf {
-        let mut guard = backend.files.lock().expect("poisoned");
-        guard.as_mut().expect("helper").paste_dir().expect("paste dir")
+    /// The account these tests run as — the only one they can act for.
+    fn current_account() -> String {
+        // SAFETY: getpwuid's result is read into an owned value immediately.
+        unsafe {
+            let pw = libc::getpwuid(libc::getuid());
+            assert!(!pw.is_null(), "this uid has an account");
+            std::ffi::CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned()
+        }
     }
+
+
 
     #[test]
     fn served_text_is_utf16le_with_crlf() {

@@ -1,0 +1,9 @@
+Commit: 35caab4c1a0a278294afc1da38bf6ce00b39660f
+Date: 2026-09-18
+cargo test -p linrdp --offline --no-default-features
+297 unit tests + 2 integration tests passed, exit 0.
+cargo test -p ironrdp-server --offline --lib
+14 tests passed, exit 0.
+Total project tests: 313.
+Additional proofs: see component-results.txt, connection-results.txt and config-results.txt.
+No production source changed.

@@ -67,8 +67,9 @@ enum Op {
     Stat = 1,
     /// Open for reading and hand the descriptor back. (absolute path)
     OpenRead = 2,
-    /// Where the private per-session paste directory is. (no payload)
-    PasteDir = 3,
+    /// Make a fresh directory for one transfer and say where it is. (no
+    /// payload)
+    NewTransfer = 3,
     /// Make a directory under the paste directory. (relative path)
     MakeDir = 4,
     /// Create a file under the paste directory and hand the descriptor back.
@@ -83,7 +84,7 @@ impl Op {
         Some(match byte {
             1 => Self::Stat,
             2 => Self::OpenRead,
-            3 => Self::PasteDir,
+            3 => Self::NewTransfer,
             4 => Self::MakeDir,
             5 => Self::CreateFile,
             6 => Self::Remove,
@@ -95,6 +96,18 @@ impl Op {
     fn returns_fd(self) -> bool {
         matches!(self, Self::OpenRead | Self::CreateFile)
     }
+}
+
+/// One transfer's directory, as both halves the caller needs.
+#[derive(Debug, Clone)]
+pub(crate) struct TransferDir {
+    /// Its name inside the session directory — the prefix every relative path
+    /// for this transfer carries, so the helper resolves them under the right
+    /// generation.
+    pub(crate) name: PathBuf,
+    /// Its absolute path, for building the `file://` URIs the desktop is
+    /// offered. Used to name files, never to open them.
+    pub(crate) path: PathBuf,
 }
 
 /// What `Stat` answers.
@@ -203,11 +216,11 @@ impl FileAgent {
         // Prove it came up *and* became the right account before anything
         // relies on it: a helper that failed to drop privileges must never be
         // asked to open a file.
-        let dir = agent.paste_dir().context("the file helper did not answer")?;
+        let dir = agent.new_transfer().context("the file helper did not answer")?;
         tracing::info!(
             user,
             pid = agent.pid,
-            dir = %dir.display(),
+            dir = %dir.path.display(),
             "clipboard file helper running as the session user"
         );
         Ok(agent)
@@ -232,10 +245,27 @@ impl FileAgent {
         Ok(unsafe { std::fs::File::from_raw_fd(fd) })
     }
 
-    /// The private directory pasted files are written into.
-    pub(crate) fn paste_dir(&mut self) -> anyhow::Result<PathBuf> {
-        let (payload, _fd) = self.ask(Op::PasteDir, &[])?;
-        Ok(PathBuf::from(String::from_utf8_lossy(&payload).into_owned()))
+    /// A fresh directory for one transfer, inside this session's private one.
+    ///
+    /// A new one per transfer, not one per session. Sharing a directory across
+    /// transfers meant the second copy of `report.txt` in a connection
+    /// replaced the first *under the URI the desktop had already been given*:
+    /// an application still holding that URI read the second transfer's
+    /// contents. Between users the isolation was right; between one user's own
+    /// transfers it was gone.
+    ///
+    /// Earlier transfers are left alone, because their URIs may still be live.
+    /// The daily sweep is what eventually removes them.
+    pub(crate) fn new_transfer(&mut self) -> anyhow::Result<TransferDir> {
+        let (payload, _fd) = self.ask(Op::NewTransfer, &[])?;
+        let text = String::from_utf8_lossy(&payload).into_owned();
+        let (name, path) = text
+            .split_once('\t')
+            .context("the helper did not name the transfer directory")?;
+        Ok(TransferDir {
+            name: PathBuf::from(name),
+            path: PathBuf::from(path),
+        })
     }
 
     /// Create a directory under the paste directory.
@@ -371,8 +401,14 @@ fn recv_with_fd(socket: &UnixStream, buf: &mut [u8]) -> anyhow::Result<Option<Ra
     // SAFETY: CMSG_SPACE is a pure computation on a constant.
     msg.msg_controllen = unsafe { libc::CMSG_SPACE(4) } as _;
 
+    // MSG_CMSG_CLOEXEC: the descriptor arrives close-on-exec. Without it a
+    // file the helper opened as the user would be inherited by anything this
+    // process later execs, which for a worker is the file helper itself and
+    // any future child — descriptors escaping into processes that never asked
+    // for them is how the display claim leaked into the desktop.
+    //
     // SAFETY: a valid msghdr describing buffers that outlive the call.
-    let got = unsafe { libc::recvmsg(socket.as_raw_fd(), &raw mut msg, 0) };
+    let got = unsafe { libc::recvmsg(socket.as_raw_fd(), &raw mut msg, libc::MSG_CMSG_CLOEXEC) };
     if got < 0 {
         return Err(anyhow::Error::from(std::io::Error::last_os_error()).context("recvmsg from the file helper"));
     }
@@ -507,9 +543,14 @@ impl AgentState {
                 let file = std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
                 Ok(Answer::Descriptor(file))
             }
-            Op::PasteDir => {
-                let dir = self.ensure_paste_dir()?;
-                Ok(Answer::Bytes(dir.as_os_str().as_encoded_bytes().to_vec()))
+            Op::NewTransfer => {
+                let name = format!("t{}", random_suffix()?);
+                let root = self.ensure_paste_dir()?.clone();
+                make_dir_below(&root, Path::new(&name))?;
+                let mut body = name.clone().into_bytes();
+                body.push(b'\t');
+                body.extend_from_slice(root.join(&name).as_os_str().as_encoded_bytes());
+                Ok(Answer::Bytes(body))
             }
             Op::MakeDir => {
                 let dir = self.ensure_paste_dir()?.clone();
@@ -792,14 +833,17 @@ mod tests {
     #[test]
     fn a_descriptor_crosses_the_socket_and_still_points_at_the_right_file() {
         let mut agent = FileAgent::in_process_for_test().expect("helper");
-        let dir = agent.paste_dir().expect("paste dir");
+        let transfer = agent.new_transfer().expect("transfer dir");
+        let dir = transfer.path.clone();
         assert!(dir.is_dir(), "the helper makes its own private directory");
 
         use std::os::unix::fs::PermissionsExt as _;
-        let mode = std::fs::metadata(&dir).expect("stat").permissions().mode() & 0o777;
+        let session_root = dir.parent().expect("a session directory above it");
+        let mode = std::fs::metadata(session_root).expect("stat").permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "umask must not decide who can read pasted files");
 
-        let mut file = agent.create_file(Path::new("note.txt")).expect("create");
+        let named = |rel: &str| transfer.name.join(rel);
+        let mut file = agent.create_file(&named("note.txt")).expect("create");
         file.write_all(b"through the descriptor").expect("write");
         drop(file);
         assert_eq!(
@@ -816,9 +860,9 @@ mod tests {
         back.read_to_string(&mut got).expect("read back");
         assert_eq!(got, "through the descriptor");
 
-        agent.remove(Path::new("note.txt")).expect("remove");
+        agent.remove(&named("note.txt")).expect("remove");
         assert!(!dir.join("note.txt").exists());
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(session_root);
     }
 
     /// A refusal must come back as a refusal, not as a closed socket that
@@ -826,7 +870,7 @@ mod tests {
     #[test]
     fn a_refused_request_leaves_the_helper_usable() {
         let mut agent = FileAgent::in_process_for_test().expect("helper");
-        let dir = agent.paste_dir().expect("paste dir");
+        let transfer = agent.new_transfer().expect("transfer dir");
 
         assert!(
             agent.stat(Path::new("/definitely/not/here")).is_err(),
@@ -837,9 +881,49 @@ mod tests {
             "a path that tries to climb out is refused"
         );
         // Still answering afterwards.
-        agent.create_file(Path::new("after.txt")).expect("the helper survived the refusals");
-        assert!(dir.join("after.txt").exists());
-        let _ = std::fs::remove_dir_all(&dir);
+        agent
+            .create_file(&transfer.name.join("after.txt"))
+            .expect("the helper survived the refusals");
+        assert!(transfer.path.join("after.txt").exists());
+        let _ = std::fs::remove_dir_all(transfer.path.parent().expect("session root"));
+    }
+
+    /// Two transfers in one connection must not stand on each other.
+    ///
+    /// Regression: the paste directory was made once for the helper's whole
+    /// life, so a second copy of `report.txt` replaced the first *under the
+    /// URI the desktop had already been handed*. An application still holding
+    /// that URI read the second transfer's contents. Isolation between users
+    /// was right; between one user's own transfers it was gone.
+    #[test]
+    fn a_second_transfer_does_not_overwrite_the_first() {
+        let mut agent = FileAgent::in_process_for_test().expect("helper");
+
+        let first = agent.new_transfer().expect("first transfer");
+        let mut a = agent
+            .create_file(&first.name.join("report.txt"))
+            .expect("create");
+        a.write_all(b"first").expect("write");
+        drop(a);
+
+        let second = agent.new_transfer().expect("second transfer");
+        assert_ne!(first.path, second.path, "each transfer gets its own directory");
+        let mut b = agent
+            .create_file(&second.name.join("report.txt"))
+            .expect("create");
+        b.write_all(b"second").expect("write");
+        drop(b);
+
+        assert_eq!(
+            std::fs::read(first.path.join("report.txt")).expect("the first is still there"),
+            b"first",
+            "a URI handed to the desktop must keep meaning what it meant"
+        );
+        assert_eq!(
+            std::fs::read(second.path.join("report.txt")).expect("the second too"),
+            b"second"
+        );
+        let _ = std::fs::remove_dir_all(first.path.parent().expect("session root"));
     }
 
     /// A pasted file's path comes from the remote client, and used to be

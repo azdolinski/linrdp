@@ -169,12 +169,23 @@ impl ConnectionInfo {
 /// All methods have default implementations that accept all connections
 /// and continue unconditionally.
 ///
-/// [`Self::on_accept`] and [`Self::on_disconnected`] are called only from
-/// [`RdpServer::run`]'s own accept loop. [`Self::on_connection_info`] is
-/// called from every code path that completes connection setup, including
-/// [`RdpServer::run_connection`] and [`RdpServer::run_connection_with`], so it
-/// is the hook to use for embedders (such as those with their own
-/// multi-transport accept loop) that do not call `run`.
+/// [`Self::on_accept`] is called only from [`RdpServer::run`]'s own accept
+/// loop, because only that loop does the accepting.
+///
+/// [`Self::on_connection_info`] and [`Self::on_disconnected`] are called from
+/// every code path that runs a connection, including
+/// [`RdpServer::run_connection`] and [`RdpServer::run_connection_with`].
+/// `on_disconnected` was once `run`-only, and that made it unusable for its
+/// main purpose: an embedder that forks a process per connection and calls
+/// `run_connection` never reached its own teardown at all, so whatever it did
+/// there — releasing a session, locking a desktop, restoring a console — did
+/// not happen. Exactly one dispatch per connection: `run` calls
+/// `run_connection_inner` directly and dispatches itself, so nothing is
+/// doubled.
+///
+/// Embedders outside `run` have no accepted address to report, so
+/// `on_disconnected` receives whatever [`RdpServer::set_peer_addr`] was told,
+/// and an unspecified address when it was told nothing.
 pub trait ConnectionHandler: Send {
     /// Called after `accept()` returns but before `run_connection()`.
     ///
@@ -712,6 +723,11 @@ pub struct RdpServer {
     credential_validator: Option<Arc<dyn CredentialValidator>>,
     credential_resolver: Option<std::sync::Arc<dyn Fn(&str) -> std::io::Result<Credentials> + Send + Sync>>,
     enable_ainput: bool,
+    /// Who is on the other end, for embedders that accepted the connection
+    /// themselves and then handed the stream to
+    /// [`Self::run_connection`](RdpServer::run_connection). `run`'s own loop
+    /// knows this from `accept` and does not consult it.
+    peer_addr: Option<SocketAddr>,
     /// How long a connection may take to get from the first byte to a
     /// finished handshake, if the embedder set a deadline.
     ///
@@ -1525,6 +1541,7 @@ impl RdpServer {
             creds: None,
             credential_resolver,
             enable_ainput,
+            peer_addr: None,
             // The embedder sets this; the library keeps its previous
             // behaviour (wait forever) unless it does.
             handshake_timeout: None,
@@ -1808,6 +1825,16 @@ impl RdpServer {
         self.auto_reconnect_sent = true;
 
         Ok(())
+    }
+
+    /// Say who is on the other end of a stream this server did not accept.
+    ///
+    /// Only affects what [`ConnectionHandler::on_disconnected`] is told;
+    /// nothing in the protocol consults it. An embedder that forks per
+    /// connection knows the peer from its own `accept` and is the only one who
+    /// can pass it on.
+    pub fn set_peer_addr(&mut self, peer: Option<SocketAddr>) {
+        self.peer_addr = peer;
     }
 
     /// Bound how long a connection may spend before it is authenticated.
@@ -2245,6 +2272,7 @@ impl RdpServer {
     where
         S: AsyncRead + AsyncWrite + Send + Sync + Unpin,
     {
+        let started = std::time::Instant::now();
         let result = self.run_connection_inner(stream, tls).await;
 
         // The static channels belong to the connection that negotiated them,
@@ -2254,6 +2282,24 @@ impl RdpServer {
         // connections through this method with the previous session's backends
         // still live until the next client attached new ones.
         self.static_channels = StaticChannelSet::new();
+
+        // The connection is over, so whatever the embedder does at the end of
+        // one has to happen here. This used to fire only in `run`'s accept
+        // loop, which meant an embedder that forks a process per connection —
+        // and therefore calls this method, not `run` — never reached its own
+        // teardown: no session released, no desktop locked, no console
+        // restored. `run` does not route through this method (it calls
+        // `run_connection_inner` and dispatches itself), so this is not a
+        // second dispatch for it.
+        if let Some(ref mut handler) = self.connection_handler {
+            let peer = self
+                .peer_addr
+                .unwrap_or_else(|| SocketAddr::new(core::net::IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED), 0));
+            // The return value steers `run`'s loop, and there is no loop here:
+            // this method serves one connection and the caller decides what
+            // comes next.
+            let _ = handler.on_disconnected(peer, started.elapsed(), result.as_ref().err());
+        }
 
         result
     }
@@ -5389,6 +5435,8 @@ mod preempt_tests {
 
 #[cfg(test)]
 mod tests {
+    use core::sync::atomic::AtomicUsize;
+
     use ironrdp_core::impl_as_any;
     use ironrdp_pdu::gcc::ChannelName;
     use ironrdp_svc::{SvcMessage, SvcServerProcessor};
@@ -5441,6 +5489,96 @@ mod tests {
         assert!(
             released.load(Ordering::Relaxed),
             "the channel backends of a finished connection must be released, not held until the next client"
+        );
+    }
+
+    /// Counts the teardown an embedder does at the end of a connection.
+    #[derive(Debug)]
+    struct CountingHandler {
+        ended: Arc<AtomicUsize>,
+        peer: Arc<std::sync::Mutex<Option<SocketAddr>>>,
+    }
+
+    impl ConnectionHandler for CountingHandler {
+        fn on_disconnected(
+            &mut self,
+            peer: SocketAddr,
+            _duration: Duration,
+            _error: Option<&ServerError>,
+        ) -> PostConnectionAction {
+            self.ended.fetch_add(1, Ordering::Relaxed);
+            *self.peer.lock().unwrap_or_else(|p| p.into_inner()) = Some(peer);
+            PostConnectionAction::Continue
+        }
+    }
+
+    /// An embedder that forks a process per connection calls
+    /// `run_connection`, never `run` — and `on_disconnected` used to fire
+    /// only from `run`'s accept loop.
+    ///
+    /// Regression, and not a cosmetic one: everything such an embedder does at
+    /// the end of a connection lived in that callback, so none of it happened.
+    /// A desktop meant to be locked when its client went away stayed unlocked
+    /// for the next connection.
+    #[tokio::test]
+    async fn run_connection_runs_the_embedders_teardown() {
+        let mut server = RdpServer::builder()
+            .with_addr(([127, 0, 0, 1], 0))
+            .with_no_security()
+            .with_no_input()
+            .with_no_display()
+            .build();
+
+        let ended = Arc::new(AtomicUsize::new(0));
+        let peer = Arc::new(std::sync::Mutex::new(None));
+        server.connection_handler = Some(Box::new(CountingHandler {
+            ended: Arc::clone(&ended),
+            peer: Arc::clone(&peer),
+        }));
+        let told: SocketAddr = "203.0.113.7:51000".parse().expect("an address");
+        server.set_peer_addr(Some(told));
+
+        let (client, server_side) = tokio::io::duplex(64);
+        drop(client);
+        let _ = server.run_connection(server_side).await;
+
+        assert_eq!(
+            ended.load(Ordering::Relaxed),
+            1,
+            "exactly one teardown per connection — none at all was the bug, twice would be a new one"
+        );
+        assert_eq!(
+            *peer.lock().unwrap_or_else(|p| p.into_inner()),
+            Some(told),
+            "the address the embedder accepted is the one it must be told about"
+        );
+    }
+
+    /// Without being told, there is no address to invent.
+    #[tokio::test]
+    async fn an_unknown_peer_is_reported_as_unspecified() {
+        let mut server = RdpServer::builder()
+            .with_addr(([127, 0, 0, 1], 0))
+            .with_no_security()
+            .with_no_input()
+            .with_no_display()
+            .build();
+
+        let ended = Arc::new(AtomicUsize::new(0));
+        let peer = Arc::new(std::sync::Mutex::new(None));
+        server.connection_handler = Some(Box::new(CountingHandler {
+            ended: Arc::clone(&ended),
+            peer: Arc::clone(&peer),
+        }));
+
+        let (client, server_side) = tokio::io::duplex(64);
+        drop(client);
+        let _ = server.run_connection(server_side).await;
+
+        assert_eq!(ended.load(Ordering::Relaxed), 1);
+        assert!(
+            peer.lock().unwrap_or_else(|p| p.into_inner()).is_some_and(|p| p.ip().is_unspecified()),
+            "an unknown peer is unspecified, not a plausible-looking address"
         );
     }
 }

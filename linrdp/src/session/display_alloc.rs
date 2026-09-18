@@ -56,11 +56,30 @@ impl DisplayLease {
 
     /// Adopt a claim handed over on an inherited descriptor.
     ///
-    /// The lock is verified rather than assumed: a descriptor that is not
-    /// holding this display's `flock` would mean the keeper is about to serve
-    /// a number somebody else may also be serving. `LOCK_EX | LOCK_NB` on a
-    /// descriptor that already holds the lock succeeds and changes nothing,
-    /// so this is a probe with no side effect when the handoff was genuine.
+    /// Two things are checked, and the second one is the point.
+    ///
+    /// The descriptor must refer to **this display's** lock file — compared by
+    /// device and inode against the path, not by taking the caller's word.
+    /// `flock` alone cannot establish that: it succeeds on any lockable file,
+    /// including one nobody was holding, so a probe that only locked would
+    /// have accepted a descriptor pointing anywhere and left the real number
+    /// free for somebody else.
+    ///
+    /// It must also already be locked. That cannot be tested from the process
+    /// that holds it — `flock` on a descriptor whose open file description
+    /// already has the lock succeeds and changes nothing, which is
+    /// indistinguishable from taking it fresh — so what is checked instead is
+    /// that *nobody else* can take it: a second, independent open of the same
+    /// path must fail `LOCK_EX | LOCK_NB`. That is exactly the property the
+    /// claim is supposed to have.
+    ///
+    /// Close-on-exec is restored immediately. The worker cleared it to hand the
+    /// descriptor over, and the keeper then `fork`/`exec`s the X server and the
+    /// desktop **as the session user**: without this, that desktop inherited an
+    /// open descriptor for a root-owned lock file and could `flock(fd,
+    /// LOCK_UN)` its own session's claim out from under a keeper that was still
+    /// running, after which the allocator would hand the same display number to
+    /// somebody else.
     pub(crate) fn adopt(base: &Path, number: u16, fd: std::os::fd::RawFd) -> anyhow::Result<Self> {
         use std::os::fd::FromRawFd as _;
 
@@ -68,13 +87,38 @@ impl DisplayLease {
         // SAFETY: the parent dup2'd the lock file onto this descriptor
         // immediately before exec and nothing else in this process uses it.
         let file = unsafe { File::from_raw_fd(fd) };
-        // SAFETY: a valid open fd; LOCK_NB never blocks.
-        let held = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+
+        let path = lock_path(base, number);
+        let expected = fs::metadata(&path)
+            .with_context(|| format!("stat {}", path.display()))?;
+        let got = file.metadata().context("stat the handed-over descriptor")?;
+        use std::os::unix::fs::MetadataExt as _;
         anyhow::ensure!(
-            held == 0,
-            "the descriptor handed over for display :{number} does not hold its lock: {}",
+            got.dev() == expected.dev() && got.ino() == expected.ino(),
+            "the descriptor handed over for display :{number} is not {}",
+            path.display()
+        );
+
+        // Someone must already hold it, and from here that someone can only be
+        // the open file description this descriptor names.
+        let probe = OpenOptions::new().read(true).write(true).open(&path)
+            .with_context(|| format!("open {} to verify the claim", path.display()))?;
+        // SAFETY: a valid open fd; LOCK_NB returns EWOULDBLOCK rather than blocking.
+        let free = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        drop(probe);
+        anyhow::ensure!(
+            !free,
+            "display :{number} is not claimed by anyone — the descriptor handed over holds no lock"
+        );
+
+        // SAFETY: a descriptor this function owns.
+        let flagged = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+        anyhow::ensure!(
+            flagged >= 0,
+            "cannot close-on-exec the claim for display :{number}: {}",
             std::io::Error::last_os_error()
         );
+
         Ok(Self {
             number,
             base: base.to_path_buf(),
@@ -217,17 +261,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A keeper must not serve a display on the word of a number alone: the
-    /// descriptor it was handed has to be the one holding that display's lock.
+    /// A keeper must not serve a display on the word of a descriptor alone.
+    ///
+    /// `flock` succeeds on any lockable file, so a probe that only locked
+    /// would accept a descriptor pointing anywhere — and leave the real
+    /// number free for somebody else to claim.
     #[test]
-    fn adopting_a_descriptor_that_holds_no_lock_is_refused() {
+    fn adopting_a_descriptor_that_is_not_this_displays_lock_is_refused() {
         let base = temp_base("adoptbad");
         assert!(
             DisplayLease::adopt(&base, 31, -1).is_err(),
             "a closed descriptor is not a claim"
         );
 
-        // A real descriptor, but on a file nobody locked.
+        // A real descriptor, lockable, on the wrong file.
         let plain = OpenOptions::new()
             .create(true)
             .read(true)
@@ -237,11 +284,69 @@ mod tests {
             .expect("open");
         let stray = plain.as_raw_fd();
         core::mem::forget(plain);
-        // This one *can* be locked, so it is adopted — the check is that the
-        // descriptor holds a lock, which is what keeps two keepers apart. What
-        // it must never do is succeed on a descriptor that cannot be locked at
-        // all, which -1 above covers.
-        let adopted = DisplayLease::adopt(&base, 31, stray).expect("lockable");
+        let err = DisplayLease::adopt(&base, 31, stray).expect_err("wrong file");
+        assert!(
+            format!("{err:#}").contains("display-31.lock"),
+            "the refusal has to say which file it expected, got: {err:#}"
+        );
+
+        // The right file, but nobody is holding it: there was no handoff.
+        let unheld = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_path(&base, 32))
+            .expect("open");
+        let unheld_fd = unheld.as_raw_fd();
+        core::mem::forget(unheld);
+        let err = DisplayLease::adopt(&base, 32, unheld_fd).expect_err("no claim");
+        assert!(
+            format!("{err:#}").contains("not claimed"),
+            "got: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The claim must not survive into the session's own processes.
+    ///
+    /// Regression, and a real one: the worker clears `FD_CLOEXEC` to hand the
+    /// descriptor over, and the keeper then `fork`/`exec`s the X server and
+    /// the desktop **as the session user**. With the flag left clear, that
+    /// desktop inherited an open descriptor for a root-owned lock file — and
+    /// the same open file description — so it could `flock(fd, LOCK_UN)` its
+    /// own session's claim away while the keeper was still running, after
+    /// which the allocator handed the number to somebody else.
+    ///
+    /// Checked through a real `exec`, because that is the only place the flag
+    /// has any effect: moving the lease around inside one process would pass
+    /// either way.
+    #[test]
+    fn an_adopted_claim_does_not_survive_into_the_sessions_processes() {
+        let base = temp_base("cloexec");
+        let lease = allocate(&base, 40..=40).expect("lease");
+        let fd = lease.into_handoff_fd();
+        let adopted = DisplayLease::adopt(&base, 40, fd).expect("adopt");
+
+        let raw = adopted._lock.as_raw_fd();
+        // SAFETY: a descriptor the lease owns.
+        let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+        assert!(flags >= 0, "F_GETFD failed");
+        assert!(
+            flags & libc::FD_CLOEXEC != 0,
+            "the claim must be close-on-exec once adopted"
+        );
+
+        let seen = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("test -e /proc/self/fd/{raw}"))
+            .status()
+            .expect("run a child");
+        assert!(
+            !seen.success(),
+            "an exec'd child must not inherit the display claim (fd {raw})"
+        );
+
         drop(adopted);
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -282,8 +282,9 @@ pub(crate) static FIELDS: &[Field] = &[
     },
     Field {
         path: "limits",
-        description: "What one unauthenticated client may cost this host. Nothing here \
-                      applies once a connection has authenticated.",
+        description: "What a client may cost this host. The two counts bound connections that \
+                      are live, established sessions included — a connection is counted from \
+                      the moment it is accepted until its process exits.",
         kind: Kind::Block,
         default: None,
         default_means: None,
@@ -294,10 +295,12 @@ pub(crate) static FIELDS: &[Field] = &[
     },
     Field {
         path: "limits.max_workers",
-        description: "How many connections may be in flight at once. Every accepted \
-                      connection is a forked process, so this is the ceiling on what the \
-                      machine will fork for clients it has not yet authenticated. Reaching \
-                      it refuses new connections; it never disturbs one already running.",
+        description: "How many connections this machine serves at once. Every accepted \
+                      connection is a forked process and stays counted until that process \
+                      exits, so this is a ceiling on live connections, not only on ones \
+                      still authenticating. Reaching it refuses new connections; it never \
+                      disturbs one already running. Set it above the number of people who \
+                      use this machine at the same time.",
         kind: Kind::Text("a whole number of processes, at least 1"),
         default: Some("128"),
         default_means: None,
@@ -308,9 +311,11 @@ pub(crate) static FIELDS: &[Field] = &[
     },
     Field {
         path: "limits.max_per_client",
-        description: "How many connections one client address may hold at once. A real \
-                      client opens a second while the first is tearing down; it does not \
-                      open dozens.",
+        description: "How many connections one source address may hold at once. Counted by \
+                      address, so everyone behind a single NAT or VPN gateway shares one \
+                      budget — raise it where that is how your users arrive. A real client \
+                      opens a second connection while the first is tearing down; it does \
+                      not open dozens.",
         kind: Kind::Text("a whole number of connections, at least 1"),
         default: Some("8"),
         default_means: None,
@@ -413,6 +418,11 @@ pub(crate) fn default_text(field: &Field) -> Option<String> {
 /// The shape a free-form key accepts, for the message that refuses a value
 /// that does not have it. Lives here so the file's comment and the rejection
 /// cannot describe two different formats.
+/// The documented default for a key, for an error that wants to name it.
+pub(crate) fn default_of(path: &str) -> Option<&'static str> {
+    field(path)?.default
+}
+
 pub(crate) fn shape(path: &str) -> Option<&'static str> {
     match field(path).map(|f| &f.kind) {
         Some(Kind::Text(shape)) => Some(shape),

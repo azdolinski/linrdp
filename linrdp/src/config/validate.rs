@@ -37,6 +37,7 @@ pub(crate) fn validate(config: &Config) -> anyhow::Result<()> {
     }
 
     check_tls(config, &mut problems);
+    check_limits(config, &mut problems);
 
     match problems.len() {
         0 => Ok(()),
@@ -149,6 +150,41 @@ fn check_console(listener: &Listener, config: &Config, problems: &mut Vec<String
     }
 }
 
+/// A budget of zero is not "no budget", it is a service that serves nobody.
+///
+/// The settings browser refused zero from the moment it could edit these, but
+/// a hand-written file went straight through serde as a plain `u32` — so
+/// `max_workers: 0` bound the port and then turned every client away, and the
+/// same file meant two different things depending on which tool had written
+/// it. This is the shared rule both go through.
+fn check_limits(config: &Config, problems: &mut Vec<String>) {
+    for (path, value) in [
+        ("limits.max_workers", config.limits.max_workers),
+        ("limits.max_per_client", config.limits.max_per_client),
+        ("limits.handshake_seconds", config.limits.handshake_seconds),
+    ] {
+        if value == 0 {
+            problems.push(format!(
+                "`{path}: 0` is not a limit, it is a service that refuses everybody. Give it \
+                 at least 1, or leave the key out for the default ({}).",
+                meta::default_of(path).unwrap_or("see `linrdp config`")
+            ));
+        }
+    }
+
+    // One client may not be allowed more than the whole machine: the file
+    // would parse, but the per-client ceiling could never be the one that
+    // applies, which is not what anyone writing it meant.
+    if config.limits.max_per_client > config.limits.max_workers {
+        problems.push(format!(
+            "`limits.max_per_client` ({}) is above `limits.max_workers` ({}), so one client is \
+             allowed more connections than the whole machine serves. Lower the first or raise \
+             the second.",
+            config.limits.max_per_client, config.limits.max_workers
+        ));
+    }
+}
+
 /// A certificate without its key is not an identity.
 fn check_tls(config: &Config, problems: &mut Vec<String>) {
     complain_about_a_half_identity("tls", &config.tls, problems);
@@ -181,6 +217,47 @@ fn complain_about_a_half_identity(where_: &str, tls: &super::Tls, problems: &mut
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hand-written file and the settings browser must mean the same thing.
+    ///
+    /// Regression: `Limits` deserialized as three plain `u32`s and nothing
+    /// checked them, while the browser's own editor refused zero. So
+    /// `max_workers: 0` written by hand was accepted, the port bound, and
+    /// every client was then turned away by a limit that was never meant to
+    /// be a limit.
+    #[test]
+    fn a_limit_of_zero_is_refused_wherever_it_was_written() {
+        for key in ["max_workers", "max_per_client", "handshake_seconds"] {
+            let yaml = format!(
+                "listeners:\n  - bind: 0.0.0.0:3389\n    auth: both\nlimits:\n  {key}: 0\n"
+            );
+            let config: Config = serde_norway::from_str(&yaml).expect("it parses; that was the problem");
+            let error = format!("{:#}", validate(&config).expect_err("but it must not validate"));
+            assert!(error.contains(key), "the refusal has to name the key, got: {error}");
+        }
+    }
+
+    /// The defaults, and the boundary right next to zero, must pass.
+    #[test]
+    fn the_smallest_real_limits_are_accepted() {
+        let yaml = "listeners:\n  - bind: 0.0.0.0:3389\n    auth: both\nlimits:\n  max_workers: 1\n  max_per_client: 1\n  handshake_seconds: 1\n";
+        let config: Config = serde_norway::from_str(yaml).expect("parses");
+        validate(&config).expect("one of each is a real, if tiny, budget");
+
+        let defaults = "listeners:\n  - bind: 0.0.0.0:3389\n    auth: both\n";
+        let config: Config = serde_norway::from_str(defaults).expect("parses");
+        validate(&config).expect("the built-in defaults must validate");
+    }
+
+    /// A per-client ceiling above the machine's own can never apply.
+    #[test]
+    fn one_client_may_not_be_allowed_more_than_the_whole_machine() {
+        let yaml = "listeners:\n  - bind: 0.0.0.0:3389\n    auth: both\nlimits:\n  max_workers: 4\n  max_per_client: 8\n";
+        let config: Config = serde_norway::from_str(yaml).expect("parses");
+        let error = format!("{:#}", validate(&config).expect_err("refused"));
+        assert!(error.contains("max_per_client"), "got: {error}");
+    }
+
 
     fn parse(body: &str) -> anyhow::Result<Config> {
         let config: Config = serde_norway::from_str(body)?;

@@ -221,12 +221,13 @@ pub(crate) fn login_service() -> &'static str {
 /// an expired account, a disabled one, or one an access rule (`pam_access`,
 /// `pam_time`, `pam_nologin`) refuses. `Err` means PAM itself is unavailable,
 /// never "denied".
-pub(crate) fn account_valid(username: &str) -> Result<bool, String> {
-    let user = CString::new(username).map_err(|_| "username contains NUL".to_owned())?;
+pub(crate) fn account_valid(username: &str) -> Result<bool, NoVerdict> {
+    let user = CString::new(username)
+        .map_err(|_| NoVerdict::BackendFailed("username contains NUL".to_owned()))?;
 
     let api = match PAM.get_or_init(load_pam) {
         Ok(api) => api,
-        Err(reason) => return Err((*reason).to_owned()),
+        Err(reason) => return Err(NoVerdict::NotInstalled((*reason).to_owned())),
     };
 
     // SAFETY: the handle is created, used and ended within this call; the
@@ -245,7 +246,7 @@ pub(crate) fn account_valid(username: &str) -> Result<bool, String> {
         let mut handle: *mut c_void = std::ptr::null_mut();
         let status = (api.pam_start)(service.as_ptr(), data.user.as_ptr(), &conv_struct, &mut handle);
         if status != PAM_SUCCESS {
-            return Err(format!("pam_start: {status}"));
+            return Err(NoVerdict::BackendFailed(format!("pam_start: {status}")));
         }
         let acct = (api.pam_acct_mgmt)(handle, 0);
         (api.pam_end)(handle, acct);
@@ -253,20 +254,51 @@ pub(crate) fn account_valid(username: &str) -> Result<bool, String> {
     }
 }
 
+/// Why PAM produced no verdict.
+///
+/// The distinction is the whole point, and collapsing it into one error was a
+/// hole: "this machine has no libpam" is a configuration a caller may fall
+/// back from, while "the stack is here and it broke" is a failure of the
+/// authority itself. Treating the second like the first meant a `pam_start`
+/// failure — after the library had loaded perfectly well — silently handed the
+/// decision to `/etc/shadow`, which knows nothing about `pam_access`,
+/// `pam_time` or anything else the stack would have applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NoVerdict {
+    /// libpam is not installed, or lacks a symbol this build needs. There is
+    /// no PAM policy on this machine to bypass.
+    NotInstalled(String),
+    /// libpam loaded and then failed: `pam_start` refused, the service is
+    /// missing, the conversation could not run. Policy exists and did not
+    /// execute, which is not the same as policy not existing.
+    BackendFailed(String),
+}
+
+impl core::fmt::Display for NoVerdict {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotInstalled(reason) => write!(f, "libpam is not usable here: {reason}"),
+            Self::BackendFailed(reason) => write!(f, "the PAM stack failed: {reason}"),
+        }
+    }
+}
+
 /// Verify a username/password pair through the system PAM stack.
 ///
-/// Returns `Ok(true/false)` = authenticated/not, `Err(reason)` = PAM itself
-/// unavailable (no libpam, or a symbol the running version lacks) — the
-/// caller should treat that as "fallback not possible", not as a verdict.
-pub(crate) fn authenticate(username: &str, password: &str) -> Result<bool, String> {
+/// `Ok(true/false)` = authenticated/not. `Err` = no verdict, and [`NoVerdict`]
+/// says whether that is because PAM is absent or because it broke — which the
+/// caller must not conflate.
+pub(crate) fn authenticate(username: &str, password: &str) -> Result<bool, NoVerdict> {
     // Reject embedded NULs up front: they cannot travel through CString
     // into PAM, and truncation would authenticate the wrong string.
-    let user = CString::new(username).map_err(|_| "username contains NUL".to_owned())?;
-    let pass = CString::new(password).map_err(|_| "password contains NUL".to_owned())?;
+    let user = CString::new(username)
+        .map_err(|_| NoVerdict::BackendFailed("username contains NUL".to_owned()))?;
+    let pass = CString::new(password)
+        .map_err(|_| NoVerdict::BackendFailed("password contains NUL".to_owned()))?;
 
     let api = match PAM.get_or_init(load_pam) {
         Ok(api) => api,
-        Err(reason) => return Err((*reason).to_owned()),
+        Err(reason) => return Err(NoVerdict::NotInstalled((*reason).to_owned())),
     };
 
     // SAFETY: the handle is created, used and destroyed within this call;
@@ -282,7 +314,8 @@ pub(crate) fn authenticate(username: &str, password: &str) -> Result<bool, Strin
         let mut handle: *mut c_void = std::ptr::null_mut();
         let status = (api.pam_start)(service.as_ptr(), data.user.as_ptr(), &conv, &mut handle);
         if status != PAM_SUCCESS {
-            return Err(format!("pam_start: {status}"));
+            // The library is here; it is the stack that would not start.
+            return Err(NoVerdict::BackendFailed(format!("pam_start: {status}")));
         }
 
         let auth = (api.pam_authenticate)(handle, 0);

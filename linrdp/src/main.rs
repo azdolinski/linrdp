@@ -536,6 +536,36 @@ async fn serve() -> anyhow::Result<()> {
         .parse()
         .with_context(|| format!("listener `{}` is not an address and port", effective.bind))?;
 
+    // `--listener` without `--serve-fd`: one process binds the address and
+    // serves every connection itself, instead of the supervisor forking a
+    // worker per connection.
+    //
+    // That mode cannot serve per-user sessions, and the reason is structural
+    // rather than missing work. The session gate is process-global and binds
+    // once: the first login points this process at its own desktop, and a
+    // second login by anyone else has nowhere to go. It also has no per-
+    // connection process to end, which is where a session's teardown lives.
+    //
+    // It used to accept those connections anyway, with no session router
+    // installed at all — so nothing drew the logon screen, nothing checked
+    // account policy, and a process that happened to have a usable X display
+    // could hand a desktop to a client that had proved nothing. Calling it a
+    // developer mode in a comment did not make it one: it took real
+    // connections with the real listener configuration. Console mode is the
+    // one shape that genuinely works in a single process, because every
+    // connection shows the same screen, so that is the one this allows.
+    if serve_fd.is_none() && !console_mode {
+        anyhow::bail!(
+            "`--listener {}` serves every connection in this one process, which cannot route \
+             per-user sessions: the session gate binds once, so the second person to connect \
+             would have nowhere to go. Run the supervisor instead — `linrdp` with no arguments, \
+             or `linrdp debug` for the same thing with a louder log — which forks a worker per \
+             connection. This mode is available for `session.console.enabled`, where every \
+             connection serves the same screen.",
+            effective.bind
+        );
+    }
+
     // Console mode serves one screen that already exists. Which screen is a
     // configuration answer and deliberately not an environment one: the unit
     // carries no Environment=, and the fallback an absent $DISPLAY used to
@@ -588,13 +618,14 @@ async fn serve() -> anyhow::Result<()> {
     // (CredSSP's SAM lookup) and turned into a session in
     // `on_connection_info`, which only runs once CredSSP has succeeded.
     let multi_session = serve_fd.is_some() && !console_mode;
-    // The router is installed for every worker, console mode included. Console
-    // creates no per-user session and binds no display — but it still has to
-    // ask whether the account that just authenticated is allowed in, and it is
-    // the only place that can: nothing downstream of it opens a PAM session.
-    // Leaving it out is why console was the one route to a desktop with no
-    // policy check on it at all.
-    let route_connections = serve_fd.is_some();
+    // The router is installed for every connection this process serves, in
+    // every mode — console included, and the direct single-process mode
+    // included. Console creates no per-user session and binds no display, but
+    // it still has to ask whether the account that just authenticated is
+    // allowed in, and it is the only place that can: nothing downstream of it
+    // opens a PAM session. Leaving it out is why console, and then the direct
+    // mode above, were routes to a desktop with no policy check on them.
+    let route_connections = true;
     let pending_identity = Arc::new(session::router::PendingIdentity::default());
 
     // The validator feeds the session router in `system` mode: there is no
@@ -917,6 +948,10 @@ async fn serve() -> anyhow::Result<()> {
         // process touches it.
         let std_stream = unsafe { <std::net::TcpStream as std::os::fd::FromRawFd>::from_raw_fd(fd) };
         std_stream.set_nonblocking(true).context("set the handed-over socket non-blocking")?;
+        // The supervisor accepted this connection, so it is the only place the
+        // peer address exists; without it the disconnect handler has nothing to
+        // report and the log says 0.0.0.0:0.
+        server.set_peer_addr(std_stream.peer_addr().ok());
         let stream = tokio::net::TcpStream::from_std(std_stream).context("adopt the handed-over socket")?;
         server.run_connection(stream).await?;
         return Ok(());

@@ -1,0 +1,7 @@
+R01 CONFIRMED: fresh greeter runtime fails: writing /tmp/linrdp-audit2-2047767/greeter-10/linrdp/Xauthority as root failed: create /tmp/linrdp-audit2-2047767/greeter-10/linrdp: No such file or directory (os error 2)
+R02 CONFIRMED: UNPRIVILEGED_CHILD_UNLOCKED_KEEPER_LEASE
+R03 CONFIRMED: second display for same UID removes first display's cookie
+PASS F03: helper refuses second unprivileged UID's mode-0600 sentinel
+PASS F03/F04: actual exec helper reads its user's file and refuses root-owned mode-0600 sentinel
+OBSERVATION: received SCM_RIGHTS descriptor CLOEXEC=false
+R07 CONFIRMED: repeated paste reuses same URI and replaces previous content

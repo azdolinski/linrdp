@@ -1,0 +1,1 @@
+R09 CONFIRMED: production YAML parser and validator accept all three limits equal to zero

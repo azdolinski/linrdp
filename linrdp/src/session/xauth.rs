@@ -17,8 +17,16 @@ use anyhow::Context as _;
 
 use super::privilege::UserIds;
 
-pub(crate) fn cookie_path(runtime_dir: &str) -> PathBuf {
-    Path::new(runtime_dir).join("linrdp").join("Xauthority")
+/// Where one display's cookie lives, inside the owner's runtime directory.
+///
+/// Per display, not per user. A single shared `Xauthority` held exactly one
+/// entry, so a second session for the same account overwrote the first's
+/// secret and the first display's cookie was simply gone — a reconnect to it
+/// failed with "holds no cookie". Sessions are serialized per account now, so
+/// that should not arise; the file name makes it structurally impossible
+/// rather than merely unlikely, and costs nothing.
+pub(crate) fn cookie_path(runtime_dir: &str, display: u16) -> PathBuf {
+    Path::new(runtime_dir).join("linrdp").join(format!("Xauthority-{display}"))
 }
 
 /// 16 secret bytes from the kernel CSPRNG.
@@ -108,7 +116,7 @@ pub(crate) fn cookie_for(path: &Path, display: u16) -> anyhow::Result<(Vec<u8>, 
 /// `O_EXCL` on the final open stay, so a stale link is reported rather than
 /// followed even within the user's own files.
 pub(crate) fn write_cookie(runtime_dir: &str, display: u16, owner: &UserIds) -> anyhow::Result<PathBuf> {
-    let path = cookie_path(runtime_dir);
+    let path = cookie_path(runtime_dir, display);
     let entry = xauthority_entry(display, &random_cookie()?);
 
     // A pipe carries the child's failure back: the child cannot return an
@@ -177,7 +185,10 @@ pub(crate) fn write_cookie(runtime_dir: &str, display: u16, owner: &UserIds) -> 
 /// Runs after `fork` in a process that does nothing else, so the irreversible
 /// `setuid` costs nothing and the keeper keeps its own privileges.
 fn write_as_user(path: &Path, entry: &[u8], owner: &UserIds) -> anyhow::Result<()> {
-    super::privilege::drop_to(owner).context("become the session user")?;
+    // SAFETY: geteuid is always safe.
+    if unsafe { libc::geteuid() } != owner.uid {
+        super::privilege::drop_to(owner).context("become the session user")?;
+    }
 
     let dir = path.parent().context("cookie path has no parent")?;
     match fs::create_dir(dir) {
@@ -274,10 +285,57 @@ mod tests {
     #[test]
     fn the_cookie_path_sits_under_the_runtime_dir() {
         assert_eq!(
-            cookie_path("/run/user/1000"),
-            std::path::Path::new("/run/user/1000/linrdp/Xauthority"),
+            cookie_path("/run/user/1000", 11),
+            std::path::Path::new("/run/user/1000/linrdp/Xauthority-11"),
             "the cookie belongs in the user's own 0700 tmpfs, never /tmp or $HOME"
         );
+        assert_ne!(
+            cookie_path("/run/user/1000", 11),
+            cookie_path("/run/user/1000", 12),
+            "two displays of one account must not share a file that holds a single entry"
+        );
+    }
+
+    /// A fresh tree must actually produce a cookie.
+    ///
+    /// Regression: `write_as_user` swapped `create_dir_all` for `create_dir`,
+    /// which is right for a real session — the runtime directory is
+    /// `pam_systemd`'s to make, and a cookie writer creating one would be
+    /// covering for its absence — but the logon screen has no PAM session, so
+    /// its runtime directory had nobody to make it. `greeter-N/linrdp` failed
+    /// with ENOENT, and on a fresh state directory an `auth: greeter` listener
+    /// drew no form at all.
+    ///
+    /// The symlink test below cannot catch this: it tolerates `write_cookie`
+    /// returning an error, because on a non-root test runner the privilege
+    /// drop is expected to fail. This one demands success.
+    #[test]
+    fn a_cookie_is_written_when_the_runtime_directory_exists() {
+        let dir = std::env::temp_dir().join(format!("linrdp-xauth-fresh-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let runtime = dir.join("greeter-10");
+        fs::create_dir_all(&runtime).expect("the caller makes the runtime directory");
+
+        let account = current_account();
+        let owner = super::super::privilege::lookup_user(&account).expect("lookup");
+        let result = write_cookie(runtime.to_str().expect("utf8"), 10, &owner);
+
+        // SAFETY: getuid is always safe.
+        let privileged = unsafe { libc::geteuid() } == owner.uid;
+        if privileged {
+            let path = result.expect("a cookie must be written into an existing runtime directory");
+            let (name, data) = cookie_for(&path, 10).expect("and be readable back");
+            assert_eq!(name, b"MIT-MAGIC-COOKIE-1");
+            assert_eq!(data.len(), 16);
+        }
+        // The parent directory, on the other hand, is never created here: a
+        // real session's runtime belongs to pam_systemd.
+        let missing = dir.join("greeter-11");
+        assert!(
+            write_cookie(missing.to_str().expect("utf8"), 11, &owner).is_err(),
+            "a runtime directory that does not exist is an error, not something to create"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A symlink at the cookie path must never be followed.
@@ -297,12 +355,10 @@ mod tests {
 
         let target = dir.join("precious");
         fs::write(&target, b"must survive").expect("target");
-        std::os::unix::fs::symlink(&target, cookie_path(runtime.to_str().expect("utf8")))
+        std::os::unix::fs::symlink(&target, cookie_path(runtime.to_str().expect("utf8"), 11))
             .expect("plant the link");
 
-        // SAFETY: getuid is always safe.
-        let me = unsafe { libc::getuid() };
-        let account = if me == 0 { "root".to_owned() } else { whoami() };
+        let account = current_account();
         let name = super::super::privilege::lookup_user(&account).expect("lookup");
         let result = write_cookie(runtime.to_str().expect("utf8"), 11, &name);
 
@@ -312,7 +368,7 @@ mod tests {
             "the file the link pointed at must be untouched"
         );
         if result.is_ok() {
-            let written = cookie_path(runtime.to_str().expect("utf8"));
+            let written = cookie_path(runtime.to_str().expect("utf8"), 11);
             let meta = fs::symlink_metadata(&written).expect("cookie file");
             assert!(
                 !meta.file_type().is_symlink(),
@@ -322,10 +378,9 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// The account this test process is running as, for the symlink test —
-    /// which needs a user it can actually become (itself).
-    #[cfg(test)]
-    fn whoami() -> String {
+    /// The account this test process is running as — the tests need a user
+    /// they can actually become, which is only ever this one.
+    fn current_account() -> String {
         // SAFETY: getpwuid returns a pointer into a static buffer, read
         // immediately; getuid is always safe.
         unsafe {

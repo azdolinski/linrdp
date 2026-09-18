@@ -236,6 +236,13 @@ pub(crate) fn set_console_user(user: &str) {
     *CONSOLE_USER.lock().unwrap_or_else(|p| p.into_inner()) = Some(user.to_owned());
 }
 
+/// Forget it again. Tests only: the statics are shared by the whole test
+/// binary, so a test that sets an owner has to put it back.
+#[cfg(test)]
+pub(crate) fn clear_console_user_for_test() {
+    *CONSOLE_USER.lock().unwrap_or_else(|p| p.into_inner()) = None;
+}
+
 /// This session's audio target, or `None` with the reason in the log.
 ///
 /// Audio must never fail the binding. A desktop with a screen and no sound is

@@ -240,7 +240,56 @@ fn spawn_keeper(
     Ok(())
 }
 
+/// An exclusive claim on one account's session lifecycle.
+///
+/// Held across "does this user have a session?" and "then make one", which
+/// have to be one step and were two. Two connections for the same account
+/// arriving before either keeper published its record both saw no session and
+/// both created one: two desktops for one person, two keepers, and — before
+/// the cookie file became per display — the second one's cookie overwriting
+/// the first's, so reconnecting to the first failed with "holds no cookie".
+///
+/// Keyed by uid rather than by the name as typed, so `Alice` and `alice`
+/// cannot end up on either side of the same lock.
+///
+/// `flock`, like everything else here, so the kernel releases it if the holder
+/// dies mid-login rather than wedging that account out of its own desktop.
+struct AccountLock {
+    /// Held purely for its `flock`; closing it releases the claim.
+    _file: std::fs::File,
+}
+
+impl AccountLock {
+    fn acquire(base: &Path, user: &str) -> anyhow::Result<Self> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let uid = privilege::lookup_user(user)
+            .with_context(|| format!("look up {user}"))?
+            .uid;
+        let path = base.join(format!("account-{uid}.lock"));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        // Blocking: the wait is one session start, and giving up would mean
+        // creating the second desktop this exists to prevent.
+        // SAFETY: a valid open fd.
+        let held = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        anyhow::ensure!(held == 0, "lock {}: {}", path.display(), std::io::Error::last_os_error());
+        Ok(Self { _file: file })
+    }
+}
+
 /// The user's session, creating one if they have none.
+///
+/// The lookup and the creation happen under one per-account lock, so a second
+/// connection for the same person either finds the session the first one made
+/// or waits for it — never starts a second.
 pub(crate) fn attach_or_create(
     base: &Path,
     user: &str,
@@ -248,6 +297,7 @@ pub(crate) fn attach_or_create(
     range: RangeInclusive<u16>,
     size: (u16, u16),
 ) -> anyhow::Result<registry::SessionRecord> {
+    let _account = AccountLock::acquire(base, user)?;
     if let Some(existing) = attach_live(base, user, range.clone()) {
         tracing::info!(user, display = existing.display, "attached to the existing session");
         return Ok(existing);
@@ -387,6 +437,62 @@ mod tests {
             attach_live(&base, "alice", 10..=20).is_none(),
             "a record with no live keeper must not be attached to"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Two logins for one account must not become two desktops.
+    ///
+    /// Regression scenario: `attach_live` and `create` were separate steps, so
+    /// two connections arriving before either keeper published its record both
+    /// saw no session and both made one. The lock makes them one step; this
+    /// exercises the lock itself, because starting two real keepers needs X,
+    /// PAM and root.
+    #[test]
+    fn one_account_creates_one_session_at_a_time() {
+        let base = temp_base("acctlock");
+        let account = {
+            // SAFETY: getpwuid is read into an owned value immediately.
+            unsafe {
+                let pw = libc::getpwuid(libc::getuid());
+                assert!(!pw.is_null(), "this uid has an account");
+                std::ffi::CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned()
+            }
+        };
+
+        let inside = std::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let overlapped = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let (base, user) = (base.clone(), account.clone());
+                let (inside, overlapped) = (inside.clone(), overlapped.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        let _guard = AccountLock::acquire(&base, &user).expect("lock");
+                        if inside.fetch_add(1, core::sync::atomic::Ordering::SeqCst) != 0 {
+                            overlapped.store(true, core::sync::atomic::Ordering::SeqCst);
+                        }
+                        std::thread::yield_now();
+                        inside.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("worker");
+        }
+        assert!(
+            !overlapped.load(core::sync::atomic::Ordering::SeqCst),
+            "two logins were inside one account's attach-or-create at once, which is how \
+             that account ends up with two desktops"
+        );
+
+        // Different accounts must not wait for each other. Skipped when the
+        // tests run as root, where "another account" would be the same one and
+        // this would deadlock on itself.
+        if account != "root" {
+            let _mine = AccountLock::acquire(&base, &account).expect("lock");
+            AccountLock::acquire(&base, "root").expect("another account is not blocked");
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 

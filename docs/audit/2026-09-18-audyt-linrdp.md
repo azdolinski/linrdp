@@ -1,5 +1,7 @@
 # Audyt kodu LinRDP — 18 września 2026
 
+> Weryfikacja napraw: [drugi przebieg audytu](2026-09-18-audyt-linrdp-runda-2.md), commit `35caab4`. Dopiski „Naprawiono” poniżej są deklaracjami implementacji; drugi raport zawiera ich niezależną ocenę i pozostałe defekty.
+
 Badany commit: `5f6fb9cdeec2819dc2c7b2c8fbcfdde372be99c6`. Drzewo robocze przed audytem było czyste. Raport dotyczy stanu rozwiązania, a nie regresji konkretnego PR. Zgodnie z prośbą zakres skilla `review-agent` rozszerzono na istniejące defekty i zapis raportu; kod produkcyjny pozostał niezmieniony. Nie znaleziono obowiązujących plików AGENTS.md w sprawdzonych katalogach nadrzędnych ani repozytorium.
 
 ## Ustalenia — od najpoważniejszych

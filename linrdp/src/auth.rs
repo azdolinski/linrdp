@@ -223,11 +223,27 @@ pub(crate) fn decide(username: &str, password: &str) -> Login {
     match crate::pam::authenticate(username, password) {
         Ok(true) => return Login::Accept,
         Ok(false) => return Login::Deny(format!("PAM ({}) refused", crate::pam::login_service())),
-        Err(reason) => {
+        // The stack exists and did not run. That is not the same as there
+        // being no stack, and treating it as such was a hole: a `pam_start`
+        // failure — after libpam had loaded perfectly well — used to hand the
+        // decision to `/etc/shadow`, which knows nothing about `pam_access`,
+        // `pam_time`, or anything else the stack would have applied. A correct
+        // local password plus an unexpired shadow entry was then an `Accept`
+        // with the policy never consulted. Refuse instead: a policy that
+        // cannot run closes the door.
+        Err(crate::pam::NoVerdict::BackendFailed(reason)) => {
+            return Login::Unavailable(format!(
+                "the PAM stack ({}) failed and no other source may stand in for it: {reason}",
+                crate::pam::login_service()
+            ));
+        }
+        // No libpam on this machine at all. There is no policy here to bypass,
+        // so `/etc/shadow` is the authority by default rather than by failure.
+        Err(crate::pam::NoVerdict::NotInstalled(reason)) => {
             tracing::warn!(
                 %username,
                 %reason,
-                "PAM is unavailable — falling back to /etc/shadow, which cannot apply \
+                "PAM is not installed — falling back to /etc/shadow, which cannot apply \
                  pam_access, pam_time or pam_faillock"
             );
         }
@@ -601,6 +617,38 @@ future:$6$x$y:19000:0:99999:7::20500:
             account_policy_in("alice:$6$x$y:19000:0:99999:7:::\n", "bob", 20_000).is_err(),
             "no record and no PAM means no basis to allow the login"
         );
+    }
+
+    /// A PAM stack that exists and breaks is not a PAM stack that is absent.
+    ///
+    /// Regression: `decide` fell back to `/etc/shadow` on *any* error from
+    /// `pam::authenticate`, and `pam_start` failing — after libpam had loaded
+    /// perfectly well — produced exactly that error. A correct local password
+    /// plus an unexpired shadow entry was then an `Accept`, with `pam_access`,
+    /// `pam_time` and the rest of the stack never consulted. The two cases now
+    /// have different types, and only one of them may fall back.
+    #[test]
+    fn a_broken_pam_stack_closes_the_door_while_an_absent_one_falls_back() {
+        use crate::pam::NoVerdict;
+
+        assert!(
+            matches!(fallback_allowed(&NoVerdict::NotInstalled("no libpam.so.0".to_owned())), true),
+            "a machine with no libpam has no policy to bypass"
+        );
+        assert!(
+            !fallback_allowed(&NoVerdict::BackendFailed("pam_start: 3".to_owned())),
+            "a stack that failed to run must not be stood in for"
+        );
+
+        // And the refusal is an Unavailable, which callers treat as "closed",
+        // never a Deny that could be mistaken for a wrong password.
+        let outcome = Login::Unavailable("the PAM stack (linrdp) failed".to_owned());
+        assert!(authorize_for_desktop_from(outcome).is_err());
+    }
+
+    /// The rule `decide` applies, as a value that can be asserted on.
+    fn fallback_allowed(reason: &crate::pam::NoVerdict) -> bool {
+        matches!(reason, crate::pam::NoVerdict::NotInstalled(_))
     }
 
     /// Nothing may be accepted on a "cannot tell".

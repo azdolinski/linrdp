@@ -271,8 +271,12 @@ sudo systemctl enable --now linrdp    # `service install` has already done this
 One process binds every listener in the configuration and forks a worker per
 connection, each serving its own user's desktop. There are no service flags:
 the only arguments linrdp takes are `--config <PATH>` to read a file somewhere
-else, and `--listener <ADDRESS:PORT>` to serve one listener in the foreground
-without forking, which is the shape to use while working on the code.
+else, and `--listener <ADDRESS:PORT>` to serve one listener in this process
+without forking. That last one is limited to `session.console.enabled`, where
+every connection shows the same screen: a single process cannot route per-user
+sessions, because the session gate binds once and the second person to connect
+would have nowhere to go. To work on the code, use `linrdp debug` — the
+supervisor, with a louder log.
 
 An argument linrdp does not recognise stops it rather than being ignored — a
 machine still carrying an old unit that said `--auth system` would otherwise

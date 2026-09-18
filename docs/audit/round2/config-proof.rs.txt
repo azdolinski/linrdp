@@ -1,0 +1,8 @@
+#![allow(dead_code)]
+#[path="__REPO__/linrdp/src/config/mod.rs"] mod config;
+fn main() {
+ let body="listeners:\n  - bind: 127.0.0.1:3389\n    auth: both\nlimits:\n  max_workers: 0\n  max_per_client: 0\n  handshake_seconds: 0\n";
+ let parsed:config::Config=serde_norway::from_str(body).unwrap();
+ assert!(config::validate(&parsed).is_ok());
+ println!("R09 CONFIRMED: production YAML parser and validator accept all three limits equal to zero");
+}

@@ -157,7 +157,18 @@ impl Greeter {
         let owner = privilege::lookup_user("root").context("look up root for the logon screen")?;
         // Its own runtime directory, not root's: the greeter's cookie must not
         // sit where a real root session keeps its own.
+        //
+        // Created here, by the half of the code that owns this directory's
+        // lifecycle — `Drop` removes it again a few lines below. `write_cookie`
+        // creates only the `linrdp` directory *inside* a runtime that already
+        // exists, because for a real session that runtime is `pam_systemd`'s to
+        // make and a cookie writer has no business creating one. The logon
+        // screen has no PAM session, so nobody else would.
         let runtime = state_dir.join(format!("greeter-{display_number}"));
+        std::fs::create_dir_all(&runtime)
+            .with_context(|| format!("create the logon screen's runtime directory {}", runtime.display()))?;
+        std::fs::set_permissions(&runtime, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .with_context(|| format!("chmod 0700 {}", runtime.display()))?;
         let runtime = runtime.to_string_lossy().into_owned();
         let cookie = xauth::write_cookie(&runtime, display_number, &owner).context("write the logon screen's cookie")?;
         let xauthority = cookie.to_string_lossy().into_owned();

@@ -38,7 +38,7 @@ sudo install -m755 target/release/linrdp /usr/local/bin/linrdp
 sudo linrdp service install
 # 0.0.0.0:3389; login/hasło: dowolne konto systemowe (np. linrdptest/test123)
 # Konfiguracja: /etc/linrdp/config.yaml — `sudo linrdp config` albo `linrdp config --print`
-# Praca nad kodem, bez forkowania: sudo ./target/debug/linrdp --listener 0.0.0.0:3389
+# Praca nad kodem: sudo ./target/debug/linrdp debug trace   (supervisor, tylko głośniejszy)
 ```
 
 ## Kolejność dalszych prac

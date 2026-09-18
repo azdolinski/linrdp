@@ -230,13 +230,19 @@ pub(crate) struct Features {
     pub(crate) wayland: bool,
 }
 
-/// What one unauthenticated client may cost this host.
+/// What a client may cost this host.
 ///
 /// Every accepted TCP connection forks a worker, and a worker that never
 /// finishes negotiating never exits — so without these a client that opens
 /// sockets and then says nothing consumed processes, memory and descriptors
-/// until the host ran out of one of them. Nothing here applies to a session
-/// that has authenticated.
+/// until the host ran out of one of them.
+///
+/// Read the two counts as what they are: a worker is registered from `accept`
+/// until the process exits, and authenticating does not deregister it. So
+/// `max_workers` and `max_per_client` bound *live connections*, including
+/// established sessions — and `max_per_client` counts by source address,
+/// which puts everyone behind one NAT in the same bucket. Only
+/// `handshake_seconds` is specific to the unauthenticated phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub(crate) struct Limits {
