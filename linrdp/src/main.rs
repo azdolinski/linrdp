@@ -8,6 +8,7 @@
 
 mod atomic;
 mod auth;
+mod build_info;
 mod capture;
 mod clipboard;
 mod config;

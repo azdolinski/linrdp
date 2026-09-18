@@ -11,6 +11,11 @@ use std::path::{Path, PathBuf};
 /// The one unit linrdp installs.
 pub(crate) const UNIT_NAME: &str = "linrdp.service";
 
+/// Where it is written. Named here rather than only in the install layout,
+/// because `doctor` asks whether the unit is there without installing
+/// anything.
+pub(crate) const UNIT_DIR: &str = "/etc/systemd/system";
+
 /// A unit that is about to stop applying, and what it used to start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Displaced {

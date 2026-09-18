@@ -34,6 +34,43 @@ struct SessionRow {
     exec: String,
 }
 
+/// One line of the `linrdp` block. Unlike a [`Fact`], a value here can be a
+/// live state rather than a description of the machine, and the one that is —
+/// whether anything is serving right now — is drawn in colour, for the same
+/// reason the session that would start is: it is what the eye goes looking
+/// for.
+struct Status {
+    key: &'static str,
+    value: String,
+    /// Draw the value green. Reserved for a state somebody wants to see, so
+    /// that a report with nothing green in it is a report worth reading.
+    good: bool,
+}
+
+/// What this binary is, and what the machine has done with it. Probed by the
+/// caller, like everything else in this report, so that the report itself
+/// stays a value.
+struct Installation {
+    version: String,
+    build: String,
+    /// Whether there is a systemd here to have a unit at all. A machine
+    /// without one is not missing anything — `linrdp daemon` is how it runs
+    /// the server — and telling it to run `service install` would be telling
+    /// it to run something that cannot work.
+    systemd: bool,
+    unit_installed: bool,
+    /// What is serving right now, whichever way it was started.
+    serving: Option<Serving>,
+}
+
+/// How the running server was started. Not interchangeable: the command that
+/// stops one does not stop the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Serving {
+    Unit,
+    Daemon { pid: u32 },
+}
+
 /// Something that wants the operator's attention. A met requirement is not a
 /// finding: it is already visible as a fact above.
 enum Finding {
@@ -43,6 +80,8 @@ enum Finding {
 
 /// What `doctor` has to say, before anything decides how to draw it.
 struct Report {
+    /// What this binary is, and what the machine has done with it.
+    linrdp: Vec<Status>,
     system: Vec<Fact>,
     authentication: Vec<Fact>,
     /// Header of the session table; names the session that would start.
@@ -80,6 +119,7 @@ fn build(
     sam_path: &Path,
     pam_capture: bool,
     service: &ConfiguredService,
+    installation: &Installation,
 ) -> Report {
     let listeners = service.listeners.as_slice();
     let config_problem = service.problem.as_deref();
@@ -98,6 +138,40 @@ fn build(
             items.join(", ")
         }
     };
+
+    // What this binary is, and what the machine has done with it. It leads
+    // the report because a report that does not say which linrdp produced it
+    // cannot be acted on, and because "is it even running" is asked before
+    // any question about the machine is.
+    let linrdp = vec![
+        Status { key: "version", value: installation.version.clone(), good: false },
+        Status { key: "build", value: installation.build.clone(), good: false },
+        Status {
+            key: "service",
+            // Each state names the command that changes it: "not installed"
+            // on its own sends the operator back to the help to find out what
+            // installs it.
+            value: if !installation.systemd {
+                "no systemd here — `sudo linrdp daemon start` runs it without one".to_owned()
+            } else if installation.unit_installed {
+                "installed".to_owned()
+            } else {
+                "not installed — `sudo linrdp service install` writes the unit".to_owned()
+            },
+            good: false,
+        },
+        Status {
+            key: "started",
+            value: match installation.serving {
+                Some(Serving::Unit) => "yes".to_owned(),
+                // Named, because the command that stops this one is not the
+                // command that stops a unit.
+                Some(Serving::Daemon { pid }) => format!("yes (linrdp daemon, pid {pid})"),
+                None => "no".to_owned(),
+            },
+            good: installation.serving.is_some(),
+        },
+    ];
 
     let system = vec![
         Fact { key: "distribution", value: caps.distro.clone() },
@@ -228,7 +302,7 @@ fn build(
         Finding::Warning(_) => 1,
     });
 
-    Report { system, authentication, sessions_title, sessions, findings }
+    Report { linrdp, system, authentication, sessions_title, sessions, findings }
 }
 
 /// A `key  value` block, keys aligned, ready to be hung off a gutter.
@@ -237,6 +311,25 @@ fn facts_block(title: &str, facts: &[Fact]) -> String {
     let mut block = title.to_owned();
     for fact in facts {
         block.push_str(&format!("\n{key:<width$}  {value}", key = fact.key, value = fact.value));
+    }
+    block
+}
+
+/// The `linrdp` block: aligned like a fact block, but a value in it can be a
+/// state rather than a description, and a state is worth a colour.
+fn status_block(title: &str, rows: &[Status]) -> String {
+    let width = rows.iter().map(|row| row.key.chars().count()).max().unwrap_or(0);
+    let mut block = title.to_owned();
+    for row in rows {
+        // Green for what is up, and the terminal's own colour for what is
+        // not. Not red: a service nobody has started yet is a state, and red
+        // would say the machine is broken when nothing about it is.
+        let value = if row.good {
+            Style::new().green().apply_to(&row.value)
+        } else {
+            Style::new().apply_to(&row.value)
+        };
+        block.push_str(&format!("\n{key:<width$}  {value}", key = row.key));
     }
     block
 }
@@ -307,6 +400,7 @@ fn render(report: &Report, theme: &dyn Theme) -> String {
     let section = theme.state_symbol(&ThemeState::Submit);
 
     let mut out = theme.format_intro("linrdp doctor");
+    out.push_str(&theme.format_log(&status_block("linrdp", &report.linrdp), &section));
     out.push_str(&theme.format_log(&facts_block("system", &report.system), &section));
     out.push_str(&theme.format_log(&facts_block("authentication", &report.authentication), &section));
     out.push_str(&theme.format_log(&sessions_block(&report.sessions_title, &report.sessions), &section));
@@ -367,6 +461,33 @@ fn configured_listeners() -> Vec<AuthListener> {
         .collect()
 }
 
+/// What this binary is, and what the machine has done with it.
+///
+/// Asked of the machine rather than of the configuration: whether the unit
+/// `service install` writes is there, whether systemd says it is up, and —
+/// for the machines with no systemd at all, which is what `linrdp daemon`
+/// exists for — whether a supervisor started by hand is answering.
+fn probe_installation(config: &crate::config::Config) -> Installation {
+    use crate::service::unit;
+
+    // One call answers both halves: `None` is a machine with no systemctl to
+    // run, `Some(false)` a systemd that has not been asked to start this.
+    let active = unit::systemctl(&["is-active", "--quiet", unit::UNIT_NAME]);
+    let serving = if active == Some(true) {
+        Some(Serving::Unit)
+    } else {
+        crate::daemon::look(&crate::daemon::ports_of(config)).map(|found| Serving::Daemon { pid: found.pid })
+    };
+
+    Installation {
+        version: crate::build_info::VERSION.to_owned(),
+        build: crate::build_info::build(),
+        systemd: active.is_some(),
+        unit_installed: unit::path_in(Path::new(unit::UNIT_DIR), unit::UNIT_NAME).exists(),
+        serving,
+    }
+}
+
 /// Probe this machine and print the report on stdout.
 pub(crate) fn run() -> anyhow::Result<()> {
     let caps = detect::probe();
@@ -381,7 +502,15 @@ pub(crate) fn run() -> anyhow::Result<()> {
         present: crate::config::path().exists(),
         problem,
     };
-    let report = build(&caps, &accounts, &sam::sam_path(), pam_capture_wired(), &service);
+    let installation = probe_installation(&config);
+    let report = build(
+        &caps,
+        &accounts,
+        &sam::sam_path(),
+        pam_capture_wired(),
+        &service,
+        &installation,
+    );
     print!("{}", render(&report, &DoctorTheme));
     Ok(())
 }
@@ -979,6 +1108,131 @@ mod tests {
         ConfiguredService { listeners: listeners(modes), present: true, problem: None }
     }
 
+    /// A machine that has installed the service and is running it.
+    fn installation() -> Installation {
+        Installation {
+            version: "0.1.0".to_owned(),
+            build: "35a421b, release, 2026-09-18".to_owned(),
+            systemd: true,
+            unit_installed: true,
+            serving: Some(Serving::Unit),
+        }
+    }
+
+    fn linrdp_row<'a>(report: &'a Report, key: &str) -> &'a Status {
+        report
+            .linrdp
+            .iter()
+            .find(|row| row.key == key)
+            .unwrap_or_else(|| panic!("the linrdp block has a `{key}` row"))
+    }
+
+    /// A healthy machine, so that a test about the block at the top is not
+    /// also a test about the four sections under it.
+    fn report_for(installation: &Installation) -> Report {
+        let caps = healthy(vec![session("xfce", SessionKind::X11, true)]);
+        build(
+            &caps,
+            &accounts(),
+            sam(),
+            true,
+            &service(&[crate::config::Auth::Both]),
+            installation,
+        )
+    }
+
+
+    /// A version alone does not identify a binary — 0.1.0 has been every
+    /// commit on this branch — so the report opens with what was actually
+    /// built, which is the thing a bug report can then name.
+    #[test]
+    fn the_report_opens_with_the_version_and_the_build() {
+        let report = report_for(&installation());
+        assert_eq!(linrdp_row(&report, "version").value, "0.1.0");
+        assert_eq!(linrdp_row(&report, "build").value, "35a421b, release, 2026-09-18");
+    }
+
+    /// "Is it actually running" is what this report is opened for often
+    /// enough that the answer is the one thing in the block wearing a colour.
+    #[test]
+    fn a_service_systemd_has_started_is_the_one_green_thing_in_the_block() {
+        let report = report_for(&installation());
+        let started = linrdp_row(&report, "started");
+        assert_eq!(started.value, "yes");
+        assert!(started.good, "a running service is green");
+        assert_eq!(linrdp_row(&report, "service").value, "installed");
+        assert!(!linrdp_row(&report, "version").good, "a version is not a state");
+    }
+
+    /// Installed and stopped is a state, not a fault: nothing here is broken,
+    /// it simply has not been started. So it says so in the terminal's own
+    /// colour rather than in red.
+    #[test]
+    fn an_installed_service_that_is_not_running_says_no_without_colour() {
+        let report = report_for(&Installation { serving: None, ..installation() });
+        let started = linrdp_row(&report, "started");
+        assert_eq!(started.value, "no");
+        assert!(!started.good);
+    }
+
+    /// This report is read on machines where nothing has been installed yet,
+    /// and "not installed" without the command that installs it sends the
+    /// operator back to the help.
+    #[test]
+    fn a_machine_with_no_unit_is_told_what_writes_one() {
+        let report = report_for(&Installation {
+            unit_installed: false,
+            serving: None,
+            ..installation()
+        });
+        let value = &linrdp_row(&report, "service").value;
+        assert!(value.starts_with("not installed"), "got {value:?}");
+        assert!(value.contains("linrdp service install"), "and what writes one: {value:?}");
+    }
+
+    /// A container, a chroot, a distribution that does not use systemd: there
+    /// is no unit to be missing, and `service install` is not the command
+    /// that helps.
+    #[test]
+    fn a_machine_without_systemd_is_pointed_at_the_daemon_rather_than_the_unit() {
+        let report = report_for(&Installation {
+            systemd: false,
+            unit_installed: false,
+            serving: None,
+            ..installation()
+        });
+        let value = &linrdp_row(&report, "service").value;
+        assert!(value.contains("linrdp daemon"), "got {value:?}");
+        assert!(!value.contains("service install"), "which is not the command here: {value:?}");
+    }
+
+    /// `linrdp daemon start` serves RDP as surely as the unit does. Saying
+    /// "started no" beside a supervisor answering on 3389 would be the report
+    /// contradicting the machine.
+    #[test]
+    fn a_supervisor_started_by_the_daemon_is_running_even_though_no_unit_is() {
+        let report = report_for(&Installation {
+            systemd: false,
+            unit_installed: false,
+            serving: Some(Serving::Daemon { pid: 4321 }),
+            ..installation()
+        });
+        let started = linrdp_row(&report, "started");
+        assert!(started.good, "something is serving: {:?}", started.value);
+        assert!(started.value.starts_with("yes"), "got {:?}", started.value);
+        assert!(started.value.contains("4321"), "and which process it is: {:?}", started.value);
+    }
+
+    /// First, because "what is this binary, and is it running" is asked
+    /// before anything about the machine under it.
+    #[test]
+    fn the_linrdp_block_is_drawn_before_everything_it_reports_about() {
+        let drawn = render(&report_for(&installation()), &DoctorTheme);
+        let at = |needle: &str| drawn.find(needle).unwrap_or_else(|| panic!("{needle} is drawn"));
+        assert!(at("version") < at("distribution"), "the block comes first:\n{drawn}");
+        assert!(at("started") < at("logind"), "all of it, not just its head:\n{drawn}");
+    }
+
     /// The old report restated every met requirement ("ok logind: available")
     /// directly under the facts that already said so. A finding is now only
     /// what the operator has to do something about, so a healthy machine ends
@@ -986,7 +1240,7 @@ mod tests {
     #[test]
     fn met_requirements_do_not_become_findings() {
         let caps = healthy(vec![session("xfce", SessionKind::X11, true)]);
-        let report = build(&caps, &accounts(), sam(), true, &service(&[crate::config::Auth::Both]));
+        let report = build(&caps, &accounts(), sam(), true, &service(&[crate::config::Auth::Both]), &installation());
         assert!(
             report.findings.is_empty(),
             "a healthy machine has nothing for the operator to read"
@@ -1003,7 +1257,7 @@ mod tests {
             session("xfce", SessionKind::X11, true),
             session("lightdm-xsession", SessionKind::X11, false),
         ]);
-        let report = build(&caps, &accounts(), sam(), true, &service(&[crate::config::Auth::Both]));
+        let report = build(&caps, &accounts(), sam(), true, &service(&[crate::config::Auth::Both]), &installation());
 
         let status = |id: &str| {
             report
@@ -1029,7 +1283,7 @@ mod tests {
     #[test]
     fn an_unwired_pam_capture_is_a_blocker() {
         let caps = healthy(vec![session("xfce", SessionKind::X11, true)]);
-        let report = build(&caps, &accounts(), sam(), false, &service(&[crate::config::Auth::Both]));
+        let report = build(&caps, &accounts(), sam(), false, &service(&[crate::config::Auth::Both]), &installation());
 
         assert_eq!(report.blockers(), 1);
         let capture = report
@@ -1046,7 +1300,7 @@ mod tests {
     #[test]
     fn auth_system_does_not_need_the_pam_capture() {
         let caps = healthy(vec![session("xfce", SessionKind::X11, true)]);
-        let report = build(&caps, &accounts(), sam(), false, &service(&[crate::config::Auth::System]));
+        let report = build(&caps, &accounts(), sam(), false, &service(&[crate::config::Auth::System]), &installation());
 
         assert_eq!(report.blockers(), 0, "the mode in use needs no capture");
         let capture = report
@@ -1069,6 +1323,7 @@ mod tests {
             sam(),
             true,
             &service(&[crate::config::Auth::Both, crate::config::Auth::Greeter]),
+            &installation(),
         );
         let fact = report
             .authentication
@@ -1092,6 +1347,7 @@ mod tests {
             sam(),
             false,
             &service(&[crate::config::Auth::System, crate::config::Auth::Nla]),
+            &installation(),
         );
         assert_eq!(report.blockers(), 1, "the nla listener still needs it");
     }
@@ -1107,6 +1363,7 @@ mod tests {
             sam(),
             false,
             &service(&[crate::config::Auth::System, crate::config::Auth::Greeter]),
+            &installation(),
         );
         assert_eq!(report.blockers(), 0);
     }
@@ -1127,6 +1384,7 @@ mod tests {
                 present: true,
                 problem: Some("listeners[0].auth: unknown variant `greter`".to_owned()),
             },
+            &installation(),
         );
         let blocker = report
             .findings
@@ -1148,7 +1406,7 @@ mod tests {
     #[test]
     fn no_captured_password_yet_is_a_warning_not_a_blocker() {
         let caps = healthy(vec![session("xfce", SessionKind::X11, true)]);
-        let report = build(&caps, &[], sam(), true, &service(&[crate::config::Auth::Both]));
+        let report = build(&caps, &[], sam(), true, &service(&[crate::config::Auth::Both]), &installation());
 
         assert_eq!(report.blockers(), 0);
         assert!(
@@ -1163,13 +1421,33 @@ mod tests {
     fn a_blocked_machine_says_so_in_the_footer() {
         let caps = healthy(vec![session("xfce", SessionKind::X11, true)]);
 
-        let blocked = render(&build(&caps, &accounts(), sam(), false, &service(&[crate::config::Auth::Both])), &DoctorTheme);
+        let blocked = render(
+            &build(
+                &caps,
+                &accounts(),
+                sam(),
+                false,
+                &service(&[crate::config::Auth::Both]),
+                &installation(),
+            ),
+            &DoctorTheme,
+        );
         assert!(
             blocked.contains("1 blocker(s): per-user sessions cannot run"),
             "got {blocked}"
         );
 
-        let working = render(&build(&caps, &accounts(), sam(), true, &service(&[crate::config::Auth::Both])), &DoctorTheme);
+        let working = render(
+            &build(
+                &caps,
+                &accounts(),
+                sam(),
+                true,
+                &service(&[crate::config::Auth::Both]),
+                &installation(),
+            ),
+            &DoctorTheme,
+        );
         assert!(
             working.contains("Per-user sessions can run on this machine."),
             "got {working}"
@@ -1183,7 +1461,7 @@ mod tests {
         let mut caps = healthy(vec![session("xfce", SessionKind::X11, true)]);
         caps.x_servers.clear();
         caps.lockers.clear();
-        let report = build(&caps, &[], sam(), true, &service(&[crate::config::Auth::Both]));
+        let report = build(&caps, &[], sam(), true, &service(&[crate::config::Auth::Both]), &installation());
 
         assert!(report.blockers() >= 1);
         let first_warning = report

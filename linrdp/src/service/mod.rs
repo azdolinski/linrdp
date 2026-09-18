@@ -47,7 +47,7 @@ impl Layout {
                 .parent()
                 .unwrap_or(Path::new("/etc/linrdp"))
                 .to_path_buf(),
-            unit_dir: PathBuf::from("/etc/systemd/system"),
+            unit_dir: PathBuf::from(unit::UNIT_DIR),
             pam_dir: PathBuf::from("/etc/pam.d"),
             state: PathBuf::from("/var/lib/linrdp"),
             cert: PathBuf::from(crate::tls::CERT_DIR),
