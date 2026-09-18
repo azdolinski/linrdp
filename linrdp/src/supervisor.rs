@@ -1,22 +1,88 @@
-//! The supervisor: accept, fork, reap. It never speaks RDP.
+//! The supervisor: bind, accept, fork, reap. It never speaks RDP.
 //!
 //! Forking before any protocol runs is what removes the routing problem.
 //! The child learns which desktop to serve from its own CredSSP exchange,
 //! not from the client-supplied X.224 `mstshash` cookie — that field is
 //! unauthenticated and must never decide whose desktop someone reaches.
+//!
+//! One process owns every listener the configuration names. It used to own
+//! exactly one, which is why serving a second port meant a second systemd unit
+//! with a second copy of every setting in its `ExecStart`.
 
-use std::net::SocketAddr;
+use std::net::TcpListener;
+use std::os::fd::AsRawFd as _;
+use std::time::Duration;
 
 use anyhow::Context as _;
 
-/// Accept connections and fork a worker for each.
+use crate::config::{self, Config};
+
+/// A listening socket and the configuration line that produced it.
+#[derive(Debug)]
+pub(crate) struct Bound {
+    listener: TcpListener,
+    /// The `bind` literal from the file, handed to the worker verbatim. Not a
+    /// re-formatted `SocketAddr`: `0.0.0.0:3389`, `[::]:3389` and
+    /// `[::ffff:0.0.0.0]:3389` can name one socket, and `Display` hands back a
+    /// spelling the operator never wrote, which the worker would then fail to
+    /// find in the very file it came from.
+    bind: String,
+}
+
+/// Bind every listener the configuration names, or none of them.
 ///
-/// A blocking listener deliberately: the supervisor has no async work, and
-/// `fork` in a multi-threaded tokio runtime is a footgun — only the calling
-/// thread survives in the child, so any runtime state is poisoned.
-pub(crate) fn run(bind: SocketAddr, worker_argv: &[String]) -> anyhow::Result<()> {
-    let listener = std::net::TcpListener::bind(bind).with_context(|| format!("bind {bind}"))?;
-    tracing::info!(%bind, "supervisor listening — forking a worker per connection");
+/// A partial start is worse than no start. The shape this replaces is one port
+/// for every client and one for the PAM-free logon screen; if the first fails
+/// and the second succeeds, the process is *healthy*, so `Restart=on-failure`
+/// never fires and monitoring stays green while the port everybody uses is
+/// dead. Exiting hands both of those back for free.
+///
+/// Every failure is reported, not just the first: an operator with two typos
+/// should learn both in one run.
+pub(crate) fn bind_all(config: &Config) -> anyhow::Result<Vec<Bound>> {
+    let mut bound = Vec::new();
+    let mut failures = Vec::new();
+
+    for listener in &config.listeners {
+        match TcpListener::bind(listener.bind.as_str()) {
+            Ok(socket) => bound.push(Bound { listener: socket, bind: listener.bind.clone() }),
+            Err(error) => failures.push(format!("{}: {error}", listener.bind)),
+        }
+    }
+
+    if !failures.is_empty() {
+        // `bound` is dropped on the way out, so nothing stays half-open.
+        anyhow::bail!(
+            "cannot bind {} of {} listeners, so none of them were kept:\n  - {}",
+            failures.len(),
+            config.listeners.len(),
+            failures.join("\n  - ")
+        );
+    }
+
+    Ok(bound)
+}
+
+/// Accept on every listener and fork a worker for each connection.
+///
+/// One thread, `poll`, and no async runtime: `fork` in a multi-threaded tokio
+/// runtime is a footgun — only the calling thread survives in the child, so
+/// any runtime state is poisoned. That constraint is why this is a hand-rolled
+/// poll loop rather than anything built on mio.
+pub(crate) fn run(mut live: Vec<Bound>) -> anyhow::Result<()> {
+    anyhow::ensure!(!live.is_empty(), "no listeners to accept on");
+
+    for bound in &live {
+        // Not an optimisation. A connection reset between `poll` reporting
+        // POLLIN and `accept` running leaves `accept` blocking (see the BUGS
+        // section of select(2)) — with one listener that only stalled itself,
+        // with several it stalls every other port in this same thread.
+        bound
+            .listener
+            .set_nonblocking(true)
+            .with_context(|| format!("make {} non-blocking", bound.bind))?;
+        tracing::info!(bind = %bound.bind, "listening");
+    }
 
     // Reap children without blocking: a worker that exits must not become a
     // zombie, and the supervisor never waits on a specific child.
@@ -28,35 +94,124 @@ pub(crate) fn run(bind: SocketAddr, worker_argv: &[String]) -> anyhow::Result<()
     // default before exec — see `session::keeper::restore_default_sigchld`,
     // which documents what that cost us.
     //
+    // It also keeps a finished worker from waking `poll`, which is why this
+    // loop needs no child bookkeeping at all. Anyone who later wants per-
+    // listener worker counts will need a real SIGCHLD handler, and with it the
+    // EINTR that is handled below.
+    //
     // SAFETY: setting SIGCHLD to SIG_IGN is async-signal-safe and documented
     // on Linux to auto-reap.
     unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
 
     loop {
-        let (stream, peer) = match listener.accept() {
-            Ok(accepted) => accepted,
-            Err(error) => {
-                tracing::warn!(%error, "accept failed");
+        let mut fds: Vec<libc::pollfd> = live
+            .iter()
+            .map(|bound| libc::pollfd {
+                fd: bound.listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        let count = libc::nfds_t::try_from(fds.len()).expect("a handful of listeners");
+
+        // SAFETY: `fds` holds `count` initialised pollfd values for the whole
+        // call, and nothing else touches it meanwhile.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), count, -1) };
+
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            // SIGCHLD is ignored, but SIGWINCH, SIGHUP and the SIGCONT after a
+            // debugger's SIGSTOP all land here. Exiting on those would mean a
+            // server that dies when somebody attaches strace to it.
+            if error.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-        };
+            // A permanent poll error would otherwise spin, filling the log at
+            // the speed of the disk.
+            tracing::error!(%error, "poll failed — retrying");
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
 
-        // SAFETY: the supervisor is single-threaded here (no tokio runtime),
-        // so the child inherits a consistent address space.
-        match unsafe { libc::fork() } {
-            -1 => tracing::error!(error = %std::io::Error::last_os_error(), "fork failed"),
-            0 => {
-                crate::session::keeper::restore_default_sigchld();
-                exec_worker(stream, worker_argv);
-                // exec_worker only returns on failure.
-                std::process::exit(1);
+        let mut dead = Vec::new();
+        for (index, pollfd) in fds.iter().enumerate() {
+            if pollfd.revents & (libc::POLLNVAL | libc::POLLERR | libc::POLLHUP) != 0 {
+                dead.push(index);
+                continue;
             }
-            pid => {
-                tracing::debug!(%peer, pid, "forked worker");
-                drop(stream); // the child owns it now
+            if pollfd.revents & libc::POLLIN != 0 {
+                accept_all(&live[index]);
+            }
+        }
+
+        // A listening TCP socket does not die on its own; this is here to stop
+        // a bug in our own descriptor handling from becoming a busy loop that
+        // reports the same dead fd forever.
+        for index in dead.into_iter().rev() {
+            let gone = live.remove(index);
+            tracing::error!(
+                bind = %gone.bind,
+                "listening socket became unusable — this address is no longer served"
+            );
+        }
+        anyhow::ensure!(
+            !live.is_empty(),
+            "every listening socket is gone; there is nothing left to accept on"
+        );
+    }
+}
+
+/// Take every connection this listener has ready.
+///
+/// Level-triggered poll would report the socket again, but draining keeps one
+/// busy port from having to wait a full poll cycle per connection while a
+/// quiet one is checked.
+fn accept_all(bound: &Bound) {
+    loop {
+        match bound.listener.accept() {
+            Ok((stream, peer)) => {
+                // SAFETY: the supervisor is single-threaded here (no tokio
+                // runtime), so the child inherits a consistent address space.
+                match unsafe { libc::fork() } {
+                    -1 => tracing::error!(
+                        error = %std::io::Error::last_os_error(),
+                        bind = %bound.bind,
+                        "fork failed"
+                    ),
+                    0 => {
+                        crate::session::keeper::restore_default_sigchld();
+                        exec_worker(stream, &worker_argv(&bound.bind));
+                        // exec_worker only returns on failure.
+                        std::process::exit(1);
+                    }
+                    pid => {
+                        tracing::debug!(%peer, pid, bind = %bound.bind, "forked worker");
+                        drop(stream); // the child owns it now
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                tracing::warn!(bind = %bound.bind, %error, "accept failed");
+                return;
             }
         }
     }
+}
+
+/// Everything a worker is told, which is only which listener it is serving.
+///
+/// No setting appears here. A worker reads the same file the supervisor read
+/// and looks its listener up by this string, so there is no second place a
+/// value could come from and no flag that could silently outrank the file.
+fn worker_argv(bind: &str) -> Vec<String> {
+    let mut argv = vec!["--listener".to_owned(), bind.to_owned()];
+    if !config::path_is_default() {
+        argv.push("--config".to_owned());
+        argv.push(config::path().display().to_string());
+    }
+    argv
 }
 
 /// The path the supervisor should exec for each worker.
@@ -89,10 +244,21 @@ fn exec_worker(stream: std::net::TcpStream, argv: &[String]) {
     use std::os::fd::IntoRawFd as _;
 
     let fd = stream.into_raw_fd();
-    // SAFETY: dup2 onto a fd the child does not otherwise use; dup2 clears
-    // CLOEXEC on the copy, which is what lets it survive the exec.
+    // SAFETY: dup2 onto a descriptor the child does not otherwise use.
     if unsafe { libc::dup2(fd, 3) } < 0 {
         tracing::error!(error = %std::io::Error::last_os_error(), "worker: cannot place the socket on fd 3");
+        return;
+    }
+    // dup2 clears FD_CLOEXEC on the copy, which is what lets the socket
+    // survive the exec — except when oldfd == newfd, where POSIX says dup2
+    // does nothing at all, close-on-exec included. With a single listener the
+    // accepted socket could never land on fd 3; with several it can, and the
+    // worker would then have been exec'd onto a descriptor closed out from
+    // under it: EBADF, connection dropped, nothing in the log.
+    //
+    // SAFETY: fd 3 is the descriptor just established above.
+    if unsafe { libc::fcntl(3, libc::F_SETFD, 0) } < 0 {
+        tracing::error!(error = %std::io::Error::last_os_error(), "worker: cannot clear close-on-exec on fd 3");
         return;
     }
     let exe = match std::env::current_exe() {
@@ -136,6 +302,14 @@ fn exec_worker(stream: std::net::TcpStream, argv: &[String]) {
 mod tests {
     use super::*;
 
+    fn config_with(binds: &[&str]) -> Config {
+        let listeners = binds
+            .iter()
+            .map(|bind| format!("  - bind: {bind}\n    auth: both\n"))
+            .collect::<String>();
+        serde_norway::from_str(&format!("listeners:\n{listeners}")).expect("parses")
+    }
+
     /// A binary replaced underneath a running supervisor.
     ///
     /// Regression: `install` over `/usr/local/bin/linrdp` unlinks the old
@@ -158,5 +332,69 @@ mod tests {
         for path in ["/usr/local/bin/linrdp", "/opt/my (deleted) tools/linrdp", "linrdp"] {
             assert_eq!(worker_program(std::path::Path::new(path)), std::path::Path::new(path));
         }
+    }
+
+    /// The worker finds its settings by matching this string against the file,
+    /// so it has to be the string the file contains — not `SocketAddr`'s idea
+    /// of how to write the same address.
+    #[test]
+    fn the_listener_argument_is_the_bind_literal_verbatim() {
+        assert_eq!(worker_argv("[::1]:3389"), vec!["--listener".to_owned(), "[::1]:3389".to_owned()]);
+    }
+
+    /// Nothing but the listener's name reaches a worker. A setting smuggled in
+    /// here would outrank the configuration file silently, which is the whole
+    /// arrangement this replaces.
+    #[test]
+    fn a_worker_is_told_nothing_but_which_listener_it_serves() {
+        let argv = worker_argv("0.0.0.0:3389");
+        for flag in ["--auth", "--bind-addr", "--usb", "--console", "--fixed-size", "--display-range"] {
+            assert!(!argv.iter().any(|a| a == flag), "`{flag}` reached a worker through argv");
+        }
+    }
+
+    /// One unusable address takes the whole start down, and leaves nothing
+    /// bound behind it. A half-started supervisor looks healthy to systemd, so
+    /// `Restart=on-failure` would never fire on the port that is missing.
+    #[test]
+    fn one_unbindable_listener_refuses_the_whole_start() {
+        let occupied = TcpListener::bind("127.0.0.1:0").expect("a port to steal");
+        let taken = occupied.local_addr().expect("addr").to_string();
+        let free = {
+            let probe = TcpListener::bind("127.0.0.1:0").expect("a free port");
+            probe.local_addr().expect("addr").to_string()
+        };
+
+        let error = bind_all(&config_with(&[&free, &taken])).expect_err("refused");
+        assert!(format!("{error:#}").contains(&taken), "got: {error:#}");
+
+        TcpListener::bind(free.as_str()).expect("the first port was not left bound");
+    }
+
+    /// Two typos, one restart.
+    #[test]
+    fn every_bind_failure_is_reported_not_just_the_first() {
+        let first = TcpListener::bind("127.0.0.1:0").expect("port");
+        let second = TcpListener::bind("127.0.0.1:0").expect("port");
+        let a = first.local_addr().expect("addr").to_string();
+        let b = second.local_addr().expect("addr").to_string();
+
+        let error = format!("{:#}", bind_all(&config_with(&[&a, &b])).expect_err("refused"));
+        assert!(error.contains(&a) && error.contains(&b), "got: {error}");
+        assert!(error.contains("cannot bind 2 of 2"), "got: {error}");
+    }
+
+    #[test]
+    fn a_configuration_that_binds_cleanly_yields_one_socket_per_listener() {
+        let ports: Vec<String> = (0..2)
+            .map(|_| {
+                let probe = TcpListener::bind("127.0.0.1:0").expect("port");
+                probe.local_addr().expect("addr").to_string()
+            })
+            .collect();
+        let refs: Vec<&str> = ports.iter().map(String::as_str).collect();
+        let bound = bind_all(&config_with(&refs)).expect("both bind");
+        assert_eq!(bound.len(), 2);
+        assert_eq!(bound[0].bind, ports[0]);
     }
 }

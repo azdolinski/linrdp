@@ -43,57 +43,49 @@ use crate::input::X11InputHandler;
 
 const HELP: &str = "\
 USAGE:
-  linrdp [--bind-addr <ADDR>] [--auth both|nla|system] [--usb]
-         [--fixed-size <WxH>] [--config <PATH>]
+  linrdp                       serve every listener in the configuration
+  linrdp doctor [<account>]    report what this machine, or one account, can do
+  linrdp service install       install the systemd unit and the config file
+  linrdp service uninstall     remove what `service install` put there
+  linrdp config [--print]      browse and edit the configuration
 
 Serves a real Linux desktop over RDP.
 
-Authentication (--auth, default `both`):
-  both    Advertise TLS and CredSSP together and let each client negotiate the
-          strongest it supports, so there is no wrong port to connect to:
-          mstsc takes NLA, a client that cannot takes TLS and sends its
-          credentials in the Client Info PDU. Either way the password checked
-          is the account's system password.
-  nla     CredSSP/NTLMv2 only — the client's own credential prompt, which is
-          what every RDP client does out of the box. You log in with the account's
-          system password; there is no linrdp password to set, and no command
-          that sets one. NTLM does require the server to know the secret
-          (MS-NLMP: it computes the expected response from it), so linrdp
-          learns each password from the system's own authentication, the way
-          Samba's pam_smbpass did — see deploy/pam-capture. Authenticate once
-          on this machine (su -, ssh, console) and RDP works from then on.
-  system  TLS only. Refuses NLA, so nothing is ever stored — but a client
-          that only speaks NLA (mstsc) is refused with it.
+CONFIGURATION
 
-  `linrdp doctor` reports whether the capture is wired and whose password it
-  has seen.
+Everything is in /etc/linrdp/config.yaml, and that file describes itself: every
+key carries its meaning and every value its consequences, so `linrdp config` and
+`less /etc/linrdp/config.yaml` answer the same questions. The systemd unit takes
+no arguments and sets no environment; there is nowhere else for a setting to
+hide.
 
-Commands:
-  doctor                report what this machine is and what linrdp may do on
-                        it: X servers, desktop sessions (and whether their
-                        programs actually exist), PAM, logind, screen lockers
-  doctor <account>      report whether that one account can be served here:
-                        uid and home, whether its password is usable at all,
-                        whether a password has been captured for NLA, and
-                        whether it can have audio — with what to do when it
-                        cannot. Run it as root; /etc/shadow is not world
-                        readable
+  listeners       the addresses served, and how each one authenticates
+                  (`auth: both | nla | system | greeter`)
+  session         display range, pinned size, locking, the shared screen
+  features        USB redirection, UDP transport, AVC444v2, Wayland capture
+  tls             the certificate to serve, or none to keep a self-signed one
+  log             level and destination
 
-Multi-session:
-  --supervisor          accept on the bind address and fork one worker per
-                        connection; each worker serves its user's own desktop
-  --console             attach to $DISPLAY instead of a per-user session
-                        (the mstsc /admin equivalent, for the shared screen)
-  --serve-fd N          internal: serve the connection the supervisor handed
-                        over on descriptor N
+AUTHENTICATION
 
-Default bind: 0.0.0.0:3389. --usb enables USB device redirection (MS-RDPEUSB).
---fixed-size pins the desktop (e.g. 2880x1800): X is resized once at startup
-and clients scale locally — recommended with mstsc, which composes EGFX
-poorly right after a mid-session RandR resize.
+Whatever the listener offers, the password checked is the account's system
+password. There is no linrdp password to set and no command that sets one.
+CredSSP/NTLM does require the server to know the secret (MS-NLMP: it computes
+the expected response from it), so linrdp learns each password from the
+system's own authentication, the way Samba's pam_smbpass did — see
+deploy/pam-capture, which `linrdp service install` wires up for you. Authenticate
+once on this machine (su -, ssh, console) and RDP works from then on.
 
-Logging: `log.file` and `log.level` in /etc/linrdp/config.yaml. Every key that
-file carries is described in it; `linrdp config` edits it.
+`linrdp doctor` reports whether that capture is wired and whose password it has
+seen. `sudo linrdp doctor <account>` answers the narrower question the machine
+report cannot: will this account work here?
+
+OPTIONS
+
+  --config <PATH>    read a configuration file other than /etc/linrdp/config.yaml
+  --listener <ADDR>  serve just this one listener, in this process, without
+                     forking — the path to use while working on linrdp
+  --serve-fd <N>     internal: serve the connection the supervisor handed over
 ";
 
 /// Supervisor mode forks per connection, and `fork` in a multi-threaded
@@ -118,14 +110,55 @@ fn main() -> anyhow::Result<()> {
     if std::env::args().any(|arg| arg == "--keeper") {
         return keeper_main();
     }
-    if std::env::args().any(|arg| arg == "--supervisor") {
+
+    // Credential capture, invoked by `pam_exec` from the system PAM stack on
+    // every authentication this machine performs. Handled here, before any
+    // runtime is built: a `su` at the console should not be paying for a
+    // multi-threaded tokio runtime to hash one password.
+    if std::env::args().any(|arg| arg == "--capture-credential") {
+        capture_credential();
+        return Ok(());
+    }
+
+    // Serving one connection means a worker the supervisor forked
+    // (`--serve-fd`); serving one address in this very process means somebody
+    // working on linrdp (`--listener` alone). Everything else — which is to
+    // say the systemd unit, whose ExecStart carries no arguments at all — is
+    // the supervisor.
+    let serves_a_connection = std::env::args()
+        .any(|arg| arg == "--serve-fd" || arg == "--listener")
+        || std::env::args().any(|arg| arg == "-h" || arg == "--help");
+    if !serves_a_connection {
         return supervisor_main();
     }
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("build tokio runtime")?
         .block_on(serve())
+}
+
+/// Refuse arguments nothing recognised.
+///
+/// pico_args leaves unclaimed arguments behind and this crate never looked at
+/// them, so an unknown flag was silently dropped. After the move to a
+/// configuration file that silence is dangerous rather than merely untidy: a
+/// machine still carrying a stale unit that says `--auth system` would have
+/// got a server serving `both` — weaker than the operator wrote — with
+/// nothing anywhere saying so.
+fn refuse_leftovers(args: pico_args::Arguments) -> anyhow::Result<()> {
+    let leftovers = args.finish();
+    if leftovers.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<String> = leftovers.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+    anyhow::bail!(
+        "unrecognised argument(s): {}\n\nlinrdp is configured by {} alone — the settings \
+         that used to be flags are keys in that file, and `linrdp config` edits it.",
+        names.join(" "),
+        config::path().display()
+    )
 }
 
 /// Own one user's session for its whole life (see `session::keeper_main`).
@@ -285,16 +318,15 @@ fn capture_credential() {
 
 
 
-/// Accept on the bind address and fork a worker per connection.
+/// Bind every listener the configuration names and fork a worker per
+/// connection.
 fn supervisor_main() -> anyhow::Result<()> {
     let mut args = pico_args::Arguments::from_env();
-    let _ = args.contains("--supervisor");
-    let bind_addr: SocketAddr = args
-        .opt_value_from_str("--bind-addr")?
-        .unwrap_or_else(|| "0.0.0.0:3389".parse().expect("valid default bind addr"));
     if let Some(path) = args.opt_value_from_str::<_, PathBuf>("--config")? {
         config::set_path(path);
     }
+    refuse_leftovers(args)?;
+
     let loaded = config::load_or_default(config::path())?;
     setup_logging(&loaded.config.log);
     if loaded.from_defaults {
@@ -323,10 +355,8 @@ fn supervisor_main() -> anyhow::Result<()> {
         tracing::info!(sessions = locked, "locked sessions inherited from a previous supervisor");
     }
 
-    // Everything except --supervisor is handed to each worker unchanged, so
-    // the two roles share one command line.
-    let worker_argv: Vec<String> = std::env::args().skip(1).filter(|a| a != "--supervisor").collect();
-    supervisor::run(bind_addr, &worker_argv)
+    let bound = supervisor::bind_all(&loaded.config)?;
+    supervisor::run(bound)
 }
 
 async fn serve() -> anyhow::Result<()> {
@@ -336,77 +366,21 @@ async fn serve() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Credential capture, invoked by `pam_exec` from the system PAM stack.
-    //
-    // There is no command for setting a linrdp password and there must not be
-    // one: the account already has a password, and a second copy that a human
-    // maintains by hand is a copy that drifts. CredSSP/NTLM nonetheless needs
-    // the server to know the secret (MS-NLMP), so linrdp learns it the way
-    // Samba's pam_smbpass did — from the system's own authentication, as it
-    // happens, verified before it is kept.
-    if args.contains("--capture-credential") {
-        capture_credential();
-        return Ok(());
-    }
-
-    // How a login is verified.
-    //
-    // `nla` (the default): CredSSP/NTLMv2 — the client's own credential
-    // prompt, which is what mstsc and every other client does out of the box.
-    // NTLM's math (MS-NLMP) makes the server compute the expected response
-    // from the account secret, so linrdp must know it; it learns that from the
-    // system's own PAM stack (see `capture_credential`), never from a human
-    // typing a second password into linrdp.
-    //
-    // `system`: TLS, and whatever credentials the client sends in the Client
-    // Info PDU, checked against `/etc/shadow` and PAM. Nothing stored at all,
-    // but it needs a client that sends credentials without NLA.
-    let auth_mode = args
-        .opt_value_from_str::<_, String>("--auth")?
-        .unwrap_or_else(|| "both".to_owned());
-    if !matches!(auth_mode.as_str(), "both" | "nla" | "system" | "greeter") {
-        anyhow::bail!("--auth expects `both`, `nla`, `system` or `greeter`, got `{auth_mode}`");
-    }
-    let greeter_mode = auth_mode == "greeter";
-
-    let enable_usb = args.contains("--usb");
-
-    // Multi-session wiring. `--serve-fd` marks a worker forked by the
-    // supervisor: it serves exactly the one connection on that descriptor.
-    // `--console` is the mstsc /admin equivalent — attach to the ambient
-    // $DISPLAY (the shared screen) instead of a per-user session.
+    // `--serve-fd` marks a worker the supervisor forked: it serves exactly the
+    // one connection on that descriptor. `--listener` names which listener in
+    // the configuration this process is, and is the only thing a worker is
+    // ever told — every setting comes from the file both processes read.
     let serve_fd: Option<i32> = args.opt_value_from_str("--serve-fd")?;
-    let console_mode = args.contains("--console");
-
-    let bind_addr: SocketAddr = args
-        .opt_value_from_str("--bind-addr")?
-        .unwrap_or_else(|| "0.0.0.0:3389".parse().expect("valid default bind addr"));
-
+    let listener: String = args
+        .opt_value_from_str("--listener")?
+        .context("--listener <ADDRESS:PORT> says which listener from the configuration to serve")?;
     if let Some(path) = args.opt_value_from_str::<_, PathBuf>("--config")? {
         config::set_path(path);
     }
-
-    // Session lifecycle (KRdp SessionController pattern): lock the logind
-    // session when the last client disconnects / unlock on reconnect, and
-    // optionally flip the seat to the greeter when a client takes over.
-    let lock_session = args.contains("--lock-session");
-    let switch_to_greeter = args.contains("--switch-to-greeter");
-
-    let fixed_size: Option<(u16, u16)> = match args.opt_value_from_str::<_, String>("--fixed-size")? {
-        Some(spec) => {
-            let Some((w, h)) = spec.split_once(['x', 'X']) else {
-                anyhow::bail!("--fixed-size expects <WIDTHxHEIGHT>, e.g. 2880x1800");
-            };
-            Some((
-                w.trim().parse().context("--fixed-size width")?,
-                h.trim().parse().context("--fixed-size height")?,
-            ))
-        }
-        None => None,
-    };
+    refuse_leftovers(args)?;
 
     // A worker is answering "what did the operator ask for on this port?", and
-    // there is no safe guess at that: it loads strictly and refuses the
+    // there is no safe guess at that: it loads strictly, and refuses the
     // connection rather than serving one it invented. Without `--serve-fd`
     // this process is somebody running linrdp by hand on a machine that may
     // never have been configured, which is what the defaults are for.
@@ -415,18 +389,68 @@ async fn serve() -> anyhow::Result<()> {
     } else {
         let loaded = config::load_or_default(config::path())?;
         if loaded.from_defaults {
-            eprintln!(
-                "linrdp: no {} — using the built-in defaults",
-                config::path().display()
-            );
+            eprintln!("linrdp: no {} — using the built-in defaults", config::path().display());
         }
         loaded.config
     };
+
+    // The log block is service-wide and cannot be overridden, so it is
+    // readable before we know which listener this is — which matters, because
+    // failing to find the listener is exactly the failure that must not be
+    // silent.
     setup_logging(&config.log);
 
-    let display_range = config.session.display_range.range();
+    let effective = match config.effective(&listener) {
+        Ok(effective) => effective,
+        Err(error) => {
+            // Name the client. "Connection reset with nothing in the log" is
+            // the failure this whole file has fought before.
+            let peer = serve_fd.and_then(|fd| {
+                // SAFETY: the supervisor placed an accepted socket on this
+                // descriptor and this process owns it. Taking it here closes
+                // it on the way out, which is the intent: the connection is
+                // being refused.
+                let stream = unsafe { <std::net::TcpStream as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+                stream.peer_addr().ok()
+            });
+            tracing::error!(
+                listener = %listener,
+                config = %config::path().display(),
+                peer = peer.map(|p| p.to_string()).unwrap_or_default(),
+                error = format!("{error:#}"),
+                "refusing the connection: this listener is not in the configuration"
+            );
+            return Err(error);
+        }
+    };
 
-    // Seal a legacy cleartext store, once. In `--supervisor` mode the migration
+    let auth_mode = effective.auth;
+    let greeter_mode = auth_mode.is_greeter();
+    let enable_usb = effective.features.usb;
+    let console_mode = effective.session.console.enabled;
+    let display_range = effective.session.display_range.range();
+    let lock_session = effective.session.lock_on_disconnect;
+    let switch_to_greeter = effective.session.switch_to_greeter;
+    let fixed_size: Option<(u16, u16)> = effective.session.fixed_size.map(|s| (s.width, s.height));
+    let bind_addr: SocketAddr = effective
+        .bind
+        .parse()
+        .with_context(|| format!("listener `{}` is not an address and port", effective.bind))?;
+
+    // Console mode serves one screen that already exists. Which screen is a
+    // configuration answer and deliberately not an environment one: the unit
+    // carries no Environment=, and the fallback an absent $DISPLAY used to
+    // reach was `:99` — either somebody else's screen or nobody's.
+    if console_mode {
+        let display = effective.session.console.display.clone().context(
+            "session.console.enabled is set without session.console.display — there is no \
+             default for it, because guessing which screen to share serves somebody else's \
+             desktop to whoever connects",
+        )?;
+        session::gate::set_console(display, effective.session.console.xauthority.clone());
+    }
+
+    // Seal a legacy cleartext store, once. In the supervisor the migration
     // already ran there before any worker forked (see `supervisor_main`); only
     // the direct, single-process path needs it here. Guarding on `serve_fd`
     // keeps per-connection workers from re-reading the file on every login.
@@ -434,18 +458,21 @@ async fn serve() -> anyhow::Result<()> {
         sam::migrate_plaintext();
     }
 
-    match auth_mode.as_str() {
-        "nla" => {
+    // Matched on the enum, not on a string with a catch-all: a mode added
+    // later must be a compile error here rather than quietly inheriting
+    // whatever `both` does.
+    match auth_mode {
+        config::Auth::Nla => {
             tracing::info!(%bind_addr, "LinRDP starting — auth: NLA only (CredSSP/NTLM)");
             warn_if_no_accounts();
         }
-        "system" => {
+        config::Auth::System => {
             tracing::info!(%bind_addr, "LinRDP starting — auth: system password only (TLS, no NLA)");
         }
-        "greeter" => {
+        config::Auth::Greeter => {
             tracing::info!(%bind_addr, "LinRDP starting — auth: server-drawn logon screen (TLS, no NLA)");
         }
-        _ => {
+        config::Auth::Both => {
             tracing::info!(
                 %bind_addr,
                 "LinRDP starting — auth: NLA or TLS, whichever the client negotiates"
@@ -454,7 +481,7 @@ async fn serve() -> anyhow::Result<()> {
         }
     }
 
-    let identity = tls::load_or_generate_identity().context("failed to prepare TLS identity")?;
+    let identity = tls::load_or_generate_identity(&effective.tls).context("failed to prepare TLS identity")?;
     let acceptor = identity.make_acceptor().context("failed to build TLS acceptor")?;
 
     // Multi-session: the worker binds itself to the authenticated user's
@@ -522,15 +549,18 @@ async fn serve() -> anyhow::Result<()> {
     let autodetect_bw = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
     let pointer_cache = Arc::new(std::sync::atomic::AtomicU16::new(0));
 
-    // Capture/input backends. X11 is the default; `--wayland` (cargo
+    // Capture/input backends. X11 is the default; `features.wayland` (cargo
     // feature "wayland") negotiates an xdg-desktop-portal session instead:
     // PipeWire screencast for frames, libei over EIS for input.
+    //
+    // A build without the feature warns rather than refusing, so one
+    // configuration file can be deployed to a fleet of mixed builds.
     #[cfg(feature = "wayland")]
-    let use_wayland = args.contains("--wayland");
+    let use_wayland = effective.features.wayland;
     #[cfg(not(feature = "wayland"))]
     let use_wayland = {
-        if args.contains("--wayland") {
-            tracing::warn!("--wayland ignored: binary built without the \"wayland\" feature");
+        if effective.features.wayland {
+            tracing::warn!("features.wayland ignored: this binary was built without the \"wayland\" feature");
         }
         false
     };
@@ -567,7 +597,7 @@ async fn serve() -> anyhow::Result<()> {
         }
         #[cfg(not(feature = "wayland"))]
         {
-            unreachable!("--wayland without the wayland feature is rejected above")
+            unreachable!("features.wayland without the wayland feature is refused above")
         }
     } else {
         (
@@ -595,10 +625,10 @@ async fn serve() -> anyhow::Result<()> {
     // Every arm lands on the same builder state; only the advertised security
     // protocol differs (MS-RDPBCGR 5.4.5.1 negotiation).
     let builder = RdpServer::builder().with_addr(bind_addr);
-    let secured = match auth_mode.as_str() {
-        "nla" => builder.with_hybrid(acceptor, identity.pub_key.clone()),
-        "system" | "greeter" => builder.with_tls(acceptor),
-        _ => builder.with_hybrid_or_tls(acceptor, identity.pub_key.clone()),
+    let secured = match auth_mode {
+        config::Auth::Nla => builder.with_hybrid(acceptor, identity.pub_key.clone()),
+        config::Auth::System | config::Auth::Greeter => builder.with_tls(acceptor),
+        config::Auth::Both => builder.with_hybrid_or_tls(acceptor, identity.pub_key.clone()),
     };
     let mut server = secured
         .with_input_handler(input_handler)
@@ -610,6 +640,7 @@ async fn serve() -> anyhow::Result<()> {
             Arc::clone(&autodetect_baseline),
             Arc::clone(&autodetect_bw),
             Arc::clone(&pointer_cache),
+            effective.features.avc444v2,
         ))
         .with_gfx_factory(Some(Box::new(gfx::LinrdpGfxFactory::new(Arc::clone(
             &gfx_session,
@@ -732,8 +763,8 @@ async fn serve() -> anyhow::Result<()> {
     // the TCP bootstrap PDU and the UDP accept loop, binding the two
     // transports to one session via the security cookie. The event channel
     // connects the tunnel to the session (Soft-Sync + DVC data pump).
-    // LINRDP_NO_UDP=1 skips the listener entirely — TCP-only sessions, kept
-    // as a bisect switch for transport bugs.
+    // `features.udp: false` skips the listener entirely — TCP-only sessions,
+    // kept as a bisect switch for transport bugs.
     //
     // It once carried a note blaming UDP for mstsc's CapsAdvertise decoder
     // recovery ("a corrupted big frame over the fresh UDP tunnel"). That was
@@ -743,10 +774,12 @@ async fn serve() -> anyhow::Result<()> {
     // With those fixed, UDP was verified working end to end — mstsc reports
     // "transport protocol: UDP" over a 100 s session with no recovery and no
     // reset. Do not disable UDP to chase a graphics fault.
-    let multitransport = if std::env::var("LINRDP_NO_UDP").as_deref() == Ok("1") {
-        tracing::warn!("LINRDP_NO_UDP=1 — UDP disabled, serving TCP-only");
-        None
-    } else {
+    let multitransport = if effective.features.udp {
+        // The UDP socket has to carry the same port as the TCP connection the
+        // client arrived on (MS-RDPEMT 3.1.1), and each worker binds its own —
+        // so a worker forked from the 3390 listener binds UDP 3390. Getting
+        // that wrong fails quietly: the error below is a warning and the
+        // session simply runs over TCP.
         match udp::spawn(bind_addr, &identity, server.event_sender().clone()) {
             Ok(request) => Some(request),
             Err(error) => {
@@ -754,6 +787,9 @@ async fn serve() -> anyhow::Result<()> {
                 None
             }
         }
+    } else {
+        tracing::info!("features.udp is off — serving TCP-only");
+        None
     };
     server.set_multitransport(multitransport);
 
@@ -778,7 +814,7 @@ async fn serve() -> anyhow::Result<()> {
 }
 
 
-/// Input backend selector for `--wayland`: `with_input_handler` is generic,
+/// Input backend selector for `features.wayland`: `with_input_handler` is generic,
 /// so the variants are dispatched through one implementing type.
 enum AnyInput {
     X11(X11InputHandler),

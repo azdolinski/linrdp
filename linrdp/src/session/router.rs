@@ -53,13 +53,13 @@ pub(crate) struct SessionRouter {
     pending: Arc<PendingIdentity>,
     state_dir: PathBuf,
     range: RangeInclusive<u16>,
-    /// `--console`: serve the ambient `$DISPLAY` (the shared screen) and
+    /// `session.console`: serve the shared screen the configuration names, and
     /// create no per-user session at all.
     console: bool,
-    /// `--fixed-size`: pin every session's screen instead of following the
+    /// `session.fixed_size`: pin every session's screen instead of following the
     /// connecting client.
     fixed_size: Option<(u16, u16)>,
-    /// `--auth greeter`: the client sends no credentials, so the server draws
+    /// `auth: greeter`: the client sends no credentials, so the server draws
     /// a logon screen and collects them there.
     greeter: bool,
     /// The display this worker bound, so the disconnect path can lock it.
@@ -174,7 +174,7 @@ impl SessionRouter {
         // maximum and cannot grow afterwards, so a session born at one
         // client's size could never fit the next one. The capture path scales
         // the screen down to `client_size` when it connects.
-        // `--fixed-size` still wins when the operator pinned a geometry.
+        // `session.fixed_size` still wins when the operator pinned a geometry.
         let size = self.fixed_size.unwrap_or(crate::session::SESSION_SCREEN_MAX);
         let rec = crate::session::attach_or_create(&self.state_dir, &user, &password, self.range.clone(), size)?;
         // The gate, not the environment, is what the capture and input paths

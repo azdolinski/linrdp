@@ -16,10 +16,30 @@ const CERT_FILE: &str = "linrdp-cert.pem";
 const KEY_FILE: &str = "linrdp-key.pem";
 const STATE_DIR: &str = "/var/lib/linrdp";
 
-/// Load the TLS identity from disk, migrating from the legacy location (the
-/// build-time manifest dir) when present, or generate a fresh self-signed
-/// pair persisted for reuse across runs.
-pub(crate) fn load_or_generate_identity() -> anyhow::Result<TlsIdentityCtx> {
+/// Load the TLS identity the configuration names, or keep one of our own.
+///
+/// The two cases are deliberately not the same. `tls.cert`/`tls.key` unset
+/// means "linrdp, look after this": load the pair in the state directory, or
+/// generate one and persist it so a client that trusted it once keeps
+/// trusting it. Setting them means the operator is naming a specific
+/// identity, and a path that is not there is then a refusal to start — the
+/// alternative is generating a fresh self-signed certificate under the
+/// operator's chosen filename, which breaks pinning on every client at once
+/// with nothing in any log to say why.
+pub(crate) fn load_or_generate_identity(configured: &crate::config::Tls) -> anyhow::Result<TlsIdentityCtx> {
+    if let (Some(cert), Some(key)) = (&configured.cert, &configured.key) {
+        anyhow::ensure!(
+            cert.exists() && key.exists(),
+            "tls.cert / tls.key name a certificate that is not there ({} / {}). \
+             They are only set when an identity is being provided, so linrdp will not \
+             generate one over the top of them.",
+            cert.display(),
+            key.display()
+        );
+        return TlsIdentityCtx::init_from_paths(cert, key)
+            .with_context(|| format!("the PEM identity at {} is invalid", cert.display()));
+    }
+
     let cert_path = Path::new(STATE_DIR).join(CERT_FILE);
     let key_path = Path::new(STATE_DIR).join(KEY_FILE);
 

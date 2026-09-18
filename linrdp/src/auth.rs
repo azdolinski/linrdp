@@ -19,7 +19,7 @@ pub(crate) struct ShadowValidator {
     /// can create that user's desktop. Recorded only on success: the identity
     /// a session is built from must be one that was actually verified.
     pending: Option<std::sync::Arc<crate::session::router::PendingIdentity>>,
-    /// `--auth greeter`: this validator does not decide anything, the logon
+    /// `auth: greeter`: this validator does not decide anything, the logon
     /// screen does. A client that sends no credentials — or the wrong ones,
     /// which is what a client sends when it is just filling in the field its
     /// UI demands — must still reach the point where the screen can be drawn.
@@ -171,8 +171,9 @@ impl CredentialValidator for ShadowValidator {
                 let _ = reason;
                 tracing::warn!(
                     "the client sent no credentials — without NLA it expects a server-drawn \
-                     logon screen, which linrdp does not have. Use --auth nla (the default) \
-                     for mstsc, or a client that sends credentials itself"
+                     logon screen. Give this listener `auth: greeter`, which draws one, or \
+                     `auth: nla` for mstsc, or connect with a client that sends credentials \
+                     itself"
                 );
                 Ok(CredentialDecision::Reject)
             }

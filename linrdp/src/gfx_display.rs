@@ -358,6 +358,10 @@ pub(crate) struct EgfxDisplay {
     bw_kbps: Arc<AtomicU32>,
     /// Client's negotiated `pointerCacheSize` — bounds the cursor LRU.
     pointer_cache: Arc<AtomicU16>,
+    /// `features.avc444v2`: whether the operator permits the layout at all.
+    /// Whether it is *used* additionally depends on what the client
+    /// negotiates — see `EgfxUpdates::avc444v2_enabled`.
+    avc444v2_allowed: bool,
 }
 
 impl EgfxDisplay {
@@ -369,6 +373,7 @@ impl EgfxDisplay {
         rtt_baseline: Arc<AtomicU32>,
         bw_kbps: Arc<AtomicU32>,
         pointer_cache: Arc<AtomicU16>,
+        avc444v2_allowed: bool,
     ) -> Self {
         Self {
             factory,
@@ -378,6 +383,7 @@ impl EgfxDisplay {
             rtt_baseline,
             bw_kbps,
             pointer_cache,
+            avc444v2_allowed,
         }
     }
 }
@@ -423,6 +429,7 @@ impl RdpServerDisplay for EgfxDisplay {
             hb_last: Instant::now(),
             avc_disabled: false,
             started: Instant::now(),
+            avc444v2_allowed: self.avc444v2_allowed,
             avc444v2_enabled: false,
             clear_seq: 0,
             stat_frames: 0,
@@ -529,8 +536,13 @@ struct EgfxUpdates {
     /// Client negotiated EGFX without AVC (AVC_DISABLED), or the H.264
     /// encoder failed to initialize — lossless ClearCodec only.
     avc_disabled: bool,
-    /// Client negotiated cap version >= 10.6: the AVC444v2 chroma layout may
-    /// be used for motion frames.
+    /// `features.avc444v2`: whether the operator permits the layout at all.
+    /// Deliberately a separate field from the one below — the two differ in
+    /// meaning by one word, "allowed" against "negotiated", and they used to
+    /// meet on two adjacent lines with only an env var to tell them apart.
+    avc444v2_allowed: bool,
+    /// Client negotiated cap version >= 10.6 AND the operator allows it: the
+    /// AVC444v2 chroma layout may be used for motion frames.
     avc444v2_enabled: bool,
     /// MS-RDPEGFX 2.2.4.1 ClearCodec `seqNumber` for this session: the first
     /// message is 0 and every later one is the previous plus one (wrapping at
@@ -1386,10 +1398,9 @@ impl EgfxUpdates {
         if self.avc_disabled {
             tracing::warn!("EGFX: client has AVC disabled — using lossless ClearCodec only");
         }
-        // AVC444v2 (4:4:4 color) is opt-in while the v2 stream is validated
-        // against mstsc's decoder: LINRDP_AVC444V2=1 enables it.
-        let avc444v2_requested = std::env::var("LINRDP_AVC444V2").as_deref() == Ok("1");
-        self.avc444v2_enabled = server.supports_avc444v2() && avc444v2_requested;
+        // AVC444v2 (4:4:4 color) needs both halves: `features.avc444v2` in the
+        // configuration, and a client that negotiated cap version >= 10.6.
+        self.avc444v2_enabled = server.supports_avc444v2() && self.avc444v2_allowed;
 
         // The surface is the REAL desktop, never the 16-aligned encoder size.
         // MS-RDPEGFX 3.3.8.3.3: "Color conversion MUST be performed for the

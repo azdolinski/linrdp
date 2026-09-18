@@ -437,7 +437,7 @@ impl RdpsndServerHandler for SystemSoundHandler {
 
 /// What this worker may capture right now.
 enum Attach {
-    /// Single-session, or `--console`: whatever the environment names, as
+    /// Single-session, or console mode: whatever the environment names, as
     /// before. There the unit's description of the desktop is a correct one,
     /// because there is only ever one desktop to describe.
     Ambient,
@@ -971,7 +971,7 @@ mod tests {
     }
 
     /// An unarmed worker keeps the ambient daemon, which is what
-    /// single-session and `--console` deployments have always used.
+    /// single-session and console-mode deployments have always used.
     #[test]
     fn an_unarmed_worker_attaches_to_the_ambient_daemon() {
         assert!(!crate::session::gate::is_armed(), "default state is unarmed");

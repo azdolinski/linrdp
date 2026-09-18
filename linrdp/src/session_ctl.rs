@@ -39,9 +39,9 @@ pub(crate) struct SessionController {
 pub(crate) struct ControllerInner {
     /// Authenticated connections currently active.
     active: AtomicUsize,
-    /// `--lock-session`: unlock on first connect, lock when last leaves.
+    /// `session.lock_on_disconnect`: unlock on first connect, lock when last leaves.
     lock_session: bool,
-    /// `--switch-to-greeter`: flip the seat to the greeter when the first
+    /// `session.switch_to_greeter`: flip the seat to the greeter when the first
     /// client connects (for "linrdp owns the seat" setups, mirroring KRdp's
     /// RemoteAccess mode).
     switch_to_greeter: bool,
@@ -114,7 +114,7 @@ impl ConnectionHandler for SessionController {
         // connection — including mstsc's probe, which dies mid-CredSSP with a
         // BrokenPipe on every single attempt. A plain `fetch_sub` wrapped the
         // counter (observed: remaining=18446744073709551614), after which
-        // `after == 0` was never true again and `--lock-session` would leave
+        // `after == 0` was never true again and `session.lock_on_disconnect` would leave
         // the desktop unlocked forever. Saturate at zero instead.
         let after = self
             .inner
@@ -194,7 +194,7 @@ mod tests {
     /// so `on_disconnected` runs without a matching `on_connection_info`.
     /// A plain `fetch_sub` wrapped the counter to u64::MAX-ish, after which
     /// the "last client left" transition never fired again and
-    /// `--lock-session` left the desktop unlocked.
+    /// `session.lock_on_disconnect` left the desktop unlocked.
     #[test]
     fn disconnect_without_a_counted_connect_keeps_the_counter_at_zero() {
         let mut ctl = SessionController::new(false, false);

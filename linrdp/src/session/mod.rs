@@ -320,7 +320,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// --console must bypass session resolution entirely.
+    /// Console mode must bypass session resolution entirely.
     #[test]
     fn console_mode_uses_the_ambient_display() {
         let base = temp_base("console");

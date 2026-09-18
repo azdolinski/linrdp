@@ -491,7 +491,8 @@ impl Config {
 fn parse(path: &Path, body: &str) -> anyhow::Result<Config> {
     let config: Config = serde_norway::from_str(body)
         .with_context(|| format!("{} is not a valid linrdp configuration", path.display()))?;
-    validate(&config).with_context(|| format!("{}", path.display()))?;
+    validate(&config)
+        .with_context(|| format!("{} is not a valid linrdp configuration", path.display()))?;
     Ok(config)
 }
 

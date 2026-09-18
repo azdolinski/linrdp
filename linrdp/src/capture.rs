@@ -38,7 +38,7 @@ pub(crate) struct X11Display {
     width: u16,
     height: u16,
     display_name: String,
-    /// Fixed desktop size (`--fixed-size`): the X screen is resized once at
+    /// Fixed desktop size (`session.fixed_size`): the X screen is resized once at
     /// startup and never per-connection again. Windows RDP works this way —
     /// the server desktop has one size and clients scale locally — and it
     /// avoids the post-resize window where a freshly re-layouting desktop
@@ -78,7 +78,7 @@ impl X11Display {
         };
         // Scale the session's screen to what this client negotiated, before
         // any frame goes out: the desktop must be settled (layout done, no
-        // churn) by the time the first frames leave. `--fixed-size` pins a
+        // churn) by the time the first frames leave. `session.fixed_size` pins a
         // geometry and wins; otherwise the client's own size decides.
         let target = fixed_size.or_else(crate::session::gate::client_size);
         display.fixed_size = target;
@@ -643,7 +643,7 @@ pub(crate) struct ScreenGrabber {
     damage_ok: bool,
     /// The next poll grabs unconditionally (first grab, reconnect, resize).
     force_grab: bool,
-    /// Fixed desktop size (`--fixed-size`): when set, the grabber re-asserts
+    /// Fixed desktop size (`session.fixed_size`): when set, the grabber re-asserts
     /// this geometry if the X screen drifts (see [`Self::grab`]).
     fixed_size: Option<(u16, u16)>,
     /// Next instant the fixed-size enforcement may query the root geometry.

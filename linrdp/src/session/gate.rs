@@ -27,6 +27,36 @@ static BOUND: Mutex<Option<Bound>> = Mutex::new(None);
 /// the user had already been let in.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
+/// The shared screen `session.console` names.
+///
+/// Console mode is the one arrangement where the display does not come from a
+/// session this process created, and it used to come from the unit's
+/// `Environment=DISPLAY=`. With the unit carrying no environment at all, an
+/// unset display fell through to the literal `:99` below — either somebody
+/// else's screen or nobody's — so the configuration says which screen, and
+/// says it here.
+static CONSOLE: Mutex<Option<ConsoleScreen>> = Mutex::new(None);
+
+#[derive(Debug, Clone)]
+struct ConsoleScreen {
+    display: String,
+    xauthority: Option<PathBuf>,
+}
+
+/// Serve the shared screen `display` for the rest of this process's life.
+pub(crate) fn set_console(display: String, xauthority: Option<PathBuf>) {
+    *CONSOLE.lock().unwrap_or_else(|p| p.into_inner()) = Some(ConsoleScreen { display, xauthority });
+}
+
+fn console() -> Option<ConsoleScreen> {
+    CONSOLE.lock().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+/// The number in `:12` or `:12.0`, for the socket path and the cookie lookup.
+fn display_number_of(name: &str) -> Option<u16> {
+    name.strip_prefix(':')?.split('.').next()?.parse().ok()
+}
+
 /// Which of the two displays a worker can be pointed at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Binding {
@@ -282,6 +312,9 @@ fn bind_into(cell: &mut Option<Bound>, wanted: Bound) -> anyhow::Result<()> {
 /// unbound armed worker gets an error, never a usable display.
 pub(crate) fn display_name() -> anyhow::Result<String> {
     if !is_armed() {
+        if let Some(console) = console() {
+            return Ok(console.display);
+        }
         return Ok(std::env::var("DISPLAY").unwrap_or_else(|_| ":99".to_owned()));
     }
     match BOUND.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
@@ -319,13 +352,23 @@ fn bound_display_number() -> Option<u16> {
 /// That is what the capture and input paths were relying on, and what the
 /// module comment above already claimed they did not.
 ///
-/// Unarmed (single-session, or `--console`) nothing is bound and this is
+/// Unarmed (single-session, or console mode) nothing is bound and this is
 /// x11rb's ordinary environment-driven connect, exactly as before.
 pub(crate) fn connect() -> anyhow::Result<(x11rb::rust_connection::RustConnection, usize)> {
     use anyhow::Context as _;
 
     let name = display_name()?;
-    let (Some(display), Some(path)) = (bound_display_number(), xauthority()) else {
+    // A bound session's cookie, or — in console mode — the one the
+    // configuration names. Everything else is x11rb's ordinary
+    // environment-driven connect.
+    let explicit = match (bound_display_number(), xauthority()) {
+        (Some(display), Some(path)) => Some((display, path)),
+        _ => console().and_then(|console| {
+            let path = console.xauthority?;
+            Some((display_number_of(&name)?, path.display().to_string()))
+        }),
+    };
+    let Some((display, path)) = explicit else {
         return x11rb::rust_connection::RustConnection::connect(Some(name.as_str()))
             .with_context(|| format!("connect to X display {name}"));
     };
@@ -356,7 +399,7 @@ pub(crate) fn client_size() -> Option<(u16, u16)> {
 /// Which PulseAudio this worker may capture, if any.
 ///
 /// `None` means capture nothing, and every `None` is a real answer rather
-/// than a missing one: an unarmed worker (single-session, or `--console`)
+/// than a missing one: an unarmed worker (single-session, or console mode)
 /// keeps the ambient environment the service unit gave it, an armed worker
 /// with no session bound has no daemon to reach yet, and the logon screen has
 /// none at all. There is no fallback to some other user's daemon, which is
@@ -494,7 +537,7 @@ mod tests {
         assert_eq!(audio.server, "unix:/run/user/1002/pulse/native");
     }
 
-    /// An unarmed worker (single-session, or `--console`) keeps the ambient
+    /// An unarmed worker (single-session, or console mode) keeps the ambient
     /// environment the unit gave it, so nothing about that deployment
     /// changes.
     #[test]
