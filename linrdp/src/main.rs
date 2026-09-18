@@ -9,6 +9,7 @@
 mod auth;
 mod capture;
 mod clipboard;
+mod config;
 mod doctor;
 mod greeter;
 mod gfx;
