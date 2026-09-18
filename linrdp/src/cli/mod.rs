@@ -165,11 +165,12 @@ mod tests {
     fn the_last_group_does_not_draw_a_line_below_itself() {
         let drawn = tree();
         let lines: Vec<&str> = drawn.lines().collect();
-        let last_group = lines
+        let last = lines
             .iter()
-            .position(|line| line.contains("└──") && line.contains("service"))
-            .expect("service is drawn as a group");
-        for line in &lines[last_group + 1..] {
+            .position(|line| line.starts_with("└──"))
+            .expect("something is the last child of the root");
+        assert!(last + 1 < lines.len(), "the last top-level entry is a group with children");
+        for line in &lines[last + 1..] {
             assert!(
                 !line.starts_with('│'),
                 "a branch continues past the last group: {line}"

@@ -42,6 +42,11 @@ pub(crate) const COMMANDS: &[Command] = &[
         summary: "Browse and edit the configuration",
     },
     Command {
+        path: "debug",
+        args: Some("[<level>]"),
+        summary: "Run in the foreground with everything on screen (default: debug)",
+    },
+    Command {
         path: "tree",
         args: None,
         summary: "Show this command tree",
@@ -80,6 +85,26 @@ pub(crate) const COMMANDS: &[Command] = &[
         path: "service.status",
         args: None,
         summary: "What systemd says, plus the listeners in effect",
+    },
+    Command {
+        path: "daemon",
+        args: None,
+        summary: "Run in the background on a machine without systemd",
+    },
+    Command {
+        path: "daemon.start",
+        args: None,
+        summary: "Start the supervisor in the background",
+    },
+    Command {
+        path: "daemon.stop",
+        args: None,
+        summary: "Stop it — sessions already open keep running",
+    },
+    Command {
+        path: "daemon.status",
+        args: None,
+        summary: "Whether one is running here, and the listeners in effect",
     },
 ];
 
@@ -163,5 +188,14 @@ mod tests {
         described.sort_unstable();
         accepted.sort_unstable();
         assert_eq!(described, accepted, "the tree and `service` disagree about the verbs");
+    }
+
+    #[test]
+    fn the_daemon_verbs_are_exactly_the_ones_daemon_accepts() {
+        let mut described: Vec<&str> = children("daemon").iter().map(|c| leaf_name(c.path)).collect();
+        let mut accepted: Vec<&str> = crate::daemon::VERBS.to_vec();
+        described.sort_unstable();
+        accepted.sort_unstable();
+        assert_eq!(described, accepted, "the tree and `daemon` disagree about the verbs");
     }
 }

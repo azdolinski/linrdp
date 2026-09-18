@@ -54,9 +54,16 @@ pub(crate) fn bind_all(config: &Config) -> anyhow::Result<Vec<Bound>> {
     }
 
     if !failures.is_empty() {
+        // The listening socket is what stops two supervisors, so this is where
+        // that shows up — as "address already in use", which describes the
+        // symptom and not the cause. Name the process holding it.
+        let held_by = match crate::daemon::running() {
+            Some(pid) => format!("\n  another linrdp supervisor is running (pid {pid})"),
+            None => String::new(),
+        };
         // `bound` is dropped on the way out, so nothing stays half-open.
         anyhow::bail!(
-            "cannot bind {} of {} listeners, so none of them were kept:\n  - {}",
+            "cannot bind {} of {} listeners, so none of them were kept:\n  - {}{held_by}",
             failures.len(),
             config.listeners.len(),
             failures.join("\n  - ")
@@ -235,6 +242,14 @@ fn worker_argv(bind: &str) -> Vec<String> {
         argv.push("--config".to_owned());
         argv.push(config::path().display().to_string());
     }
+    // The one thing a worker is told that the file does not say, and it says
+    // nothing about what is served — only how loudly. `linrdp debug` is worth
+    // little if the interesting half, which is the session, keeps logging at
+    // the level the machine uses every day.
+    if let Some(filter) = crate::logging::override_filter() {
+        argv.push("--log-level".to_owned());
+        argv.push(filter.to_owned());
+    }
     argv
 }
 
@@ -389,9 +404,13 @@ mod tests {
         );
     }
 
-    /// Nothing but the listener's name reaches a worker. A setting smuggled in
-    /// here would outrank the configuration file silently, which is the whole
-    /// arrangement this replaces.
+    /// Nothing that decides *what is served* reaches a worker through argv. A
+    /// setting smuggled in here would outrank the configuration file silently,
+    /// which is the whole arrangement this replaces.
+    ///
+    /// `--log-level` is the one thing that does travel, and it is not an
+    /// exception to that rule: it changes how loud the worker is, never which
+    /// address, which authentication or which features it serves.
     #[test]
     fn a_worker_is_told_nothing_but_which_listener_it_serves() {
         let argv = worker_argv("0.0.0.0:3389");

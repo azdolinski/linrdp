@@ -21,6 +21,8 @@ mod mic;
 mod pam;
 mod sam;
 mod cli;
+mod daemon;
+mod logging;
 mod service;
 mod sound;
 mod sound_real;
@@ -79,6 +81,20 @@ fn main() -> anyhow::Result<()> {
         }
         Some("config") => return configtui::run(std::env::args().any(|arg| arg == "--print")),
         Some("service") => return service::run(std::env::args().nth(2).as_deref()),
+        Some("daemon") => return daemon::run(std::env::args().nth(2).as_deref()),
+        Some("debug") => {
+            // The level is the argument so that `linrdp debug trace` and
+            // `linrdp debug info,ironrdp=trace` both work: the filter is the
+            // useful knob, and naming one level would only mean adding the
+            // next one later.
+            logging::set_override(std::env::args().nth(2).as_deref().unwrap_or("debug"));
+            // Past the program name *and* past `debug` and its level: what
+            // follows is the supervisor's own arguments, and `refuse_leftovers`
+            // rejects anything it does not recognise — including, without this,
+            // the word that got us here.
+            let rest = std::env::args_os().skip(if std::env::args().nth(2).is_some() { 3 } else { 2 });
+            return supervisor_main(pico_args::Arguments::from_vec(rest.collect()));
+        }
         Some("tree") => {
             print!("{}", cli::tree());
             return Ok(());
@@ -112,7 +128,7 @@ fn main() -> anyhow::Result<()> {
     // the supervisor.
     let serves_a_connection = std::env::args().any(|arg| arg == "--serve-fd" || arg == "--listener");
     if !serves_a_connection {
-        return supervisor_main();
+        return supervisor_main(pico_args::Arguments::from_env());
     }
 
     tokio::runtime::Builder::new_multi_thread()
@@ -165,7 +181,7 @@ fn keeper_main() -> anyhow::Result<()> {
         Ok(config) => (config.log, None),
         Err(error) => (config::Log::default(), Some(format!("{error:#}"))),
     };
-    setup_logging(&log);
+    logging::setup(&log);
     if let Some(complaint) = complaint {
         tracing::warn!(
             error = %complaint,
@@ -330,15 +346,14 @@ fn capture_credential() {
 
 /// Bind every listener the configuration names and fork a worker per
 /// connection.
-fn supervisor_main() -> anyhow::Result<()> {
-    let mut args = pico_args::Arguments::from_env();
+fn supervisor_main(mut args: pico_args::Arguments) -> anyhow::Result<()> {
     if let Some(path) = args.opt_value_from_str::<_, PathBuf>("--config")? {
         config::set_path(path);
     }
     refuse_leftovers(args)?;
 
     let loaded = config::load_or_default(config::path())?;
-    setup_logging(&loaded.config.log);
+    logging::setup(&loaded.config.log);
     if loaded.from_defaults {
         tracing::info!(
             path = %config::path().display(),
@@ -370,6 +385,11 @@ fn supervisor_main() -> anyhow::Result<()> {
     tls::ensure_default_identity(&loaded.config.tls).context("failed to prepare the TLS identity")?;
 
     let bound = supervisor::bind_all(&loaded.config)?;
+
+    // After the bind, so a supervisor that was refused leaves no record
+    // claiming it is running.
+    daemon::write_pid_file();
+
     supervisor::run(bound)
 }
 
@@ -386,6 +406,12 @@ async fn serve() -> anyhow::Result<()> {
         .context("--listener <ADDRESS:PORT> says which listener from the configuration to serve")?;
     if let Some(path) = args.opt_value_from_str::<_, PathBuf>("--config")? {
         config::set_path(path);
+    }
+    // Set by a supervisor that was started with `linrdp debug`, and by nothing
+    // else. It changes how loud this worker is and nothing about what it
+    // serves — every such setting still comes from the file.
+    if let Some(filter) = args.opt_value_from_str::<_, String>("--log-level")? {
+        logging::set_override(&filter);
     }
     refuse_leftovers(args)?;
 
@@ -408,7 +434,7 @@ async fn serve() -> anyhow::Result<()> {
     // readable before we know which listener this is — which matters, because
     // failing to find the listener is exactly the failure that must not be
     // silent.
-    setup_logging(&config.log);
+    logging::setup(&config.log);
 
     let effective = match config.effective(&listener) {
         Ok(effective) => effective,
@@ -969,103 +995,3 @@ fn setup_helper_logging(log: &config::Log) {
         .try_init();
 }
 
-/// Start logging as `log` asks.
-///
-/// The verbosity was `LINRDP_LOG` and the destination was `--log-file`; both
-/// are `log.level` and `log.file` now, so that "why is this machine quiet?"
-/// has one answer and it is in the same file as everything else.
-/// Whether colour belongs on stderr.
-///
-/// Under the unit stderr is journald, not a terminal, and the escape codes go
-/// into the journal as literal bytes — the same wart the log file carried
-/// until it was written with `with_ansi(false)`. Run by hand, stderr is a
-/// terminal and the colour is worth having.
-fn stderr_is_a_terminal() -> bool {
-    use std::io::IsTerminal as _;
-    std::io::stderr().is_terminal()
-}
-
-fn setup_logging(log: &config::Log) {
-    use tracing_subscriber::filter::LevelFilter;
-    use tracing_subscriber::Layer as _;
-    use tracing_subscriber::layer::SubscriberExt as _;
-    use tracing_subscriber::util::SubscriberInitExt as _;
-    use tracing_subscriber::{EnvFilter, fmt};
-
-    // A malformed filter must not be the reason a server does not start.
-    let filter = || {
-        EnvFilter::try_new(&log.level).unwrap_or_else(|error| {
-            eprintln!("linrdp: log.level `{}` is not a filter ({error}); using info", log.level);
-            EnvFilter::new("info,ironrdp=warn")
-        })
-    };
-
-    let path = match &log.file {
-        Some(path) => {
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            path.clone()
-        }
-        None => PathBuf::new(),
-    };
-
-    let file = if path.as_os_str().is_empty() {
-        None
-    } else {
-        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-            Ok(file) => Some(file),
-            Err(error) => {
-                eprintln!("linrdp: cannot open {} ({error}); logging to the terminal", path.display());
-                None
-            }
-        }
-    };
-
-    match file {
-        // A file AND the terminal — which, under the unit, is the journal.
-        //
-        // The file alone left `journalctl -u linrdp` and `systemctl status`
-        // empty, which is the first place anyone looks and the worst possible
-        // place to find nothing.
-        //
-        // The two carry different amounts on purpose. The file gets exactly
-        // `log.level`; the journal gets the same filter capped at INFO, so
-        // `debug` and `trace` — which log per frame — stay out of journald's
-        // ring buffer. Duplicating those there would evict *other services'*
-        // logs, a cost paid by the whole machine rather than by linrdp. The
-        // cap only ever quietens: `log.level: warn` gives warn in both.
-        Some(file) => {
-            eprintln!("linrdp: logging to {} (and to the journal, at info)", path.display());
-            let _ = tracing_subscriber::registry()
-                // `log.level` governs everything...
-                .with(filter())
-                .with(
-                    fmt::layer()
-                        .compact()
-                        // No escape codes in a file somebody will grep.
-                        .with_ansi(false)
-                        .with_writer(std::sync::Mutex::new(file)),
-                )
-                // ...and the journal is quietened further, never louder.
-                .with(
-                    fmt::layer()
-                        .compact()
-                        .with_ansi(stderr_is_a_terminal())
-                        .with_writer(std::io::stderr)
-                        .with_filter(LevelFilter::INFO),
-                )
-                .try_init();
-        }
-        // No file: the terminal is the whole log, and it gets everything that
-        // was asked for — capping here would take `debug` away from the one
-        // person who typed it.
-        None => {
-            let _ = tracing_subscriber::fmt()
-                .compact()
-                .with_ansi(stderr_is_a_terminal())
-                .with_env_filter(filter())
-                .try_init();
-        }
-    }
-}

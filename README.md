@@ -60,6 +60,21 @@ Day to day:
 | `sudo linrdp service restart` | restart it, picking up a changed configuration |
 | `linrdp service status` | what systemd says, then the listeners in effect |
 
+When something is wrong, `sudo linrdp debug` runs the server in the foreground
+with everything on the terminal — the workers included, so the protocol
+exchange of a connection you make while it runs is on screen. It writes nothing
+to `log.file`, so a debugging session never lands in the machine's own log.
+`sudo linrdp debug trace` (or any tracing filter, e.g. `debug,ironrdp=trace`)
+turns it up further.
+
+On a machine without systemd, `sudo linrdp daemon start` puts the same
+supervisor in the background, `daemon stop` ends it and `daemon status` says
+whether one is running. What actually stops two servers colliding is the
+listening socket, not the pid file in `/run/linrdp`: the second one cannot bind
+and refuses every listener rather than coming up half-open. The pid file only
+answers the two questions the socket cannot — which process to signal, and who
+is holding the port you were just refused.
+
 `linrdp tree` prints every command with what it does; `linrdp --help` prints
 the same tree and then the prose below. Any group answers for itself —
 `linrdp service --help` lists just its six verbs.
