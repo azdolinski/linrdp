@@ -386,12 +386,12 @@ mod tests {
 
     #[test]
     fn a_configuration_that_binds_cleanly_yields_one_socket_per_listener() {
-        let ports: Vec<String> = (0..2)
-            .map(|_| {
-                let probe = TcpListener::bind("127.0.0.1:0").expect("port");
-                probe.local_addr().expect("addr").to_string()
-            })
-            .collect();
+        let ports: Vec<String> = std::iter::repeat_with(|| {
+            let probe = TcpListener::bind("127.0.0.1:0").expect("port");
+            probe.local_addr().expect("addr").to_string()
+        })
+        .take(2)
+        .collect();
         let refs: Vec<&str> = ports.iter().map(String::as_str).collect();
         let bound = bind_all(&config_with(&refs)).expect("both bind");
         assert_eq!(bound.len(), 2);

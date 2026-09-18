@@ -62,16 +62,35 @@ impl Report {
 
 /// Turn the probe into the report. Pure, so every awkward machine can be
 /// tested without being one.
+/// What the configuration contributes to the machine report.
+#[derive(Debug, Default)]
+struct ConfiguredService {
+    listeners: Vec<AuthListener>,
+    /// `false` when there is no file at all — the listeners below are then the
+    /// built-in defaults, and saying "0.0.0.0:3389" without saying that would
+    /// read as a deliberate choice somebody made.
+    present: bool,
+    /// Why the file could not be read, when it exists and is wrong.
+    problem: Option<String>,
+}
+
 fn build(
     caps: &Capabilities,
     accounts: &[String],
     sam_path: &Path,
     pam_capture: bool,
-    auth_mode: Option<&str>,
+    service: &ConfiguredService,
 ) -> Report {
-    // `--auth system` takes credentials from the client and checks them against
-    // /etc/shadow itself, so it neither needs nor uses a captured password.
-    let capture_needed = auth_mode != Some("system");
+    let listeners = service.listeners.as_slice();
+    let config_problem = service.problem.as_deref();
+    // Capture is needed if ANY listener offers NLA. The old test was one
+    // unit's `--auth`, which on a machine running `system` on one port and
+    // `both` on another reported whichever unit happened to be named `linrdp`
+    // — and told the operator to fix nothing while half the server was
+    // refusing logins.
+    let capture_needed = listeners
+        .iter()
+        .any(|l| l.refuses_without_capture() || l.loses_nla_without_capture());
     let list = |items: &[String]| {
         if items.is_empty() {
             "none".to_owned()
@@ -94,7 +113,25 @@ fn build(
     let authentication = vec![
         Fact {
             key: "default",
-            value: "system password (/etc/shadow + PAM); `--auth nla` uses the SAM".to_owned(),
+            value: "system password (/etc/shadow + PAM); `auth: nla` uses the SAM".to_owned(),
+        },
+        Fact {
+            key: "listeners",
+            value: {
+                let list = listeners
+                    .iter()
+                    .map(|l| format!("{} (auth: {})", l.bind, l.mode))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                match (listeners.is_empty(), service.present) {
+                    (true, _) => "none configured".to_owned(),
+                    (false, true) => list,
+                    (false, false) => format!(
+                        "{list} — built-in defaults; there is no {}",
+                        crate::config::CONFIG_PATH
+                    ),
+                }
+            },
         },
         Fact {
             key: "NLA accounts",
@@ -108,7 +145,7 @@ fn build(
             key: "PAM capture",
             value: match (pam_capture, capture_needed) {
                 (true, _) => "wired".to_owned(),
-                (false, false) => "not wired (`--auth system` does not need it)".to_owned(),
+                (false, false) => "not wired (no listener offers NLA)".to_owned(),
                 (false, true) => "NOT wired".to_owned(),
             },
         },
@@ -156,14 +193,25 @@ fn build(
     // works" and "every login is denied as invalid username".
     if !pam_capture && capture_needed {
         findings.push(Finding::Blocker(
-            "PAM credential capture is NOT wired, and this machine runs the default `--auth \
-             nla`. NLA cannot verify an /etc/shadow hash, so linrdp has to learn each account's \
-             system password from the system's own authentication: install deploy/pam-capture \
-             into the PAM stack. The alternative, if you would rather not touch PAM, is `--auth \
-             system` — it stores nothing, but only works with clients that send credentials \
-             without NLA (FreeRDP, Remmina; mstsc does not)."
+            "PAM credential capture is NOT wired, and a listener here offers NLA. NLA cannot \
+             verify an /etc/shadow hash, so linrdp has to learn each account's system password \
+             from the system's own authentication: `linrdp service install` wires that up. The \
+             alternatives, if you would rather not touch PAM, are `auth: greeter` (the server \
+             draws the logon form; every client works) and `auth: system` (nothing stored, but \
+             only clients that send credentials without NLA — FreeRDP, Remmina; mstsc does \
+             not)."
                 .to_owned(),
         ));
+    }
+
+    // A configuration that does not load is not a detail of this report: it is
+    // the reason the service is not running, and everything below it here is
+    // describing defaults the machine is not actually using.
+    if let Some(problem) = config_problem {
+        findings.push(Finding::Blocker(format!(
+            "the configuration cannot be read, so linrdp will not start — this report shows \
+             the built-in defaults instead of what you configured. {problem}"
+        )));
     }
     if accounts.is_empty() {
         findings.push(Finding::Warning(
@@ -303,48 +351,37 @@ fn pam_capture_wired() -> bool {
     })
 }
 
-/// The `--auth` mode this machine is configured to run, when it can be told.
+/// The listeners this machine is configured to serve, for the account report.
 ///
-/// `doctor` runs as its own process and cannot see a running server's flags,
-/// so it asks systemd what the unit is set to start. Without systemd, or
-/// without the unit, the answer is unknown and the caller assumes the
-/// default. Only used to decide how loudly to report a missing PAM capture:
-/// required for `nla`, meaningless for `system`.
-fn configured_auth_mode() -> Option<String> {
-    auth_mode_of("linrdp")
-}
-
-/// The `--auth` mode one unit is set to start, when it can be told.
-fn auth_mode_of(unit: &str) -> Option<String> {
-    let out = std::process::Command::new("systemctl")
-        .args(["show", unit, "--property=ExecStart", "--value"])
-        .output()
-        .ok()?;
-    let exec = String::from_utf8_lossy(&out.stdout);
-    if !out.status.success() || exec.trim().is_empty() {
-        return None;
-    }
-    // ExecStart renders as a struct; the argv is in there verbatim, so a
-    // window search over the tokens is enough and needs no parser.
-    let tokens: Vec<&str> = exec.split_whitespace().collect();
-    tokens
-        .windows(2)
-        .find(|pair| pair[0] == "--auth")
-        .map(|pair| pair[1].trim_end_matches(&['"', '\''][..]).to_owned())
+/// It used to ask systemd: `systemctl list-units linrdp*.service`, then
+/// `systemctl show` on each and a window search over `ExecStart` for
+/// `--auth`. That answered "what is this unit set to start", which is only
+/// the same question as "how is this server configured" while the two happen
+/// not to have drifted. The configuration file answers it directly.
+fn configured_listeners() -> Vec<AuthListener> {
+    crate::config::load_for_diagnostics(crate::config::path())
+        .0
+        .listeners
+        .iter()
+        .map(|listener| AuthListener { bind: listener.bind.clone(), mode: listener.auth })
+        .collect()
 }
 
 /// Probe this machine and print the report on stdout.
 pub(crate) fn run() -> anyhow::Result<()> {
     let caps = detect::probe();
     let accounts = sam::account_names();
-    let auth_mode = configured_auth_mode();
-    let report = build(
-        &caps,
-        &accounts,
-        &sam::sam_path(),
-        pam_capture_wired(),
-        auth_mode.as_deref(),
-    );
+    let (config, problem) = crate::config::load_for_diagnostics(crate::config::path());
+    let service = ConfiguredService {
+        listeners: config
+            .listeners
+            .iter()
+            .map(|listener| AuthListener { bind: listener.bind.clone(), mode: listener.auth })
+            .collect(),
+        present: crate::config::path().exists(),
+        problem,
+    };
+    let report = build(&caps, &accounts, &sam::sam_path(), pam_capture_wired(), &service);
     print!("{}", render(&report, &DoctorTheme));
     Ok(())
 }
@@ -363,18 +400,19 @@ pub(crate) fn run() -> anyhow::Result<()> {
 
 /// One linrdp listener and the authentication it is configured to offer.
 ///
-/// There is rarely only one. This machine runs two — NLA on 3389 and the
+/// There is rarely only one. A typical machine runs two — NLA on 3389 and the
 /// server-drawn logon screen on 3390 — and they want different things from an
 /// account: NLA has to know the password to compute the expected response,
 /// while the logon screen hands what you type straight to PAM and needs
-/// nothing stored. A report that looked at one unit would tell someone
+/// nothing stored. A report that looked at one listener would tell someone
 /// logging in through the greeter that their account was not ready, which is
 /// what the first draft of this did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AuthListener {
-    unit: String,
-    /// `both`, `nla`, `system` or `greeter`.
-    mode: String,
+    /// The `bind` literal from the configuration — what the operator would
+    /// search the file for.
+    bind: String,
+    mode: crate::config::Auth,
 }
 
 impl AuthListener {
@@ -383,7 +421,7 @@ impl AuthListener {
     /// Only `nla` does. It advertises CredSSP alone, so a client that cannot
     /// complete it has nowhere else to go.
     fn refuses_without_capture(&self) -> bool {
-        self.mode == "nla"
+        self.mode == crate::config::Auth::Nla
     }
 
     /// Whether a missing captured password costs this listener NLA but not
@@ -400,7 +438,7 @@ impl AuthListener {
     /// it a blocker told someone their account was broken while they were
     /// sitting in its desktop.
     fn loses_nla_without_capture(&self) -> bool {
-        self.mode == "both"
+        self.mode == crate::config::Auth::Both
     }
 }
 
@@ -598,30 +636,6 @@ fn probe_account(name: &str) -> AccountProbe {
     }
 }
 
-/// Every linrdp listener systemd knows about, with the authentication it
-/// offers.
-///
-/// `doctor` runs as its own process and cannot see a running server's flags,
-/// so it asks systemd what each unit is set to start. A unit with no `--auth`
-/// runs the default, which is `both`.
-fn configured_listeners() -> Vec<AuthListener> {
-    let Ok(out) = std::process::Command::new("systemctl")
-        .args(["list-units", "--type=service", "--all", "--no-legend", "--plain", "linrdp*.service"])
-        .output()
-    else {
-        return Vec::new();
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .filter(|unit| unit.ends_with(".service"))
-        .map(|unit| AuthListener {
-            mode: auth_mode_of(unit).unwrap_or_else(|| "both".to_owned()),
-            unit: unit.to_owned(),
-        })
-        .collect()
-}
-
 /// Turn the account probe into its report. Pure, as [`build`] is.
 fn build_account(probe: &AccountProbe) -> AccountReport {
     let mut findings = Vec::new();
@@ -672,25 +686,25 @@ fn build_account(probe: &AccountProbe) -> AccountReport {
         .listeners
         .iter()
         .filter(|l| l.refuses_without_capture())
-        .map(|l| l.unit.as_str())
+        .map(|l| l.bind.as_str())
         .collect();
     let degrading: Vec<&str> = probe
         .listeners
         .iter()
         .filter(|l| l.loses_nla_without_capture())
-        .map(|l| l.unit.as_str())
+        .map(|l| l.bind.as_str())
         .collect();
     let capture_needed = !refusing.is_empty() || !degrading.is_empty();
     let authentication = vec![
         Fact {
             key: "listeners",
             value: if probe.listeners.is_empty() {
-                "none found (systemd knows no linrdp*.service)".to_owned()
+                "none configured".to_owned()
             } else {
                 probe
                     .listeners
                     .iter()
-                    .map(|l| format!("{} (--auth {})", l.unit, l.mode))
+                    .map(|l| format!("{} (auth: {})", l.bind, l.mode))
                     .collect::<Vec<_>>()
                     .join(", ")
             },
@@ -709,7 +723,7 @@ fn build_account(probe: &AccountProbe) -> AccountReport {
             key: "password captured",
             value: match (probe.captured, capture_needed) {
                 (true, _) => "yes — NLA can authenticate this account".to_owned(),
-                (false, false) => "no (`--auth system` does not need it)".to_owned(),
+                (false, false) => "no (no listener here offers NLA)".to_owned(),
                 (false, true) => "NOT yet".to_owned(),
             },
         },
@@ -953,6 +967,18 @@ mod tests {
         Path::new("/var/lib/linrdp/sam")
     }
 
+    fn listeners(modes: &[crate::config::Auth]) -> Vec<AuthListener> {
+        modes
+            .iter()
+            .enumerate()
+            .map(|(n, mode)| AuthListener { bind: format!("0.0.0.0:{}", 3389 + n), mode: *mode })
+            .collect()
+    }
+
+    fn service(modes: &[crate::config::Auth]) -> ConfiguredService {
+        ConfiguredService { listeners: listeners(modes), present: true, problem: None }
+    }
+
     /// The old report restated every met requirement ("ok logind: available")
     /// directly under the facts that already said so. A finding is now only
     /// what the operator has to do something about, so a healthy machine ends
@@ -960,7 +986,7 @@ mod tests {
     #[test]
     fn met_requirements_do_not_become_findings() {
         let caps = healthy(vec![session("xfce", SessionKind::X11, true)]);
-        let report = build(&caps, &accounts(), sam(), true, None);
+        let report = build(&caps, &accounts(), sam(), true, &service(&[crate::config::Auth::Both]));
         assert!(
             report.findings.is_empty(),
             "a healthy machine has nothing for the operator to read"
@@ -977,7 +1003,7 @@ mod tests {
             session("xfce", SessionKind::X11, true),
             session("lightdm-xsession", SessionKind::X11, false),
         ]);
-        let report = build(&caps, &accounts(), sam(), true, None);
+        let report = build(&caps, &accounts(), sam(), true, &service(&[crate::config::Auth::Both]));
 
         let status = |id: &str| {
             report
@@ -1003,7 +1029,7 @@ mod tests {
     #[test]
     fn an_unwired_pam_capture_is_a_blocker() {
         let caps = healthy(vec![session("xfce", SessionKind::X11, true)]);
-        let report = build(&caps, &accounts(), sam(), false, None);
+        let report = build(&caps, &accounts(), sam(), false, &service(&[crate::config::Auth::Both]));
 
         assert_eq!(report.blockers(), 1);
         let capture = report
@@ -1014,13 +1040,13 @@ mod tests {
         assert_eq!(capture.value, "NOT wired");
     }
 
-    /// `--auth system` checks the client's credentials against /etc/shadow
+    /// `auth: system` checks the client's credentials against /etc/shadow
     /// itself, so it never reads a captured password. Calling the missing
     /// capture a blocker there tells the operator to fix what they chose.
     #[test]
     fn auth_system_does_not_need_the_pam_capture() {
         let caps = healthy(vec![session("xfce", SessionKind::X11, true)]);
-        let report = build(&caps, &accounts(), sam(), false, Some("system"));
+        let report = build(&caps, &accounts(), sam(), false, &service(&[crate::config::Auth::System]));
 
         assert_eq!(report.blockers(), 0, "the mode in use needs no capture");
         let capture = report
@@ -1028,7 +1054,92 @@ mod tests {
             .iter()
             .find(|f| f.key == "PAM capture")
             .expect("the capture fact is reported");
-        assert_eq!(capture.value, "not wired (`--auth system` does not need it)");
+        assert_eq!(capture.value, "not wired (no listener offers NLA)");
+    }
+
+    /// The listener list is what the file says, and it names each listener by
+    /// the address the operator would search that file for — not by a systemd
+    /// unit, which is what it used to report and which no longer exists.
+    #[test]
+    fn the_listeners_fact_comes_from_the_configuration() {
+        let caps = healthy(vec![session("xfce", SessionKind::X11, true)]);
+        let report = build(
+            &caps,
+            &accounts(),
+            sam(),
+            true,
+            &service(&[crate::config::Auth::Both, crate::config::Auth::Greeter]),
+        );
+        let fact = report
+            .authentication
+            .iter()
+            .find(|f| f.key == "listeners")
+            .expect("the listener fact is reported");
+        assert_eq!(fact.value, "0.0.0.0:3389 (auth: both), 0.0.0.0:3390 (auth: greeter)");
+    }
+
+    /// One port that stores nothing does not excuse another that cannot work
+    /// without a capture. The old report asked systemd for the `--auth` of the
+    /// unit named `linrdp` and answered for the whole machine with it, so a
+    /// machine serving `system` there and `nla` elsewhere was told it had
+    /// nothing to fix while half of it refused every login.
+    #[test]
+    fn a_listener_that_needs_the_capture_is_not_excused_by_one_that_does_not() {
+        let caps = healthy(vec![session("xfce", SessionKind::X11, true)]);
+        let report = build(
+            &caps,
+            &accounts(),
+            sam(),
+            false,
+            &service(&[crate::config::Auth::System, crate::config::Auth::Nla]),
+        );
+        assert_eq!(report.blockers(), 1, "the nla listener still needs it");
+    }
+
+    /// Only when no listener offers NLA at all is the missing capture a
+    /// non-event.
+    #[test]
+    fn a_machine_offering_no_nla_anywhere_needs_no_capture() {
+        let caps = healthy(vec![session("xfce", SessionKind::X11, true)]);
+        let report = build(
+            &caps,
+            &accounts(),
+            sam(),
+            false,
+            &service(&[crate::config::Auth::System, crate::config::Auth::Greeter]),
+        );
+        assert_eq!(report.blockers(), 0);
+    }
+
+    /// A configuration that does not load is why the service is not running,
+    /// and it also means every other line of this report is describing
+    /// defaults the machine is not using. Both halves have to be said.
+    #[test]
+    fn a_configuration_that_does_not_load_is_a_blocker() {
+        let caps = healthy(vec![session("xfce", SessionKind::X11, true)]);
+        let report = build(
+            &caps,
+            &accounts(),
+            sam(),
+            true,
+            &ConfiguredService {
+                listeners: listeners(&[crate::config::Auth::Both]),
+                present: true,
+                problem: Some("listeners[0].auth: unknown variant `greter`".to_owned()),
+            },
+        );
+        let blocker = report
+            .findings
+            .iter()
+            .filter_map(|f| match f {
+                Finding::Blocker(message) => Some(message.as_str()),
+                Finding::Warning(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(blocker.contains("will not start"), "got: {blocker}");
+        assert!(blocker.contains("built-in defaults"), "it says what is being shown instead: {blocker}");
+        assert!(blocker.contains("greter"), "it carries the parser's own words: {blocker}");
     }
 
     /// An empty SAM is the normal state of a fresh install: the hook is wired
@@ -1037,7 +1148,7 @@ mod tests {
     #[test]
     fn no_captured_password_yet_is_a_warning_not_a_blocker() {
         let caps = healthy(vec![session("xfce", SessionKind::X11, true)]);
-        let report = build(&caps, &[], sam(), true, None);
+        let report = build(&caps, &[], sam(), true, &service(&[crate::config::Auth::Both]));
 
         assert_eq!(report.blockers(), 0);
         assert!(
@@ -1052,13 +1163,13 @@ mod tests {
     fn a_blocked_machine_says_so_in_the_footer() {
         let caps = healthy(vec![session("xfce", SessionKind::X11, true)]);
 
-        let blocked = render(&build(&caps, &accounts(), sam(), false, None), &DoctorTheme);
+        let blocked = render(&build(&caps, &accounts(), sam(), false, &service(&[crate::config::Auth::Both])), &DoctorTheme);
         assert!(
             blocked.contains("1 blocker(s): per-user sessions cannot run"),
             "got {blocked}"
         );
 
-        let working = render(&build(&caps, &accounts(), sam(), true, None), &DoctorTheme);
+        let working = render(&build(&caps, &accounts(), sam(), true, &service(&[crate::config::Auth::Both])), &DoctorTheme);
         assert!(
             working.contains("Per-user sessions can run on this machine."),
             "got {working}"
@@ -1072,7 +1183,7 @@ mod tests {
         let mut caps = healthy(vec![session("xfce", SessionKind::X11, true)]);
         caps.x_servers.clear();
         caps.lockers.clear();
-        let report = build(&caps, &[], sam(), true, None);
+        let report = build(&caps, &[], sam(), true, &service(&[crate::config::Auth::Both]));
 
         assert!(report.blockers() >= 1);
         let first_warning = report
@@ -1113,7 +1224,7 @@ mod tests {
             sound_socket_exists: true,
             cookie_exists: true,
             live_display: None,
-            listeners: vec![AuthListener { unit: "linrdp-alt-port.service".to_owned(), mode: "greeter".to_owned() }],
+            listeners: vec![AuthListener { bind: "0.0.0.0:3390".to_owned(), mode: crate::config::Auth::Greeter }],
         }
     }
 
@@ -1241,7 +1352,7 @@ mod tests {
         assert!(found.contains("no sound server listening"), "got {found}");
     }
 
-    /// `--auth system` verifies the client's own credentials against
+    /// `auth: system` verifies the client's own credentials against
     /// /etc/shadow, so it needs no captured password and must not be nagged
     /// about one.
     #[test]
@@ -1249,17 +1360,17 @@ mod tests {
         let mut probe = account("rdptest", 1002);
         probe.captured = false;
 
-        let listener = |mode: &str| {
-            vec![AuthListener { unit: "linrdp.service".to_owned(), mode: mode.to_owned() }]
+        let listener = |mode: crate::config::Auth| {
+            vec![AuthListener { bind: "0.0.0.0:3389".to_owned(), mode }]
         };
 
-        probe.listeners = listener("system");
+        probe.listeners = listener(crate::config::Auth::System);
         assert!(build_account(&probe).findings.is_empty());
 
-        probe.listeners = listener("greeter");
+        probe.listeners = listener(crate::config::Auth::Greeter);
         assert!(build_account(&probe).findings.is_empty());
 
-        probe.listeners = listener("nla");
+        probe.listeners = listener(crate::config::Auth::Nla);
         let found = blockers(&build_account(&probe)).join("\n");
         assert!(found.contains("su - rdptest"), "got {found}");
         assert!(
@@ -1268,7 +1379,7 @@ mod tests {
         );
     }
 
-    /// `--auth both` without a captured password is a lost feature, not a
+    /// `auth: both` without a captured password is a lost feature, not a
     /// locked door: NLA fails, the client reconnects over TLS, and
     /// /etc/shadow lets it in. Traced on a real login — the first draft
     /// called this a blocker and told someone their account could not get in
@@ -1277,7 +1388,7 @@ mod tests {
     fn auth_both_without_a_capture_loses_nla_but_not_the_login() {
         let mut probe = account("user", 1000);
         probe.captured = false;
-        probe.listeners = vec![AuthListener { unit: "linrdp.service".to_owned(), mode: "both".to_owned() }];
+        probe.listeners = vec![AuthListener { bind: "0.0.0.0:3389".to_owned(), mode: crate::config::Auth::Both }];
 
         let report = build_account(&probe);
         assert!(blockers(&report).is_empty(), "not a blocker: {:?}", blockers(&report));
@@ -1287,21 +1398,21 @@ mod tests {
         assert!(found.contains("/etc/shadow"), "it says what does let them in: {found}");
     }
 
-    /// Both kinds of listener at once — this machine's actual shape. The
+    /// Both kinds of listener at once — the shape this deployment has. The
     /// blocker names only the listener that truly refuses.
     #[test]
     fn a_greeter_alongside_an_nla_listener_is_not_blamed_for_the_nla_listener() {
         let mut probe = account("rdptest", 1002);
         probe.captured = false;
         probe.listeners = vec![
-            AuthListener { unit: "linrdp.service".to_owned(), mode: "nla".to_owned() },
-            AuthListener { unit: "linrdp-alt-port.service".to_owned(), mode: "greeter".to_owned() },
+            AuthListener { bind: "0.0.0.0:3389".to_owned(), mode: crate::config::Auth::Nla },
+            AuthListener { bind: "0.0.0.0:3390".to_owned(), mode: crate::config::Auth::Greeter },
         ];
 
         let found = blockers(&build_account(&probe)).join("\n");
-        assert!(found.contains("linrdp.service"), "got {found}");
+        assert!(found.contains("0.0.0.0:3389"), "got {found}");
         assert!(
-            !found.contains("linrdp-alt-port.service"),
+            !found.contains("0.0.0.0:3390"),
             "the greeter port needs nothing stored and must not be named: {found}"
         );
     }

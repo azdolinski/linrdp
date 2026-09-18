@@ -213,7 +213,7 @@ pub(crate) struct Session {
     pub(crate) console: Console,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub(crate) struct Console {
     pub(crate) enabled: bool,
@@ -230,7 +230,7 @@ pub(crate) struct Features {
     pub(crate) wayland: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub(crate) struct Tls {
     pub(crate) cert: Option<PathBuf>,
@@ -256,21 +256,9 @@ impl Default for Session {
     }
 }
 
-impl Default for Console {
-    fn default() -> Self {
-        Self { enabled: false, display: None, xauthority: None }
-    }
-}
-
 impl Default for Features {
     fn default() -> Self {
         Self { usb: false, udp: true, avc444v2: true, wayland: false }
-    }
-}
-
-impl Default for Tls {
-    fn default() -> Self {
-        Self { cert: None, key: None }
     }
 }
 
