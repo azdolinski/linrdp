@@ -45,8 +45,8 @@ sudo linrdp service install
 
 `service install` writes one systemd unit, creates `/etc/linrdp/config.yaml`
 (only if there is none — re-running it to upgrade the binary leaves your
-settings alone), installs `/etc/pam.d/linrdp`, creates `/var/lib/linrdp` and
-`/var/log/linrdp`, wires the credential capture into the system PAM stack
+settings alone), installs `/etc/pam.d/linrdp`, creates `/etc/linrdp/cert`,
+`/var/lib/linrdp` and `/var/log/linrdp`, wires the credential capture into the system PAM stack
 (see **Authentication** below), and starts the service. `sudo linrdp service
 uninstall` takes back exactly that and leaves the configuration, the TLS
 identity and the logs where they are.
@@ -82,7 +82,7 @@ features:
   wayland: false            # portal + PipeWire + libei instead of X
 
 tls:
-  cert: null                # null keeps a self-signed identity in /var/lib/linrdp
+  cert: null                # null keeps a self-signed identity in /etc/linrdp/cert
   key:  null
 
 log:
@@ -250,9 +250,12 @@ if you want the supervisor itself on the new code.) Re-running
 `sudo linrdp service install` refreshes the unit and leaves
 `/etc/linrdp/config.yaml` exactly as it is.
 
-On first start it generates a self-signed TLS certificate in
-`/var/lib/linrdp` and reuses it, so a client that accepted it once goes on
-accepting it. Setting `tls.cert` and `tls.key` means you are providing an
+On first start it generates a self-signed TLS certificate as
+`/etc/linrdp/cert/default.cert` (with its key beside it, mode 0600) and
+reuses it, so a client that accepted it once goes on accepting it. That
+`.cert` file is the one to import into a client's trust store — it carries
+SANs for the machine's hostnames and interface IPs, so connecting by raw IP
+validates too. Setting `tls.cert` and `tls.key` means you are providing an
 identity instead: a path that is not there then stops the service rather than
 being replaced by a fresh self-signed certificate under your filename, which
 would break pinning on every client at once.

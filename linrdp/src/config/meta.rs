@@ -50,7 +50,7 @@ pub(crate) struct Field {
     /// What that default *does*, for a default that names an absence rather
     /// than a value. "unset" answers "what did I write" and not "what will it
     /// do", and on a certificate an absence reads as "off" — so the line says
-    /// `default: unset (self-signed, /var/lib/linrdp/linrdp-cert.pem)`.
+    /// `default: unset (self-signed, /etc/linrdp/cert/default.cert)`.
     pub(crate) default_means: Option<&'static str>,
     pub(crate) overridable: Overridable,
 }
@@ -283,7 +283,7 @@ pub(crate) static FIELDS: &[Field] = &[
     Field {
         path: "tls",
         description: "The certificate clients see. Unset means linrdp keeps a self-signed \
-                      one of its own in /var/lib/linrdp and reuses it across restarts, so a \
+                      one of its own in /etc/linrdp/cert and reuses it across restarts, so a \
                       client that trusted it once keeps trusting it.",
         kind: Kind::Block,
         default: None,
@@ -294,13 +294,14 @@ pub(crate) static FIELDS: &[Field] = &[
         path: "tls.cert",
         description: "PEM certificate chain to serve. Unset is not \"no TLS\" — RDP has \
                       no such mode: linrdp generates a self-signed certificate, keeps it in \
-                      /var/lib/linrdp and reuses it across restarts, so a client that \
-                      trusted it once keeps trusting it. Set, linrdp generates nothing: a \
-                      path that does not exist is a refusal to start, not a fresh \
-                      self-signed certificate under your filename.",
+                      /etc/linrdp/cert and reuses it across restarts, so a client that \
+                      trusted it once keeps trusting it. That file is the one to import \
+                      into a client's trust store. Set, linrdp generates nothing: a path \
+                      that does not exist is a refusal to start, not a fresh self-signed \
+                      certificate under your filename.",
         kind: Kind::Path,
         default: Some("unset"),
-        default_means: Some("self-signed, /var/lib/linrdp/linrdp-cert.pem"),
+        default_means: Some("self-signed, /etc/linrdp/cert/default.cert"),
         overridable: Overridable::Yes,
     },
     Field {
@@ -310,7 +311,7 @@ pub(crate) static FIELDS: &[Field] = &[
                       identity is a refusal to start.",
         kind: Kind::Path,
         default: Some("unset"),
-        default_means: Some("self-signed, /var/lib/linrdp/linrdp-key.pem"),
+        default_means: Some("self-signed, /etc/linrdp/cert/default.key"),
         overridable: Overridable::Yes,
     },
     Field {
@@ -478,7 +479,7 @@ mod tests {
     #[test]
     fn the_promised_certificate_paths_are_the_ones_tls_writes() {
         for (path, file) in [("tls.cert", crate::tls::CERT_FILE), ("tls.key", crate::tls::KEY_FILE)] {
-            let on_disk = format!("{}/{file}", crate::tls::STATE_DIR);
+            let on_disk = format!("{}/{file}", crate::tls::CERT_DIR);
             let promised = field(path).and_then(|f| f.default_means).unwrap_or("");
             assert!(
                 promised.contains(&on_disk),

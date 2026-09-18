@@ -29,6 +29,10 @@ pub(crate) struct Layout {
     pub(crate) pam_dir: PathBuf,
     /// `/var/lib/linrdp`
     pub(crate) state: PathBuf,
+    /// `/etc/linrdp/cert` — the self-signed identity linrdp keeps when
+    /// `tls.cert` is unset. Made here so it exists, with the right mode,
+    /// before the first connection makes one in a hurry.
+    pub(crate) cert: PathBuf,
     /// `/var/log/linrdp`
     pub(crate) log: PathBuf,
     /// The binary the unit and the PAM line name.
@@ -46,6 +50,7 @@ impl Layout {
             unit_dir: PathBuf::from("/etc/systemd/system"),
             pam_dir: PathBuf::from("/etc/pam.d"),
             state: PathBuf::from("/var/lib/linrdp"),
+            cert: PathBuf::from(crate::tls::CERT_DIR),
             log: PathBuf::from("/var/log/linrdp"),
             // Where this very binary is running from, so the unit starts the
             // thing the operator just ran rather than one they may not have
@@ -94,14 +99,18 @@ fn install(layout: &Layout) -> anyhow::Result<()> {
 
     // 1. Directories, with the modes enforced rather than assumed — they may
     //    have been made by an older build, a packaging script, or by hand.
-    for dir in [&layout.etc, &layout.state, &layout.log] {
+    for dir in [&layout.etc, &layout.state, &layout.cert, &layout.log] {
         std::fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
     }
     harden(&layout.state, 0o700)?;
+    // Not 0700: the certificate in it is meant to be copied to clients. The
+    // private key beside it carries its own 0600 — see `tls::generate_into`.
+    harden(&layout.cert, 0o755)?;
     println!(
-        "  directories   {}, {}, {}",
+        "  directories   {}, {}, {}, {}",
         layout.etc.display(),
         layout.state.display(),
+        layout.cert.display(),
         layout.log.display()
     );
 
@@ -315,6 +324,7 @@ mod tests {
             unit_dir: root.join("etc/systemd/system"),
             pam_dir: root.join("etc/pam.d"),
             state: root.join("var/lib/linrdp"),
+            cert: root.join("etc/linrdp/cert"),
             log: root.join("var/log/linrdp"),
             binary: PathBuf::from("/usr/local/bin/linrdp"),
         };

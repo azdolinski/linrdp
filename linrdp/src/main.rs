@@ -391,6 +391,10 @@ fn supervisor_main() -> anyhow::Result<()> {
         tracing::info!(sessions = locked, "locked sessions inherited from a previous supervisor");
     }
 
+    // Before the first connection, so the certificate an operator has to
+    // import into their clients exists the moment the service is up.
+    tls::ensure_default_identity(&loaded.config.tls).context("failed to prepare the TLS identity")?;
+
     let bound = supervisor::bind_all(&loaded.config)?;
     supervisor::run(bound)
 }
