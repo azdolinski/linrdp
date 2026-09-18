@@ -573,6 +573,109 @@ mod tests {
 
     const MINIMAL: &str = "listeners:\n  - bind: 0.0.0.0:3389\n    auth: both\n";
 
+    /// `doctor` searches for a user's live session across the display range,
+    /// and it used to search a hardcoded `10..=99` with a comment claiming
+    /// that matched the supervisor. Nothing made that true: on a machine whose
+    /// range had been narrowed, every account was reported as having no live
+    /// display. Its loader has to answer from the file like everyone else's.
+    #[test]
+    fn the_report_and_the_service_read_one_display_range() {
+        let path = temp_file(
+            "range",
+            "listeners:\n  - bind: 0.0.0.0:3389\n    auth: both\nsession:\n  display_range: 40-50\n",
+        );
+        let (for_the_report, problem) = load_for_diagnostics(&path);
+        let for_the_service = load_or_default(&path).expect("loads").config;
+
+        assert!(problem.is_none());
+        assert_eq!(for_the_report.session.display_range.range(), 40..=50);
+        assert_eq!(
+            for_the_report.session.display_range,
+            for_the_service.session.display_range,
+            "the report searches the range the service hands out from"
+        );
+        cleanup(&path);
+    }
+
+    /// And on a machine whose file is broken, the report still runs — with the
+    /// complaint to show, because a configuration that does not load is why
+    /// the service is not running.
+    #[test]
+    fn the_report_survives_a_configuration_the_service_would_refuse() {
+        let path = temp_file("brokenreport", "listeners:\n  - bind: nonsense\n    auth: both\n");
+        let (config, problem) = load_for_diagnostics(&path);
+
+        assert_eq!(config.listeners.len(), 1, "it falls back to the defaults to have something to show");
+        let problem = problem.expect("and keeps the reason");
+        assert!(problem.contains("nonsense"), "got: {problem}");
+        cleanup(&path);
+    }
+
+    /// A typo'd key must stop the service, not be dropped. The quiet outcome
+    /// of dropping `auth` is `both` — a port more permissive than anything the
+    /// operator wrote — and the quiet outcome of dropping a `features` block
+    /// is every feature back at its default.
+    #[test]
+    fn an_unknown_key_is_refused_rather_than_ignored() {
+        for body in [
+            "listeners:\n  - bind: 0.0.0.0:3389\n    auth: both\nfeaturs:\n  usb: true\n",
+            "listeners:\n  - bind: 0.0.0.0:3389\n    auth: both\n    porrt: 3389\n",
+            "listeners:\n  - bind: 0.0.0.0:3389\n    auth: both\nsession:\n  fixed_sizes: 800x600\n",
+        ] {
+            let path = temp_file("unknown", body);
+            let error = format!("{:#}", load_strict(&path).expect_err("refused"));
+            assert!(error.contains("unknown field"), "got: {error}");
+            cleanup(&path);
+        }
+    }
+
+    /// Being told a value is wrong without being told what would be right
+    /// sends the operator to the source. The values come from the metadata
+    /// table, so this message cannot fall behind a mode added later.
+    #[test]
+    fn an_unknown_value_names_the_values_that_exist() {
+        let path = temp_file("badauth", "listeners:\n  - bind: 0.0.0.0:3389\n    auth: greter\n");
+        let error = format!("{:#}", load_strict(&path).expect_err("refused"));
+        for value in ["both", "nla", "system", "greeter"] {
+            assert!(error.contains(value), "`{value}` is not offered: {error}");
+        }
+        assert!(error.contains("line 3"), "and it says where: {error}");
+        cleanup(&path);
+    }
+
+    /// One configuration file is deployed to a fleet that will not all have
+    /// been built with the `wayland` feature. A binary without it warns and
+    /// carries on; refusing here would make the file un-deployable instead.
+    #[test]
+    fn a_wayland_key_is_accepted_whatever_this_binary_was_built_with() {
+        let path = temp_file(
+            "wayland",
+            "listeners:\n  - bind: 0.0.0.0:3389\n    auth: both\nfeatures:\n  wayland: true\n",
+        );
+        let config = load_strict(&path).expect("accepted by every build");
+        assert!(config.effective("0.0.0.0:3389").expect("listener").features.wayland);
+        cleanup(&path);
+    }
+
+    /// The UDP socket has to carry the same port as the TCP connection the
+    /// client arrived on (MS-RDPEMT 3.1.1), and the worker derives both from
+    /// this one string. A worker forked from the 3390 listener binding UDP
+    /// 3389 would fail quietly: the bind error is a warning and the session
+    /// simply runs over TCP.
+    #[test]
+    fn a_listeners_effective_bind_is_the_port_it_was_forked_from() {
+        let config: Config = serde_norway::from_str(
+            "listeners:\n  - bind: 0.0.0.0:3389\n    auth: both\n  - bind: 0.0.0.0:3390\n    auth: greeter\n",
+        )
+        .expect("parses");
+
+        for (bind, port) in [("0.0.0.0:3389", 3389), ("0.0.0.0:3390", 3390)] {
+            let effective = config.effective(bind).expect("listener");
+            let addr: core::net::SocketAddr = effective.bind.parse().expect("an address");
+            assert_eq!(addr.port(), port, "the worker binds UDP on what it serves TCP on");
+        }
+    }
+
     /// A machine nobody has configured still serves, and serves the one thing
     /// every deployment starts from.
     #[test]
