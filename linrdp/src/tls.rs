@@ -12,9 +12,12 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use ironrdp_server::TlsIdentityCtx;
 
-const CERT_FILE: &str = "linrdp-cert.pem";
-const KEY_FILE: &str = "linrdp-key.pem";
-const STATE_DIR: &str = "/var/lib/linrdp";
+// Visible to `config::meta`, whose `tls.cert` / `tls.key` help promises these
+// exact paths to anyone who leaves the keys unset. A test there compares the
+// promise against these three.
+pub(crate) const CERT_FILE: &str = "linrdp-cert.pem";
+pub(crate) const KEY_FILE: &str = "linrdp-key.pem";
+pub(crate) const STATE_DIR: &str = "/var/lib/linrdp";
 
 /// Load the TLS identity the configuration names, or keep one of our own.
 ///

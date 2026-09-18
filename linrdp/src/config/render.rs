@@ -274,7 +274,7 @@ fn comment(out: &mut String, path: &str, indent: usize) {
         }
     }
 
-    if let Some(default) = field.default {
+    if let Some(default) = meta::default_text(field) {
         let _ = writeln!(out, "{pad}# default: {default}");
     }
 }

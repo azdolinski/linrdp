@@ -47,6 +47,11 @@ pub(crate) struct Field {
     pub(crate) kind: Kind,
     /// Rendered as the `default:` line. `None` only for [`Kind::Block`].
     pub(crate) default: Option<&'static str>,
+    /// What that default *does*, for a default that names an absence rather
+    /// than a value. "unset" answers "what did I write" and not "what will it
+    /// do", and on a certificate an absence reads as "off" — so the line says
+    /// `default: unset (self-signed, /var/lib/linrdp/linrdp-cert.pem)`.
+    pub(crate) default_means: Option<&'static str>,
     pub(crate) overridable: Overridable,
 }
 
@@ -116,6 +121,7 @@ pub(crate) static FIELDS: &[Field] = &[
                       `systemctl restart linrdp`.",
         kind: Kind::Block,
         default: None,
+        default_means: None,
         overridable: Overridable::No("a listener cannot contain listeners"),
     },
     Field {
@@ -124,6 +130,7 @@ pub(crate) static FIELDS: &[Field] = &[
                       may share a port only on different addresses.",
         kind: Kind::Text("ADDRESS:PORT, e.g. 0.0.0.0:3389 or [::1]:3389"),
         default: Some("0.0.0.0:3389"),
+        default_means: None,
         overridable: Overridable::No("this is what identifies the listener"),
     },
     Field {
@@ -132,6 +139,7 @@ pub(crate) static FIELDS: &[Field] = &[
                       the account's system password; there is no linrdp password to set.",
         kind: Kind::Enum(AUTH_VALUES),
         default: Some("both"),
+        default_means: None,
         overridable: Overridable::No("this is already a per-listener setting"),
     },
     Field {
@@ -140,6 +148,7 @@ pub(crate) static FIELDS: &[Field] = &[
                       alone. Anything not named here is inherited.",
         kind: Kind::Block,
         default: None,
+        default_means: None,
         overridable: Overridable::No("overrides do not nest"),
     },
     Field {
@@ -148,6 +157,7 @@ pub(crate) static FIELDS: &[Field] = &[
                       every listener unless a listener overrides a key.",
         kind: Kind::Block,
         default: None,
+        default_means: None,
         overridable: Overridable::Yes,
     },
     Field {
@@ -156,6 +166,7 @@ pub(crate) static FIELDS: &[Field] = &[
                       at 1 or above: :0 is a physical seat.",
         kind: Kind::Text("LOW-HIGH, e.g. 10-99"),
         default: Some("10-99"),
+        default_means: None,
         overridable: Overridable::No(RANGE_IS_GLOBAL),
     },
     Field {
@@ -165,6 +176,7 @@ pub(crate) static FIELDS: &[Field] = &[
                       right after a mid-session resize. Unset means follow the client.",
         kind: Kind::Text("WIDTHxHEIGHT, e.g. 2880x1800"),
         default: Some("unset"),
+        default_means: Some("follow the client's own screen size"),
         overridable: Overridable::Yes,
     },
     Field {
@@ -173,6 +185,7 @@ pub(crate) static FIELDS: &[Field] = &[
                       it when one reconnects.",
         kind: Kind::Bool,
         default: Some("false"),
+        default_means: None,
         overridable: Overridable::Yes,
     },
     Field {
@@ -182,6 +195,7 @@ pub(crate) static FIELDS: &[Field] = &[
                       the desktop somebody is now using remotely.",
         kind: Kind::Bool,
         default: Some("false"),
+        default_means: None,
         overridable: Overridable::Yes,
     },
     Field {
@@ -190,6 +204,7 @@ pub(crate) static FIELDS: &[Field] = &[
                       session per user — the equivalent of mstsc /admin.",
         kind: Kind::Block,
         default: None,
+        default_means: None,
         overridable: Overridable::Yes,
     },
     Field {
@@ -198,6 +213,7 @@ pub(crate) static FIELDS: &[Field] = &[
                       the same desktop, and nobody gets one of their own.",
         kind: Kind::Bool,
         default: Some("false"),
+        default_means: None,
         overridable: Overridable::Yes,
     },
     Field {
@@ -207,6 +223,7 @@ pub(crate) static FIELDS: &[Field] = &[
                       here serves somebody else's screen to whoever connects.",
         kind: Kind::Text("an X display, e.g. :0"),
         default: Some("unset"),
+        default_means: Some("valid only while console is disabled"),
         overridable: Overridable::Yes,
     },
     Field {
@@ -215,6 +232,7 @@ pub(crate) static FIELDS: &[Field] = &[
                       display accepts the connection without one.",
         kind: Kind::Path,
         default: Some("unset"),
+        default_means: Some("reach the display without one"),
         overridable: Overridable::Yes,
     },
     Field {
@@ -222,6 +240,7 @@ pub(crate) static FIELDS: &[Field] = &[
         description: "Protocol extensions and encoder options.",
         kind: Kind::Block,
         default: None,
+        default_means: None,
         overridable: Overridable::Yes,
     },
     Field {
@@ -230,6 +249,7 @@ pub(crate) static FIELDS: &[Field] = &[
                       appears on this machine.",
         kind: Kind::Bool,
         default: Some("false"),
+        default_means: None,
         overridable: Overridable::Yes,
     },
     Field {
@@ -238,6 +258,7 @@ pub(crate) static FIELDS: &[Field] = &[
                       what makes a lossy link usable. Turning it off serves TCP only.",
         kind: Kind::Bool,
         default: Some("true"),
+        default_means: None,
         overridable: Overridable::Yes,
     },
     Field {
@@ -246,6 +267,7 @@ pub(crate) static FIELDS: &[Field] = &[
                       negotiate EGFX cap version 10.6. A quality setting and nothing more.",
         kind: Kind::Bool,
         default: Some("true"),
+        default_means: None,
         overridable: Overridable::Yes,
     },
     Field {
@@ -255,6 +277,7 @@ pub(crate) static FIELDS: &[Field] = &[
                       `wayland` feature, so one file can serve several builds.",
         kind: Kind::Bool,
         default: Some("false"),
+        default_means: None,
         overridable: Overridable::Yes,
     },
     Field {
@@ -264,6 +287,7 @@ pub(crate) static FIELDS: &[Field] = &[
                       client that trusted it once keeps trusting it.",
         kind: Kind::Block,
         default: None,
+        default_means: None,
         overridable: Overridable::Yes,
     },
     Field {
@@ -276,6 +300,7 @@ pub(crate) static FIELDS: &[Field] = &[
                       self-signed certificate under your filename.",
         kind: Kind::Path,
         default: Some("unset"),
+        default_means: Some("self-signed, /var/lib/linrdp/linrdp-cert.pem"),
         overridable: Overridable::Yes,
     },
     Field {
@@ -285,6 +310,7 @@ pub(crate) static FIELDS: &[Field] = &[
                       identity is a refusal to start.",
         kind: Kind::Path,
         default: Some("unset"),
+        default_means: Some("self-signed, /var/lib/linrdp/linrdp-key.pem"),
         overridable: Overridable::Yes,
     },
     Field {
@@ -292,6 +318,7 @@ pub(crate) static FIELDS: &[Field] = &[
         description: "Where linrdp writes and how much.",
         kind: Kind::Block,
         default: None,
+        default_means: None,
         overridable: Overridable::No(LOG_IS_GLOBAL),
     },
     Field {
@@ -300,6 +327,7 @@ pub(crate) static FIELDS: &[Field] = &[
                       `info,ironrdp=warn`.",
         kind: Kind::Enum(LEVEL_VALUES),
         default: Some("info"),
+        default_means: None,
         overridable: Overridable::No(LOG_IS_GLOBAL),
     },
     Field {
@@ -311,6 +339,7 @@ pub(crate) static FIELDS: &[Field] = &[
                       whole log and gets the level above in full.",
         kind: Kind::Path,
         default: Some("/var/log/linrdp/linrdp.log"),
+        default_means: None,
         overridable: Overridable::No(LOG_IS_GLOBAL),
     },
 ];
@@ -318,6 +347,18 @@ pub(crate) static FIELDS: &[Field] = &[
 /// The table entry for a dotted path, or `None` if there is no such key.
 pub(crate) fn field(path: &str) -> Option<&'static Field> {
     FIELDS.iter().find(|f| f.path == path)
+}
+
+/// The text of the `default:` line — the value, plus what it does when the
+/// value names an absence. One function, because the file's comment and the
+/// help pane in `linrdp config` saying it two different ways is the whole
+/// class of bug this table exists to prevent.
+pub(crate) fn default_text(field: &Field) -> Option<String> {
+    let default = field.default?;
+    Some(match field.default_means {
+        Some(means) => format!("{default} ({means})"),
+        None => default.to_owned(),
+    })
 }
 
 /// The shape a free-form key accepts, for the message that refuses a value
@@ -413,7 +454,8 @@ mod tests {
     /// got the parent block's help open — which is exactly what `tls.cert`
     /// looked like, promising a generated certificate on the `tls` branch and
     /// saying only "unset" on the key underneath it. So a key that defaults to
-    /// unset has to spend a sentence of its own on what unset means.
+    /// an absence owes two things: a sentence on what fills it, and the same
+    /// answer on the `default:` line itself, where the eye actually lands.
     #[test]
     fn a_key_that_defaults_to_unset_says_what_unset_does() {
         for f in FIELDS {
@@ -423,7 +465,25 @@ mod tests {
                     "{} defaults to unset without saying what unset does",
                     f.path
                 );
+                let means = f.default_means.unwrap_or("");
+                assert!(!means.trim().is_empty(), "{}: `default: unset` says nothing", f.path);
             }
+        }
+    }
+
+    /// The help for an unset `tls.cert` names the file linrdp will write. A
+    /// renamed constant in `tls.rs` would leave the operator looking for a
+    /// certificate at a path that no longer exists — and looking in the one
+    /// place that reads like documentation.
+    #[test]
+    fn the_promised_certificate_paths_are_the_ones_tls_writes() {
+        for (path, file) in [("tls.cert", crate::tls::CERT_FILE), ("tls.key", crate::tls::KEY_FILE)] {
+            let on_disk = format!("{}/{file}", crate::tls::STATE_DIR);
+            let promised = field(path).and_then(|f| f.default_means).unwrap_or("");
+            assert!(
+                promised.contains(&on_disk),
+                "{path} promises `{promised}`, but tls.rs writes {on_disk}"
+            );
         }
     }
 

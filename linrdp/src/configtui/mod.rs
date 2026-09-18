@@ -413,7 +413,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, model: &Model) {
                 lines.push(Line::raw(format!("  {}", value.gloss)));
             }
         }
-        if let Some(default) = field.default {
+        if let Some(default) = meta::default_text(field) {
             lines.push(Line::raw(""));
             lines.push(Line::styled(
                 format!("default: {default}"),
