@@ -21,8 +21,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
-use crate::config::meta::{self, Kind};
 use crate::config::Config;
+use crate::config::meta::{self, Kind};
 use model::{Model, Slot, Source};
 
 /// Restore the terminal, whatever happens to the process.
@@ -61,9 +61,16 @@ impl Drop for TerminalGuard {
 enum Mode {
     Browse,
     /// Picking one of a key's documented values.
-    Choose { slot: Slot, values: Vec<&'static str>, index: usize },
+    Choose {
+        slot: Slot,
+        values: Vec<&'static str>,
+        index: usize,
+    },
     /// Typing a value.
-    Type { slot: Slot, buffer: String },
+    Type {
+        slot: Slot,
+        buffer: String,
+    },
     /// Answering "leave without saving?".
     ConfirmQuit,
 }
@@ -86,8 +93,8 @@ pub(crate) fn run(print_only: bool) -> anyhow::Result<()> {
     let mut model = Model::new(config);
 
     let _guard = TerminalGuard::enter()?;
-    let mut terminal = Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
-        .context("take over the terminal")?;
+    let mut terminal =
+        Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout())).context("take over the terminal")?;
     let outcome = event_loop(&mut terminal, &mut model, &path, writable);
     drop(_guard);
     outcome
@@ -104,17 +111,15 @@ fn read(path: &Path) -> anyhow::Result<Config> {
 
 type Backend = ratatui::backend::CrosstermBackend<std::io::Stdout>;
 
-fn event_loop(
-    terminal: &mut Terminal<Backend>,
-    model: &mut Model,
-    path: &Path,
-    writable: bool,
-) -> anyhow::Result<()> {
+fn event_loop(terminal: &mut Terminal<Backend>, model: &mut Model, path: &Path, writable: bool) -> anyhow::Result<()> {
     let mut mode = Mode::Browse;
     let mut message = if writable {
         String::new()
     } else {
-        format!("read-only: {} belongs to root — run with sudo to change it", path.display())
+        format!(
+            "read-only: {} belongs to root — run with sudo to change it",
+            path.display()
+        )
     };
 
     loop {
@@ -249,13 +254,7 @@ fn selected_listener(model: &Model) -> Option<usize> {
     let row = model.selected()?;
     match row.slot {
         Some(Slot::Bind(index) | Slot::ListenerAuth(index) | Slot::Override(index, _)) => Some(index),
-        _ => row
-            .id
-            .strip_prefix("listeners[")?
-            .split(']')
-            .next()?
-            .parse()
-            .ok(),
+        _ => row.id.strip_prefix("listeners[")?.split(']').next()?.parse().ok(),
     }
 }
 
@@ -274,7 +273,10 @@ fn editor_for(model: &Model, slot: Slot) -> Mode {
             let index = values.iter().position(|v| *v == current).unwrap_or(0);
             Mode::Choose { slot, values, index }
         }
-        _ => Mode::Type { slot, buffer: slot.get(&model.config) },
+        _ => Mode::Type {
+            slot,
+            buffer: slot.get(&model.config),
+        },
     }
 }
 
@@ -298,8 +300,7 @@ fn save(config: &Config, path: &Path) -> anyhow::Result<Option<PathBuf>> {
     crate::config::validate(config)?;
     let backup = if path.exists() {
         let backup = PathBuf::from(format!("{}.bak", path.display()));
-        std::fs::copy(path, &backup)
-            .with_context(|| format!("keep the previous version as {}", backup.display()))?;
+        std::fs::copy(path, &backup).with_context(|| format!("keep the previous version as {}", backup.display()))?;
         Some(backup)
     } else {
         if let Some(dir) = path.parent() {
@@ -374,7 +375,11 @@ fn draw_tree(frame: &mut Frame<'_>, area: Rect, model: &Model, writable: bool) {
         })
         .collect();
 
-    let title = if writable { " linrdp config " } else { " linrdp config (read-only) " };
+    let title = if writable {
+        " linrdp config "
+    } else {
+        " linrdp config (read-only) "
+    };
     let mut state = ListState::default();
     state.select(Some(model.cursor));
     frame.render_stateful_widget(
@@ -422,45 +427,48 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, model: &Model) {
         if !row.schema.starts_with("listeners") {
             if let Some(reason) = meta::override_refusal(row.schema) {
                 lines.push(Line::raw(""));
-                lines.push(Line::raw(format!("service-wide, so no listener may override it: {reason}")));
+                lines.push(Line::raw(format!(
+                    "service-wide, so no listener may override it: {reason}"
+                )));
             }
         }
     }
 
     if row.source == Source::Inherited {
         lines.push(Line::raw(""));
-        lines.push(Line::raw("inherited from the global block; Enter gives this listener its own"));
+        lines.push(Line::raw(
+            "inherited from the global block; Enter gives this listener its own",
+        ));
     }
     if row.source == Source::Overridden {
         lines.push(Line::raw(""));
-        lines.push(Line::raw("this listener's own value; x gives it back to the global one"));
+        lines.push(Line::raw(
+            "this listener's own value; x gives it back to the global one",
+        ));
     }
 
     frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .block(Block::default().borders(Borders::ALL).title(format!(" {} ", model::leaf_name(row.schema)))),
+        Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {} ", model::leaf_name(row.schema))),
+        ),
         area,
     );
 }
 
-fn draw_footer(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    model: &Model,
-    mode: &Mode,
-    message: &str,
-    writable: bool,
-) {
+fn draw_footer(frame: &mut Frame<'_>, area: Rect, model: &Model, mode: &Mode, message: &str, writable: bool) {
     let line = match mode {
         Mode::Type { buffer, slot } => {
-            format!("{} = {buffer}_    (Enter to accept, Esc to cancel)", model::leaf_name(slot.schema()))
+            format!(
+                "{} = {buffer}_    (Enter to accept, Esc to cancel)",
+                model::leaf_name(slot.schema())
+            )
         }
         Mode::Choose { .. } => "↑↓ choose   Enter accept   Esc cancel".to_owned(),
         Mode::ConfirmQuit => "unsaved changes — leave anyway? (y/n)".to_owned(),
         Mode::Browse if writable => {
-            "↑↓ move   →/Enter open   Enter edit   x inherit   a add listener   d remove   s save   q quit"
-                .to_owned()
+            "↑↓ move   →/Enter open   Enter edit   x inherit   a add listener   d remove   s save   q quit".to_owned()
         }
         Mode::Browse => "↑↓ move   →/Enter open   q quit".to_owned(),
     };
@@ -476,7 +484,10 @@ fn draw_footer(
     };
 
     frame.render_widget(
-        Paragraph::new(vec![Line::raw(line), Line::styled(status, Style::default().add_modifier(Modifier::BOLD))]),
+        Paragraph::new(vec![
+            Line::raw(line),
+            Line::styled(status, Style::default().add_modifier(Modifier::BOLD)),
+        ]),
         area,
     );
 }
@@ -485,7 +496,9 @@ fn draw_footer(
 fn draw_chooser(frame: &mut Frame<'_>, model: &Model, values: &[&str], index: usize) {
     let area = frame.area();
     let width = area.width.saturating_sub(10).min(70);
-    let height = u16::try_from(values.len().saturating_add(2)).unwrap_or(6).min(area.height);
+    let height = u16::try_from(values.len().saturating_add(2))
+        .unwrap_or(6)
+        .min(area.height);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -521,7 +534,11 @@ fn draw_chooser(frame: &mut Frame<'_>, model: &Model, values: &[&str], index: us
     frame.render_widget(ratatui::widgets::Clear, popup);
     frame.render_stateful_widget(
         List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(format!(" {} ", model::leaf_name(schema))))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" {} ", model::leaf_name(schema))),
+            )
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
         popup,
         &mut state,
@@ -530,7 +547,8 @@ fn draw_chooser(frame: &mut Frame<'_>, model: &Model, values: &[&str], index: us
 
 /// The picker has one line per value; the pane beside it has the whole gloss.
 fn first_sentence(text: &str) -> String {
-    text.split_once(". ").map_or_else(|| text.to_owned(), |(first, _)| format!("{first}."))
+    text.split_once(". ")
+        .map_or_else(|| text.to_owned(), |(first, _)| format!("{first}."))
 }
 
 #[cfg(test)]
@@ -555,14 +573,18 @@ mod tests {
             .position(|row| row.slot == Some(Slot::ListenerAuth(0)))
             .expect("the auth row");
 
-        let mut terminal =
-            Terminal::new(ratatui::backend::TestBackend::new(140, 40)).expect("terminal");
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(140, 40)).expect("terminal");
         terminal
             .draw(|frame| draw(frame, &model, &Mode::Browse, "", true))
             .expect("drawn");
 
-        let screen: String =
-            terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
 
         assert!(screen.contains("listeners"), "the tree is drawn: {screen}");
         assert!(screen.contains("0.0.0.0:3389"), "with the listener in it");

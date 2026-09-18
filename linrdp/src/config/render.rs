@@ -60,18 +60,53 @@ pub(crate) fn render(config: &Config) -> String {
 
     block(&mut out, "session", 0);
     out.push_str("session:\n");
-    leaf(&mut out, "session.display_range", &config.session.display_range.to_string(), 2);
-    leaf(&mut out, "session.fixed_size", &opt(config.session.fixed_size.map(|s| s.to_string())), 2);
-    leaf(&mut out, "session.lock_on_disconnect", &config.session.lock_on_disconnect.to_string(), 2);
-    leaf(&mut out, "session.switch_to_greeter", &config.session.switch_to_greeter.to_string(), 2);
+    leaf(
+        &mut out,
+        "session.display_range",
+        &config.session.display_range.to_string(),
+        2,
+    );
+    leaf(
+        &mut out,
+        "session.fixed_size",
+        &opt(config.session.fixed_size.map(|s| s.to_string())),
+        2,
+    );
+    leaf(
+        &mut out,
+        "session.lock_on_disconnect",
+        &config.session.lock_on_disconnect.to_string(),
+        2,
+    );
+    leaf(
+        &mut out,
+        "session.switch_to_greeter",
+        &config.session.switch_to_greeter.to_string(),
+        2,
+    );
     block(&mut out, "session.console", 2);
     out.push_str("  console:\n");
-    leaf(&mut out, "session.console.enabled", &config.session.console.enabled.to_string(), 4);
-    leaf(&mut out, "session.console.display", &opt(config.session.console.display.clone()), 4);
+    leaf(
+        &mut out,
+        "session.console.enabled",
+        &config.session.console.enabled.to_string(),
+        4,
+    );
+    leaf(
+        &mut out,
+        "session.console.display",
+        &opt(config.session.console.display.clone()),
+        4,
+    );
     leaf(
         &mut out,
         "session.console.xauthority",
-        &opt(config.session.console.xauthority.as_ref().map(|p| p.display().to_string())),
+        &opt(config
+            .session
+            .console
+            .xauthority
+            .as_ref()
+            .map(|p| p.display().to_string())),
         4,
     );
     out.push('\n');
@@ -86,14 +121,29 @@ pub(crate) fn render(config: &Config) -> String {
 
     block(&mut out, "tls", 0);
     out.push_str("tls:\n");
-    leaf(&mut out, "tls.cert", &opt(config.tls.cert.as_ref().map(|p| p.display().to_string())), 2);
-    leaf(&mut out, "tls.key", &opt(config.tls.key.as_ref().map(|p| p.display().to_string())), 2);
+    leaf(
+        &mut out,
+        "tls.cert",
+        &opt(config.tls.cert.as_ref().map(|p| p.display().to_string())),
+        2,
+    );
+    leaf(
+        &mut out,
+        "tls.key",
+        &opt(config.tls.key.as_ref().map(|p| p.display().to_string())),
+        2,
+    );
     out.push('\n');
 
     block(&mut out, "log", 0);
     out.push_str("log:\n");
     leaf(&mut out, "log.level", &config.log.level, 2);
-    leaf(&mut out, "log.file", &opt(config.log.file.as_ref().map(|p| p.display().to_string())), 2);
+    leaf(
+        &mut out,
+        "log.file",
+        &opt(config.log.file.as_ref().map(|p| p.display().to_string())),
+        2,
+    );
 
     out
 }
@@ -168,10 +218,18 @@ fn render_overrides(out: &mut String, overrides: &Overrides) {
     if let Some(tls) = &overrides.tls {
         out.push_str("      tls:\n");
         if let Some(cert) = &tls.cert {
-            let _ = writeln!(out, "        cert: {}", opt(cert.as_ref().map(|p| p.display().to_string())));
+            let _ = writeln!(
+                out,
+                "        cert: {}",
+                opt(cert.as_ref().map(|p| p.display().to_string()))
+            );
         }
         if let Some(key) = &tls.key {
-            let _ = writeln!(out, "        key: {}", opt(key.as_ref().map(|p| p.display().to_string())));
+            let _ = writeln!(
+                out,
+                "        key: {}",
+                opt(key.as_ref().map(|p| p.display().to_string()))
+            );
         }
     }
 }
@@ -206,7 +264,10 @@ fn comment(out: &mut String, path: &str, indent: usize) {
         for value in *values {
             let lead = format!("  {:widest$}  ", value.name, widest = widest);
             let hanging = " ".repeat(lead.len());
-            for (n, line) in wrap(value.gloss, text_width.saturating_sub(lead.len())).into_iter().enumerate() {
+            for (n, line) in wrap(value.gloss, text_width.saturating_sub(lead.len()))
+                .into_iter()
+                .enumerate()
+            {
                 let prefix = if n == 0 { &lead } else { &hanging };
                 let _ = writeln!(out, "{pad}#{prefix}{line}");
             }
@@ -340,11 +401,17 @@ log:
             let key = key.trim_end_matches("[]");
             let described = lines.iter().enumerate().any(|(n, line)| {
                 // A listener's first key is written as a list item, `- bind:`.
-                line.trim_start().trim_start_matches("- ").starts_with(&format!("{key}:"))
+                line.trim_start()
+                    .trim_start_matches("- ")
+                    .starts_with(&format!("{key}:"))
                     && n > 0
                     && lines[n - 1].trim_start().starts_with('#')
             });
-            assert!(described, "`{}` is written with no comment above it:\n{rendered}", field.path);
+            assert!(
+                described,
+                "`{}` is written with no comment above it:\n{rendered}",
+                field.path
+            );
         }
     }
 

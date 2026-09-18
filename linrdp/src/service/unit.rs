@@ -188,7 +188,10 @@ mod tests {
         let text = describe_displaced(&units);
         assert!(text.contains("--auth greeter"), "the old settings are shown: {text}");
         assert!(text.contains("0.0.0.0:3390"), "including the port: {text}");
-        assert!(!text.contains("unrelated"), "somebody else's unit is not touched: {text}");
+        assert!(
+            !text.contains("unrelated"),
+            "somebody else's unit is not touched: {text}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -197,8 +200,7 @@ mod tests {
     #[test]
     fn a_unit_that_already_starts_this_is_not_displaced() {
         let dir = temp_dir("same");
-        std::fs::write(dir.join("linrdp.service"), body(Path::new("/usr/local/bin/linrdp")))
-            .expect("seed");
+        std::fs::write(dir.join("linrdp.service"), body(Path::new("/usr/local/bin/linrdp"))).expect("seed");
         assert!(displaced(&dir, "/usr/local/bin/linrdp").is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }

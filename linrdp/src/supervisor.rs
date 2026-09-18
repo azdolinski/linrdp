@@ -45,7 +45,10 @@ pub(crate) fn bind_all(config: &Config) -> anyhow::Result<Vec<Bound>> {
 
     for listener in &config.listeners {
         match TcpListener::bind(listener.bind.as_str()) {
-            Ok(socket) => bound.push(Bound { listener: socket, bind: listener.bind.clone() }),
+            Ok(socket) => bound.push(Bound {
+                listener: socket,
+                bind: listener.bind.clone(),
+            }),
             Err(error) => failures.push(format!("{}: {error}", listener.bind)),
         }
     }
@@ -232,9 +235,9 @@ fn worker_program(exe: &std::path::Path) -> std::path::PathBuf {
     match raw.strip_suffix(b" (deleted)") {
         // SAFETY: the bytes came from an OsStr and are a prefix of it, so they
         // are still whatever encoding the platform uses for paths.
-        Some(trimmed) => std::path::PathBuf::from(unsafe {
-            std::ffi::OsString::from_encoded_bytes_unchecked(trimmed.to_vec())
-        }),
+        Some(trimmed) => {
+            std::path::PathBuf::from(unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(trimmed.to_vec()) })
+        }
         None => exe.to_path_buf(),
     }
 }
@@ -339,7 +342,10 @@ mod tests {
     /// of how to write the same address.
     #[test]
     fn the_listener_argument_is_the_bind_literal_verbatim() {
-        assert_eq!(worker_argv("[::1]:3389"), vec!["--listener".to_owned(), "[::1]:3389".to_owned()]);
+        assert_eq!(
+            worker_argv("[::1]:3389"),
+            vec!["--listener".to_owned(), "[::1]:3389".to_owned()]
+        );
     }
 
     /// Nothing but the listener's name reaches a worker. A setting smuggled in
@@ -348,8 +354,18 @@ mod tests {
     #[test]
     fn a_worker_is_told_nothing_but_which_listener_it_serves() {
         let argv = worker_argv("0.0.0.0:3389");
-        for flag in ["--auth", "--bind-addr", "--usb", "--console", "--fixed-size", "--display-range"] {
-            assert!(!argv.iter().any(|a| a == flag), "`{flag}` reached a worker through argv");
+        for flag in [
+            "--auth",
+            "--bind-addr",
+            "--usb",
+            "--console",
+            "--fixed-size",
+            "--display-range",
+        ] {
+            assert!(
+                !argv.iter().any(|a| a == flag),
+                "`{flag}` reached a worker through argv"
+            );
         }
     }
 

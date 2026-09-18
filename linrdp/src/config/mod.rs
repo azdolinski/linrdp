@@ -84,10 +84,7 @@ impl FromStr for DisplayRange {
             low >= 1,
             "session.display_range must start at 1 or above (:0 is a physical seat)"
         );
-        anyhow::ensure!(
-            low <= high,
-            "session.display_range expects LOW-HIGH with LOW <= HIGH"
-        );
+        anyhow::ensure!(low <= high, "session.display_range expects LOW-HIGH with LOW <= HIGH");
         Ok(Self(low..=high))
     }
 }
@@ -131,7 +128,8 @@ macro_rules! string_serde {
         impl<'de> Deserialize<'de> for $ty {
             fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
                 let raw = String::deserialize(de)?;
-                raw.parse().map_err(|e: anyhow::Error| serde::de::Error::custom(format!("{e:#}")))
+                raw.parse()
+                    .map_err(|e: anyhow::Error| serde::de::Error::custom(format!("{e:#}")))
             }
         }
 
@@ -258,13 +256,21 @@ impl Default for Session {
 
 impl Default for Features {
     fn default() -> Self {
-        Self { usb: false, udp: true, avc444v2: true, wayland: false }
+        Self {
+            usb: false,
+            udp: true,
+            avc444v2: true,
+            wayland: false,
+        }
     }
 }
 
 impl Default for Log {
     fn default() -> Self {
-        Self { level: "info".to_owned(), file: Some(PathBuf::from("/var/log/linrdp/linrdp.log")) }
+        Self {
+            level: "info".to_owned(),
+            file: Some(PathBuf::from("/var/log/linrdp/linrdp.log")),
+        }
     }
 }
 
@@ -479,8 +485,7 @@ impl Config {
 fn parse(path: &Path, body: &str) -> anyhow::Result<Config> {
     let config: Config = serde_norway::from_str(body)
         .with_context(|| format!("{} is not a valid linrdp configuration", path.display()))?;
-    validate(&config)
-        .with_context(|| format!("{} is not a valid linrdp configuration", path.display()))?;
+    validate(&config).with_context(|| format!("{} is not a valid linrdp configuration", path.display()))?;
     Ok(config)
 }
 
@@ -509,10 +514,14 @@ pub(crate) struct Loaded {
 /// configured incorrectly".
 pub(crate) fn load_or_default(path: &Path) -> anyhow::Result<Loaded> {
     match std::fs::read_to_string(path) {
-        Ok(body) => parse(path, &body).map(|config| Loaded { config, from_defaults: false }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(Loaded { config: Config::builtin_default(), from_defaults: true })
-        }
+        Ok(body) => parse(path, &body).map(|config| Loaded {
+            config,
+            from_defaults: false,
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Loaded {
+            config: Config::builtin_default(),
+            from_defaults: true,
+        }),
         Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
     }
 }
@@ -539,8 +548,7 @@ pub(crate) fn load_for_diagnostics(path: &Path) -> (Config, Option<String>) {
 /// worker, where guessing `auth: both` over a written `auth: system` would
 /// authenticate more weakly than anyone asked, in silence.
 pub(crate) fn load_strict(path: &Path) -> anyhow::Result<Config> {
-    let body = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let body = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     parse(path, &body)
 }
 
@@ -657,7 +665,10 @@ session:
         let config: Config = serde_norway::from_str(body).expect("parses");
         let effective = config.effective("0.0.0.0:3389").expect("listener");
         assert_eq!(effective.session.display_range.to_string(), "20-30");
-        assert_eq!(effective.session.fixed_size.map(|s| s.to_string()).as_deref(), Some("1920x1080"));
+        assert_eq!(
+            effective.session.fixed_size.map(|s| s.to_string()).as_deref(),
+            Some("1920x1080")
+        );
         assert!(effective.session.lock_on_disconnect);
         assert_eq!(effective.auth, Auth::Nla);
     }

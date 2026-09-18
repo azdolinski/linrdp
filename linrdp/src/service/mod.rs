@@ -50,8 +50,7 @@ impl Layout {
             // Where this very binary is running from, so the unit starts the
             // thing the operator just ran rather than one they may not have
             // installed yet.
-            binary: std::env::current_exe()
-                .unwrap_or_else(|_| PathBuf::from("/usr/local/bin/linrdp")),
+            binary: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/local/bin/linrdp")),
         }
     }
 
@@ -99,7 +98,12 @@ fn install(layout: &Layout) -> anyhow::Result<()> {
         std::fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
     }
     harden(&layout.state, 0o700)?;
-    println!("  directories   {}, {}, {}", layout.etc.display(), layout.state.display(), layout.log.display());
+    println!(
+        "  directories   {}, {}, {}",
+        layout.etc.display(),
+        layout.state.display(),
+        layout.log.display()
+    );
 
     // 2. The PAM service each session opens.
     let pam_service = layout.pam_dir.join("linrdp");
@@ -114,7 +118,10 @@ fn install(layout: &Layout) -> anyhow::Result<()> {
     //    has set.
     let config_file = layout.config_file();
     if ensure_config(&config_file)? {
-        println!("  config        {} (written, with every key described in it)", config_file.display());
+        println!(
+            "  config        {} (written, with every key described in it)",
+            config_file.display()
+        );
     } else {
         println!("  config        {} (left as it is)", config_file.display());
     }
@@ -210,7 +217,10 @@ fn uninstall(layout: &Layout) -> anyhow::Result<()> {
     println!();
     println!("Left alone, because they are yours and not ours:");
     println!("  {}", layout.config_file().display());
-    println!("  {} (the TLS identity and the captured passwords)", layout.state.display());
+    println!(
+        "  {} (the TLS identity and the captured passwords)",
+        layout.state.display()
+    );
     println!("  {}", layout.log.display());
     Ok(())
 }
@@ -289,7 +299,13 @@ mod tests {
             log: root.join("var/log/linrdp"),
             binary: PathBuf::from("/usr/local/bin/linrdp"),
         };
-        for dir in [&layout.etc, &layout.unit_dir, &layout.pam_dir, &layout.state, &layout.log] {
+        for dir in [
+            &layout.etc,
+            &layout.unit_dir,
+            &layout.pam_dir,
+            &layout.state,
+            &layout.log,
+        ] {
             std::fs::create_dir_all(dir).expect("temp layout");
         }
         Fixture { root, layout }
@@ -304,7 +320,10 @@ mod tests {
         std::fs::write(layout.config_file(), mine).expect("seed");
 
         for _ in 0..2 {
-            assert!(!ensure_config(&layout.config_file()).expect("no write"), "nothing written");
+            assert!(
+                !ensure_config(&layout.config_file()).expect("no write"),
+                "nothing written"
+            );
         }
         assert_eq!(
             std::fs::read_to_string(layout.config_file()).expect("read"),
@@ -318,7 +337,10 @@ mod tests {
     fn install_writes_a_configuration_when_there_is_none() {
         let layout = &fixture("newconfig").layout;
         assert!(ensure_config(&layout.config_file()).expect("written"));
-        assert!(!ensure_config(&layout.config_file()).expect("second run"), "only the first time");
+        assert!(
+            !ensure_config(&layout.config_file()).expect("second run"),
+            "only the first time"
+        );
         crate::config::load_strict(&layout.config_file()).expect("the service starts on it");
     }
 
@@ -327,13 +349,18 @@ mod tests {
     #[test]
     fn the_configuration_install_writes_is_valid_and_self_describing() {
         let layout = &fixture("freshconfig").layout;
-        let fresh = crate::config::load_or_default(&layout.config_file()).expect("defaults").config;
+        let fresh = crate::config::load_or_default(&layout.config_file())
+            .expect("defaults")
+            .config;
         let body = crate::config::render(&fresh);
         crate::atomic::write(&layout.config_file(), &body, 0o644).expect("write");
 
         let reloaded = crate::config::load_strict(&layout.config_file()).expect("starts on it");
         assert_eq!(reloaded, fresh);
-        assert!(body.contains("# How a login is verified"), "the keys are described: {body}");
+        assert!(
+            body.contains("# How a login is verified"),
+            "the keys are described: {body}"
+        );
     }
 
     /// The PAM service file is what gives a session its /run/user/<uid>, and
@@ -353,6 +380,9 @@ mod tests {
             return; // running as root; the refusal cannot be provoked
         }
         let error = require_root("install").expect_err("refused");
-        assert!(format!("{error:#}").contains("sudo linrdp service install"), "got: {error:#}");
+        assert!(
+            format!("{error:#}").contains("sudo linrdp service install"),
+            "got: {error:#}"
+        );
     }
 }

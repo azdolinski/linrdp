@@ -160,11 +160,7 @@ fn check_tls(config: &Config, problems: &mut Vec<String>) {
         let Ok(effective) = config.effective(&listener.bind) else {
             continue;
         };
-        complain_about_a_half_identity(
-            &format!("listener `{}`", listener.bind),
-            &effective.tls,
-            problems,
-        );
+        complain_about_a_half_identity(&format!("listener `{}`", listener.bind), &effective.tls, problems);
     }
 }
 
@@ -200,19 +196,20 @@ mod tests {
     /// wearing it would be indistinguishable the moment a connection arrived.
     #[test]
     fn two_listeners_on_the_same_bind_are_refused() {
-        let message = refusal(
-            "listeners:\n  - bind: 0.0.0.0:3389\n    auth: both\n  - bind: 0.0.0.0:3389\n    auth: nla\n",
+        let message =
+            refusal("listeners:\n  - bind: 0.0.0.0:3389\n    auth: both\n  - bind: 0.0.0.0:3389\n    auth: nla\n");
+        assert!(
+            message.contains("two listeners are bound to `0.0.0.0:3389`"),
+            "got: {message}"
         );
-        assert!(message.contains("two listeners are bound to `0.0.0.0:3389`"), "got: {message}");
     }
 
     /// Same socket, two spellings — the duplicate check has to see through the
     /// notation, or the literal match downstream becomes a coin toss.
     #[test]
     fn one_socket_written_two_ways_is_still_a_duplicate() {
-        let message = refusal(
-            "listeners:\n  - bind: 127.0.0.1:3389\n    auth: both\n  - bind: 127.0.0.1:3389\n    auth: nla\n",
-        );
+        let message =
+            refusal("listeners:\n  - bind: 127.0.0.1:3389\n    auth: both\n  - bind: 127.0.0.1:3389\n    auth: nla\n");
         assert!(message.contains("3389"), "got: {message}");
     }
 
@@ -251,9 +248,8 @@ mod tests {
     /// either somebody else's screen or nobody's.
     #[test]
     fn console_without_a_display_is_refused() {
-        let message = refusal(
-            "listeners:\n  - bind: 0.0.0.0:3389\n    auth: both\nsession:\n  console: { enabled: true }\n",
-        );
+        let message =
+            refusal("listeners:\n  - bind: 0.0.0.0:3389\n    auth: both\nsession:\n  console: { enabled: true }\n");
         assert!(message.contains("console.display"), "got: {message}");
     }
 
@@ -269,9 +265,8 @@ mod tests {
 
     #[test]
     fn a_certificate_without_its_key_is_refused() {
-        let message = refusal(
-            "listeners:\n  - bind: 0.0.0.0:3389\n    auth: both\ntls:\n  cert: /etc/ssl/linrdp.pem\n",
-        );
+        let message =
+            refusal("listeners:\n  - bind: 0.0.0.0:3389\n    auth: both\ntls:\n  cert: /etc/ssl/linrdp.pem\n");
         assert!(message.contains("without `tls.key`"), "got: {message}");
     }
 
@@ -285,19 +280,19 @@ mod tests {
     /// Two typos should cost one restart, not two.
     #[test]
     fn every_problem_is_reported_not_just_the_first() {
-        let message = refusal(
-            "listeners:\n  - bind: nonsense\n    auth: both\n  - bind: also-nonsense\n    auth: nla\n",
-        );
+        let message =
+            refusal("listeners:\n  - bind: nonsense\n    auth: both\n  - bind: also-nonsense\n    auth: nla\n");
         assert!(message.contains("2 problems"), "got: {message}");
-        assert!(message.contains("nonsense") && message.contains("also-nonsense"), "got: {message}");
+        assert!(
+            message.contains("nonsense") && message.contains("also-nonsense"),
+            "got: {message}"
+        );
     }
 
     /// The shape every deployment starts from has to survive validation.
     #[test]
     fn the_two_listener_deployment_this_replaces_is_valid() {
-        parse(
-            "listeners:\n  - bind: 0.0.0.0:3389\n    auth: both\n  - bind: 0.0.0.0:3390\n    auth: greeter\n",
-        )
-        .expect("the shape of the two units this replaces");
+        parse("listeners:\n  - bind: 0.0.0.0:3389\n    auth: both\n  - bind: 0.0.0.0:3390\n    auth: greeter\n")
+            .expect("the shape of the two units this replaces");
     }
 }

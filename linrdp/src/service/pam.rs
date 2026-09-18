@@ -34,14 +34,14 @@ pub(crate) const MARKER: &str = "# linrdp credential capture — added by `linrd
 /// stack is never run, so the stored copy would silently stop following
 /// password changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Kind {
+pub(crate) enum Stack {
     /// Every successful authentication — su, ssh, console, sudo.
     Auth,
     /// Every password change, so the stored copy does not go stale.
     Password,
 }
 
-impl Kind {
+impl Stack {
     fn keyword(self) -> &'static str {
         match self {
             Self::Auth => "auth",
@@ -53,8 +53,8 @@ impl Kind {
 /// What happened to one file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Outcome {
-    Added(PathBuf, Kind),
-    AlreadyPresent(PathBuf, Kind),
+    Added(PathBuf, Stack),
+    AlreadyPresent(PathBuf, Stack),
     Removed(PathBuf),
     /// The file is not on this distribution.
     Absent(PathBuf),
@@ -65,17 +65,20 @@ pub(crate) enum Outcome {
 ///
 /// Debian splits the stacks; RedHat and SUSE combine them, so `system-auth`
 /// and `password-auth` each take both lines.
-pub(crate) fn candidates(pam_dir: &Path) -> Vec<(PathBuf, &'static [Kind])> {
+pub(crate) fn candidates(pam_dir: &Path) -> Vec<(PathBuf, &'static [Stack])> {
+    const AUTH: &[Stack] = &[Stack::Auth];
+    const PASSWORD: &[Stack] = &[Stack::Password];
+    const BOTH: &[Stack] = &[Stack::Auth, Stack::Password];
     vec![
-        (pam_dir.join("common-auth"), &[Kind::Auth] as &[Kind]),
-        (pam_dir.join("common-password"), &[Kind::Password]),
-        (pam_dir.join("system-auth"), &[Kind::Auth, Kind::Password]),
-        (pam_dir.join("password-auth"), &[Kind::Auth, Kind::Password]),
+        (pam_dir.join("common-auth"), AUTH),
+        (pam_dir.join("common-password"), PASSWORD),
+        (pam_dir.join("system-auth"), BOTH),
+        (pam_dir.join("password-auth"), BOTH),
     ]
 }
 
 /// The line itself.
-pub(crate) fn line_for(kind: Kind, binary: &Path) -> String {
+pub(crate) fn line_for(kind: Stack, binary: &Path) -> String {
     format!(
         "{:<9} optional  pam_exec.so expose_authtok quiet {} --capture-credential",
         kind.keyword(),
@@ -88,12 +91,7 @@ pub(crate) fn line_for(kind: Kind, binary: &Path) -> String {
 /// `verify` is handed the proposed file and says whether it is still a usable
 /// stack; when it says no, the file is restored from the backup and the error
 /// explains that nothing was changed.
-pub(crate) fn wire(
-    path: &Path,
-    kind: Kind,
-    binary: &Path,
-    verify: &dyn Fn(&str) -> bool,
-) -> anyhow::Result<Outcome> {
+pub(crate) fn wire(path: &Path, kind: Stack, binary: &Path, verify: &dyn Fn(&str) -> bool) -> anyhow::Result<Outcome> {
     let Ok(original) = std::fs::read_to_string(path) else {
         // Not this distribution's layout. Creating the file would replace a
         // stack PAM falls back to with one that says only what we put in it.
@@ -126,11 +124,9 @@ pub(crate) fn wire(
 
     // The backup goes down before the file is touched, and stays afterwards.
     let backup = backup_path(path);
-    std::fs::write(&backup, original.as_bytes())
-        .with_context(|| format!("write the backup {}", backup.display()))?;
+    std::fs::write(&backup, original.as_bytes()).with_context(|| format!("write the backup {}", backup.display()))?;
 
-    crate::atomic::write(path, &proposed, mode_of(path))
-        .with_context(|| format!("write {}", path.display()))?;
+    crate::atomic::write(path, &proposed, mode_of(path)).with_context(|| format!("write {}", path.display()))?;
 
     Ok(Outcome::Added(path.to_path_buf(), kind))
 }
@@ -167,10 +163,8 @@ pub(crate) fn unwire(path: &Path) -> anyhow::Result<Outcome> {
     let mut body = kept.join("\n");
     body.push('\n');
     let backup = backup_path(path);
-    std::fs::write(&backup, original.as_bytes())
-        .with_context(|| format!("write the backup {}", backup.display()))?;
-    crate::atomic::write(path, &body, mode_of(path))
-        .with_context(|| format!("write {}", path.display()))?;
+    std::fs::write(&backup, original.as_bytes()).with_context(|| format!("write the backup {}", backup.display()))?;
+    crate::atomic::write(path, &body, mode_of(path)).with_context(|| format!("write {}", path.display()))?;
     Ok(Outcome::Removed(path.to_path_buf()))
 }
 
@@ -185,7 +179,7 @@ fn mode_of(path: &Path) -> u32 {
     std::fs::metadata(path).map_or(0o644, |meta| meta.permissions().mode() & 0o7777)
 }
 
-fn has_capture(body: &str, kind: Kind) -> bool {
+fn has_capture(body: &str, kind: Stack) -> bool {
     body.lines().any(|line| {
         let trimmed = line.trim_start();
         !trimmed.starts_with('#')
@@ -200,8 +194,16 @@ fn has_capture(body: &str, kind: Kind) -> bool {
 /// that matters, a file mangled into something whose lines no longer begin
 /// with a module type, and it is the default `verify` for [`wire`].
 pub(crate) fn looks_like_a_stack(body: &str) -> bool {
-    const TYPES: [&str; 8] =
-        ["auth", "account", "password", "session", "-auth", "-account", "-password", "-session"];
+    const TYPES: [&str; 8] = [
+        "auth",
+        "account",
+        "password",
+        "session",
+        "-auth",
+        "-account",
+        "-password",
+        "-session",
+    ];
     body.lines().all(|line| {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('@') {
@@ -252,27 +254,37 @@ auth    required                        pam_permit.so
     /// slow cannot turn a console login into a locked door.
     #[test]
     fn the_line_is_optional_and_stays_optional() {
-        let line = line_for(Kind::Auth, &binary());
+        let line = line_for(Stack::Auth, &binary());
         let fields: Vec<&str> = line.split_whitespace().collect();
         assert_eq!(fields[0], "auth");
-        assert_eq!(fields[1], "optional", "the control flag is what makes this safe: {line}");
+        assert_eq!(
+            fields[1], "optional",
+            "the control flag is what makes this safe: {line}"
+        );
         assert_eq!(fields[2], "pam_exec.so");
-        assert!(line.contains("expose_authtok"), "without it the helper gets no password");
+        assert!(
+            line.contains("expose_authtok"),
+            "without it the helper gets no password"
+        );
     }
 
     /// A `password` line in the auth stack is never run, so the stored copy
     /// would quietly stop following password changes.
     #[test]
     fn the_type_matches_the_stack_it_is_written_into() {
-        assert!(line_for(Kind::Password, &binary()).starts_with("password"));
+        assert!(line_for(Stack::Password, &binary()).starts_with("password"));
         let (dir, _) = seeded("types", DEBIAN_COMMON_AUTH);
         let wants: Vec<_> = candidates(&dir)
             .into_iter()
             .map(|(path, kinds)| (path.file_name().expect("name").to_string_lossy().into_owned(), kinds))
             .collect();
-        assert_eq!(wants[0].1, &[Kind::Auth]);
-        assert_eq!(wants[1].1, &[Kind::Password]);
-        assert_eq!(wants[2].1, &[Kind::Auth, Kind::Password], "RedHat combines the stacks");
+        assert_eq!(wants[0].1, &[Stack::Auth]);
+        assert_eq!(wants[1].1, &[Stack::Password]);
+        assert_eq!(
+            wants[2].1,
+            &[Stack::Auth, Stack::Password],
+            "RedHat combines the stacks"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -283,12 +295,12 @@ auth    required                        pam_permit.so
         let (dir, path) = seeded("idem", DEBIAN_COMMON_AUTH);
 
         assert!(matches!(
-            wire(&path, Kind::Auth, &binary(), &always_fine).expect("first"),
+            wire(&path, Stack::Auth, &binary(), &always_fine).expect("first"),
             Outcome::Added(..)
         ));
         for _ in 0..2 {
             assert!(matches!(
-                wire(&path, Kind::Auth, &binary(), &always_fine).expect("again"),
+                wire(&path, Stack::Auth, &binary(), &always_fine).expect("again"),
                 Outcome::AlreadyPresent(..)
             ));
         }
@@ -303,7 +315,7 @@ auth    required                        pam_permit.so
     #[test]
     fn a_backup_is_written_before_the_file_is_changed() {
         let (dir, path) = seeded("backup", DEBIAN_COMMON_AUTH);
-        wire(&path, Kind::Auth, &binary(), &always_fine).expect("added");
+        wire(&path, Stack::Auth, &binary(), &always_fine).expect("added");
 
         let backup = std::fs::read_to_string(dir.join("common-auth.linrdp-backup")).expect("backup");
         assert_eq!(backup, DEBIAN_COMMON_AUTH, "the backup is the file as it was");
@@ -324,11 +336,15 @@ auth    required                        pam_permit.so
         // The hand-written capture line is already there, so install adds
         // nothing — and uninstall must still leave the file exactly as it is.
         assert!(matches!(
-            wire(&path, Kind::Auth, &binary(), &always_fine).expect("skipped"),
+            wire(&path, Stack::Auth, &binary(), &always_fine).expect("skipped"),
             Outcome::AlreadyPresent(..)
         ));
         unwire(&path).expect("nothing of ours to remove");
-        assert_eq!(std::fs::read_to_string(&path).expect("read"), seed, "nothing of ours was there");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            seed,
+            "nothing of ours was there"
+        );
 
         // Now with a line of ours present too.
         std::fs::write(&path, DEBIAN_COMMON_AUTH).expect("reseed");
@@ -337,7 +353,7 @@ auth    required                        pam_permit.so
             format!("{DEBIAN_COMMON_AUTH}auth    optional   pam_exec.so /usr/local/bin/notify-login\n"),
         )
         .expect("reseed");
-        wire(&path, Kind::Auth, &binary(), &always_fine).expect("added");
+        wire(&path, Stack::Auth, &binary(), &always_fine).expect("added");
         assert!(matches!(unwire(&path).expect("removed"), Outcome::Removed(_)));
 
         let body = std::fs::read_to_string(&path).expect("read");
@@ -353,7 +369,7 @@ auth    required                        pam_permit.so
     #[test]
     fn a_result_that_is_not_a_stack_leaves_the_file_alone() {
         let (dir, path) = seeded("verify", DEBIAN_COMMON_AUTH);
-        let error = wire(&path, Kind::Auth, &binary(), &|_| false).expect_err("refused");
+        let error = wire(&path, Stack::Auth, &binary(), &|_| false).expect_err("refused");
 
         assert!(format!("{error:#}").contains("Nothing was changed"), "got: {error:#}");
         assert_eq!(std::fs::read_to_string(&path).expect("read"), DEBIAN_COMMON_AUTH);
@@ -367,7 +383,7 @@ auth    required                        pam_permit.so
         let dir = temp_dir("absent");
         let path = dir.join("system-auth");
         assert!(matches!(
-            wire(&path, Kind::Auth, &binary(), &always_fine).expect("absent"),
+            wire(&path, Stack::Auth, &binary(), &always_fine).expect("absent"),
             Outcome::Absent(_)
         ));
         assert!(!path.exists(), "no file was conjured up");
@@ -378,7 +394,9 @@ auth    required                        pam_permit.so
     fn the_structural_check_accepts_a_real_stack_and_rejects_rubbish() {
         assert!(looks_like_a_stack(DEBIAN_COMMON_AUTH));
         assert!(looks_like_a_stack("@include common-auth\n\n# comment\n"));
-        assert!(!looks_like_a_stack("auth required pam_unix.so\nthis is not a pam line\n"));
+        assert!(!looks_like_a_stack(
+            "auth required pam_unix.so\nthis is not a pam line\n"
+        ));
     }
 
     /// A file with no trailing newline would otherwise get our marker glued
@@ -386,7 +404,7 @@ auth    required                        pam_permit.so
     #[test]
     fn a_file_without_a_trailing_newline_is_still_appended_to_safely() {
         let (dir, path) = seeded("nonewline", "auth required pam_unix.so");
-        wire(&path, Kind::Auth, &binary(), &always_fine).expect("added");
+        wire(&path, Stack::Auth, &binary(), &always_fine).expect("added");
 
         let body = std::fs::read_to_string(&path).expect("read");
         assert!(body.starts_with("auth required pam_unix.so\n"), "{body}");

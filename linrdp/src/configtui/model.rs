@@ -14,13 +14,13 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use crate::config::meta::{self, Kind};
+use crate::config::meta;
 use crate::config::{Auth, Config, DisplayRange, Listener, Size};
 
-/// Every key that lives in a global block, and may therefore also be
+/// Every setting that lives in a global block, and may therefore also be
 /// overridden on one listener.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Key {
+pub(crate) enum Setting {
     DisplayRange,
     FixedSize,
     LockOnDisconnect,
@@ -38,7 +38,7 @@ pub(crate) enum Key {
     LogFile,
 }
 
-impl Key {
+impl Setting {
     /// The metadata path — which is also the help text, the allowed values and
     /// the documented default.
     pub(crate) fn schema(self) -> &'static str {
@@ -116,23 +116,16 @@ impl Key {
                 .as_ref()?
                 .fixed_size
                 .map(|size| opt(size.map(|s| s.to_string()))),
-            Self::LockOnDisconnect => {
-                overrides.session.as_ref()?.lock_on_disconnect.map(|v| v.to_string())
-            }
-            Self::SwitchToGreeter => {
-                overrides.session.as_ref()?.switch_to_greeter.map(|v| v.to_string())
-            }
-            Self::ConsoleEnabled => {
-                overrides.session.as_ref()?.console.as_ref()?.enabled.map(|v| v.to_string())
-            }
-            Self::ConsoleDisplay => overrides
+            Self::LockOnDisconnect => overrides.session.as_ref()?.lock_on_disconnect.map(|v| v.to_string()),
+            Self::SwitchToGreeter => overrides.session.as_ref()?.switch_to_greeter.map(|v| v.to_string()),
+            Self::ConsoleEnabled => overrides
                 .session
                 .as_ref()?
                 .console
                 .as_ref()?
-                .display
-                .clone()
-                .map(opt),
+                .enabled
+                .map(|v| v.to_string()),
+            Self::ConsoleDisplay => overrides.session.as_ref()?.console.as_ref()?.display.clone().map(opt),
             Self::ConsoleXauthority => overrides
                 .session
                 .as_ref()?
@@ -168,8 +161,8 @@ impl Key {
 pub(crate) enum Slot {
     Bind(usize),
     ListenerAuth(usize),
-    Global(Key),
-    Override(usize, Key),
+    Global(Setting),
+    Override(usize, Setting),
 }
 
 impl Slot {
@@ -184,16 +177,13 @@ impl Slot {
     /// The value as written, with `null` for a key nobody has set.
     pub(crate) fn get(self, config: &Config) -> String {
         match self {
-            Self::Bind(index) => {
-                config.listeners.get(index).map(|l| l.bind.clone()).unwrap_or_default()
-            }
-            Self::ListenerAuth(index) => {
-                config.listeners.get(index).map_or_else(String::new, |l| l.auth.to_string())
-            }
+            Self::Bind(index) => config.listeners.get(index).map(|l| l.bind.clone()).unwrap_or_default(),
+            Self::ListenerAuth(index) => config
+                .listeners
+                .get(index)
+                .map_or_else(String::new, |l| l.auth.to_string()),
             Self::Global(key) => key.get(config),
-            Self::Override(index, key) => {
-                key.override_of(config, index).unwrap_or_else(|| key.get(config))
-            }
+            Self::Override(index, key) => key.override_of(config, index).unwrap_or_else(|| key.get(config)),
         }
     }
 
@@ -288,7 +278,12 @@ impl Model {
         let collapsed = (0..config.listeners.len())
             .map(|index| format!("listeners[{index}].overrides"))
             .collect();
-        Self { config, collapsed, cursor: 0, dirty: false }
+        Self {
+            config,
+            collapsed,
+            cursor: 0,
+            dirty: false,
+        }
     }
 
     /// Every line currently on screen, top to bottom.
@@ -304,20 +299,33 @@ impl Model {
         self.push_block(
             &mut rows,
             "session",
-            &[Key::DisplayRange, Key::FixedSize, Key::LockOnDisconnect, Key::SwitchToGreeter],
+            &[
+                Setting::DisplayRange,
+                Setting::FixedSize,
+                Setting::LockOnDisconnect,
+                Setting::SwitchToGreeter,
+            ],
         );
         if self.is_open("session") {
             self.push_branch(&mut rows, 1, "session.console", "console".to_owned(), "session.console");
             if self.is_open("session.console") {
-                for key in [Key::ConsoleEnabled, Key::ConsoleDisplay, Key::ConsoleXauthority] {
+                for key in [
+                    Setting::ConsoleEnabled,
+                    Setting::ConsoleDisplay,
+                    Setting::ConsoleXauthority,
+                ] {
                     rows.push(self.global_row(2, key));
                 }
             }
         }
 
-        self.push_block(&mut rows, "features", &[Key::Usb, Key::Udp, Key::Avc444v2, Key::Wayland]);
-        self.push_block(&mut rows, "tls", &[Key::TlsCert, Key::TlsKey]);
-        self.push_block(&mut rows, "log", &[Key::LogLevel, Key::LogFile]);
+        self.push_block(
+            &mut rows,
+            "features",
+            &[Setting::Usb, Setting::Udp, Setting::Avc444v2, Setting::Wayland],
+        );
+        self.push_block(&mut rows, "tls", &[Setting::TlsCert, Setting::TlsKey]);
+        self.push_block(&mut rows, "log", &[Setting::LogLevel, Setting::LogFile]);
         rows
     }
 
@@ -356,7 +364,7 @@ impl Model {
         });
     }
 
-    fn push_block(&self, rows: &mut Vec<Row>, id: &'static str, keys: &[Key]) {
+    fn push_block(&self, rows: &mut Vec<Row>, id: &'static str, keys: &[Setting]) {
         self.push_branch(rows, 0, id, id.to_owned(), id);
         if self.is_open(id) {
             for key in keys {
@@ -365,7 +373,7 @@ impl Model {
         }
     }
 
-    fn global_row(&self, depth: usize, key: Key) -> Row {
+    fn global_row(&self, depth: usize, key: Setting) -> Row {
         let schema = key.schema();
         let value = Slot::Global(key).get(&self.config);
         Row {
@@ -374,7 +382,11 @@ impl Model {
             value: Some(value.clone()),
             schema,
             slot: Some(Slot::Global(key)),
-            source: if is_default(schema, &value) { Source::Default } else { Source::Set },
+            source: if is_default(schema, &value) {
+                Source::Default
+            } else {
+                Source::Set
+            },
             id: schema.to_owned(),
             expandable: false,
             expanded: false,
@@ -418,7 +430,7 @@ impl Model {
         if !self.is_open(&overrides_id) {
             return;
         }
-        for key in ALL_KEYS.iter().filter(|key| key.overridable()) {
+        for key in ALL_SETTINGS.iter().filter(|key| key.overridable()) {
             let slot = Slot::Override(index, *key);
             let overridden = key.override_of(&self.config, index);
             rows.push(Row {
@@ -430,7 +442,11 @@ impl Model {
                 value: Some(slot.get(&self.config)),
                 schema: key.schema(),
                 slot: Some(slot),
-                source: if overridden.is_some() { Source::Overridden } else { Source::Inherited },
+                source: if overridden.is_some() {
+                    Source::Overridden
+                } else {
+                    Source::Inherited
+                },
                 id: format!("{overrides_id}.{}", leaf_name(key.schema())),
                 expandable: false,
                 expanded: false,
@@ -472,25 +488,25 @@ impl Model {
 }
 
 /// Every global key, in the order the file writes them.
-pub(crate) const ALL_KEYS: [Key; 15] = [
-    Key::DisplayRange,
-    Key::FixedSize,
-    Key::LockOnDisconnect,
-    Key::SwitchToGreeter,
-    Key::ConsoleEnabled,
-    Key::ConsoleDisplay,
-    Key::ConsoleXauthority,
-    Key::Usb,
-    Key::Udp,
-    Key::Avc444v2,
-    Key::Wayland,
-    Key::TlsCert,
-    Key::TlsKey,
-    Key::LogLevel,
-    Key::LogFile,
+pub(crate) const ALL_SETTINGS: [Setting; 15] = [
+    Setting::DisplayRange,
+    Setting::FixedSize,
+    Setting::LockOnDisconnect,
+    Setting::SwitchToGreeter,
+    Setting::ConsoleEnabled,
+    Setting::ConsoleDisplay,
+    Setting::ConsoleXauthority,
+    Setting::Usb,
+    Setting::Udp,
+    Setting::Avc444v2,
+    Setting::Wayland,
+    Setting::TlsCert,
+    Setting::TlsKey,
+    Setting::LogLevel,
+    Setting::LogFile,
 ];
 
-fn set_override(config: &mut Config, index: usize, key: Key, raw: Option<&str>) -> anyhow::Result<()> {
+fn set_override(config: &mut Config, index: usize, key: Setting, raw: Option<&str>) -> anyhow::Result<()> {
     anyhow::ensure!(
         key.overridable(),
         "{}",
@@ -502,50 +518,54 @@ fn set_override(config: &mut Config, index: usize, key: Key, raw: Option<&str>) 
     let overrides = listener.overrides.get_or_insert_with(Default::default);
 
     match key {
-        Key::FixedSize => {
+        Setting::FixedSize => {
             let session = overrides.session.get_or_insert_with(Default::default);
             session.fixed_size = raw.map(parse_opt::<Size>).transpose()?;
         }
-        Key::LockOnDisconnect => {
+        Setting::LockOnDisconnect => {
             let session = overrides.session.get_or_insert_with(Default::default);
             session.lock_on_disconnect = raw.map(parse_bool).transpose()?;
         }
-        Key::SwitchToGreeter => {
+        Setting::SwitchToGreeter => {
             let session = overrides.session.get_or_insert_with(Default::default);
             session.switch_to_greeter = raw.map(parse_bool).transpose()?;
         }
-        Key::ConsoleEnabled => {
+        Setting::ConsoleEnabled => {
             let session = overrides.session.get_or_insert_with(Default::default);
             let console = session.console.get_or_insert_with(Default::default);
             console.enabled = raw.map(parse_bool).transpose()?;
         }
-        Key::ConsoleDisplay => {
+        Setting::ConsoleDisplay => {
             let session = overrides.session.get_or_insert_with(Default::default);
             let console = session.console.get_or_insert_with(Default::default);
             console.display = raw.map(unset_or);
         }
-        Key::ConsoleXauthority => {
+        Setting::ConsoleXauthority => {
             let session = overrides.session.get_or_insert_with(Default::default);
             let console = session.console.get_or_insert_with(Default::default);
             console.xauthority = raw.map(|value| unset_or(value).map(PathBuf::from));
         }
-        Key::Usb => overrides.features.get_or_insert_with(Default::default).usb = raw.map(parse_bool).transpose()?,
-        Key::Udp => overrides.features.get_or_insert_with(Default::default).udp = raw.map(parse_bool).transpose()?,
-        Key::Avc444v2 => {
+        Setting::Usb => {
+            overrides.features.get_or_insert_with(Default::default).usb = raw.map(parse_bool).transpose()?
+        }
+        Setting::Udp => {
+            overrides.features.get_or_insert_with(Default::default).udp = raw.map(parse_bool).transpose()?
+        }
+        Setting::Avc444v2 => {
             overrides.features.get_or_insert_with(Default::default).avc444v2 = raw.map(parse_bool).transpose()?;
         }
-        Key::Wayland => {
+        Setting::Wayland => {
             overrides.features.get_or_insert_with(Default::default).wayland = raw.map(parse_bool).transpose()?;
         }
-        Key::TlsCert => {
+        Setting::TlsCert => {
             overrides.tls.get_or_insert_with(Default::default).cert =
                 raw.map(|value| unset_or(value).map(PathBuf::from));
         }
-        Key::TlsKey => {
+        Setting::TlsKey => {
             overrides.tls.get_or_insert_with(Default::default).key =
                 raw.map(|value| unset_or(value).map(PathBuf::from));
         }
-        Key::DisplayRange | Key::LogLevel | Key::LogFile => {
+        Setting::DisplayRange | Setting::LogLevel | Setting::LogFile => {
             anyhow::bail!("{}", meta::override_refusal(key.schema()).unwrap_or("service-wide"))
         }
     }
@@ -572,12 +592,12 @@ fn is_empty_override(overrides: &crate::config::Overrides) -> bool {
             })
     });
     let features_empty = overrides.features.as_ref().is_none_or(|features| {
-        features.usb.is_none()
-            && features.udp.is_none()
-            && features.avc444v2.is_none()
-            && features.wayland.is_none()
+        features.usb.is_none() && features.udp.is_none() && features.avc444v2.is_none() && features.wayland.is_none()
     });
-    let tls_empty = overrides.tls.as_ref().is_none_or(|tls| tls.cert.is_none() && tls.key.is_none());
+    let tls_empty = overrides
+        .tls
+        .as_ref()
+        .is_none_or(|tls| tls.cert.is_none() && tls.key.is_none());
     session_empty && features_empty && tls_empty && overrides.log.is_none()
 }
 
@@ -588,9 +608,9 @@ pub(crate) fn leaf_name(schema: &str) -> &str {
 
 /// Whether a rendered value is the documented default, for the marker column.
 fn is_default(schema: &str, value: &str) -> bool {
-    meta::field(schema).and_then(|field| field.default).is_some_and(|default| {
-        default == value || (default == "unset" && value == "null")
-    })
+    meta::field(schema)
+        .and_then(|field| field.default)
+        .is_some_and(|default| default == value || (default == "unset" && value == "null"))
 }
 
 fn opt(value: Option<String>) -> String {
@@ -682,7 +702,7 @@ mod tests {
         let row = model
             .rows()
             .into_iter()
-            .find(|row| row.schema == "features.udp" && row.slot == Some(Slot::Global(Key::Udp)))
+            .find(|row| row.schema == "features.udp" && row.slot == Some(Slot::Global(Setting::Udp)))
             .expect("row");
         assert_eq!(row.value.as_deref(), Some("true"));
         assert_eq!(row.source, Source::Default);
@@ -697,7 +717,7 @@ mod tests {
         let row = model
             .rows()
             .into_iter()
-            .find(|row| row.slot == Some(Slot::Global(Key::Usb)))
+            .find(|row| row.slot == Some(Slot::Global(Setting::Usb)))
             .expect("row");
         assert_eq!(row.source, Source::Set);
     }
@@ -715,17 +735,21 @@ mod tests {
 
         let own = rows
             .iter()
-            .find(|row| row.slot == Some(Slot::Override(0, Key::Usb)))
+            .find(|row| row.slot == Some(Slot::Override(0, Setting::Usb)))
             .expect("row");
         assert_eq!(own.source, Source::Overridden);
         assert_eq!(own.value.as_deref(), Some("true"));
 
         let inherited = rows
             .iter()
-            .find(|row| row.slot == Some(Slot::Override(0, Key::Udp)))
+            .find(|row| row.slot == Some(Slot::Override(0, Setting::Udp)))
             .expect("row");
         assert_eq!(inherited.source, Source::Inherited);
-        assert_eq!(inherited.value.as_deref(), Some("true"), "the global value, shown as inherited");
+        assert_eq!(
+            inherited.value.as_deref(),
+            Some("true"),
+            "the global value, shown as inherited"
+        );
     }
 
     /// The two service-wide keys are not offered as overrides at all. Offering
@@ -734,7 +758,7 @@ mod tests {
     fn the_service_wide_keys_are_not_offered_as_overrides() {
         let mut model = Model::new(minimal());
         open_everything(&mut model);
-        for key in [Key::DisplayRange, Key::LogLevel, Key::LogFile] {
+        for key in [Setting::DisplayRange, Setting::LogLevel, Setting::LogFile] {
             assert!(
                 !model.rows().iter().any(|row| row.slot == Some(Slot::Override(0, key))),
                 "{} is offered as an override",
@@ -755,13 +779,18 @@ mod tests {
             .set(&mut model.config, "0.0.0.0:3389")
             .expect_err("refused");
         assert!(format!("{error:#}").contains("already bound"), "got: {error:#}");
-        assert_eq!(model.config.listeners[1].bind, "0.0.0.0:3390", "and the edit did not land");
+        assert_eq!(
+            model.config.listeners[1].bind, "0.0.0.0:3390",
+            "and the edit did not land"
+        );
     }
 
     #[test]
     fn a_value_that_is_not_an_address_is_refused_in_place() {
         let mut model = Model::new(minimal());
-        Slot::Bind(0).set(&mut model.config, "localhost:3389").expect_err("not an address");
+        Slot::Bind(0)
+            .set(&mut model.config, "localhost:3389")
+            .expect_err("not an address");
     }
 
     /// Setting an override and clearing it again must leave the file exactly
@@ -769,13 +798,16 @@ mod tests {
     #[test]
     fn clearing_the_last_override_removes_the_block_entirely() {
         let mut model = Model::new(minimal());
-        let slot = Slot::Override(0, Key::Usb);
+        let slot = Slot::Override(0, Setting::Usb);
 
         slot.set(&mut model.config, "true").expect("set");
         assert!(model.config.listeners[0].overrides.is_some());
 
         slot.clear(&mut model.config).expect("cleared");
-        assert!(model.config.listeners[0].overrides.is_none(), "no empty block left behind");
+        assert!(
+            model.config.listeners[0].overrides.is_none(),
+            "no empty block left behind"
+        );
     }
 
     /// A service with no listeners does not load, so the editor may not let
@@ -806,9 +838,15 @@ mod tests {
         let mut model = Model::new(minimal());
         model.add_listener().expect("added");
         Slot::ListenerAuth(1).set(&mut model.config, "greeter").expect("auth");
-        Slot::Override(1, Key::Usb).set(&mut model.config, "true").expect("override");
-        Slot::Global(Key::FixedSize).set(&mut model.config, "2880x1800").expect("size");
-        Slot::Global(Key::LogFile).set(&mut model.config, "null").expect("unset");
+        Slot::Override(1, Setting::Usb)
+            .set(&mut model.config, "true")
+            .expect("override");
+        Slot::Global(Setting::FixedSize)
+            .set(&mut model.config, "2880x1800")
+            .expect("size");
+        Slot::Global(Setting::LogFile)
+            .set(&mut model.config, "null")
+            .expect("unset");
 
         let rendered = crate::config::render(&model.config);
         let reloaded: Config = serde_norway::from_str(&rendered).expect("parses");

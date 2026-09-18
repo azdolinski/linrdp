@@ -78,11 +78,26 @@ const AUTH_VALUES: &[Value] = &[
 ];
 
 const LEVEL_VALUES: &[Value] = &[
-    Value { name: "error", gloss: "only what failed." },
-    Value { name: "warn", gloss: "failures and the conditions that lead to them." },
-    Value { name: "info", gloss: "one line per connection, session and listener. The useful default." },
-    Value { name: "debug", gloss: "protocol decisions. Verbose enough to be worth a log file of its own." },
-    Value { name: "trace", gloss: "everything, including per-frame work. Unusable on a busy server." },
+    Value {
+        name: "error",
+        gloss: "only what failed.",
+    },
+    Value {
+        name: "warn",
+        gloss: "failures and the conditions that lead to them.",
+    },
+    Value {
+        name: "info",
+        gloss: "one line per connection, session and listener. The useful default.",
+    },
+    Value {
+        name: "debug",
+        gloss: "protocol decisions. Verbose enough to be worth a log file of its own.",
+    },
+    Value {
+        name: "trace",
+        gloss: "everything, including per-frame work. Unusable on a busy server.",
+    },
 ];
 
 /// Why `display_range` is one setting for the whole service.
