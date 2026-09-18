@@ -149,7 +149,14 @@ fn spawn_keeper(
     use std::process::{Command, Stdio};
 
     let exe = std::env::current_exe().context("locate the linrdp binary")?;
-    let mut child = Command::new(exe)
+    let mut command = Command::new(exe);
+    // A keeper started from a worker that was pointed at a different
+    // configuration has to be pointed at the same one, or the session's log
+    // goes somewhere nobody is looking.
+    if !crate::config::path_is_default() {
+        command.arg("--config").arg(crate::config::path());
+    }
+    let mut child = command
         .arg("--keeper")
         .arg("--keeper-user")
         .arg(user)

@@ -43,8 +43,8 @@ use crate::input::X11InputHandler;
 
 const HELP: &str = "\
 USAGE:
-  linrdp [--bind-addr <ADDR>] [--auth both|nla|system] [--usb] [--log-file <PATH>]
-         [--fixed-size <WxH>]
+  linrdp [--bind-addr <ADDR>] [--auth both|nla|system] [--usb]
+         [--fixed-size <WxH>] [--config <PATH>]
 
 Serves a real Linux desktop over RDP.
 
@@ -93,9 +93,8 @@ Default bind: 0.0.0.0:3389. --usb enables USB device redirection (MS-RDPEUSB).
 and clients scale locally — recommended with mstsc, which composes EGFX
 poorly right after a mid-session RandR resize.
 
-Logging: written to /var/log/linrdp/linrdp.log when that directory can be
-created (falling back to the terminal), or to the file given with --log-file.
-Verbosity: LINRDP_LOG env var (default \"info,ironrdp=warn\").
+Logging: `log.file` and `log.level` in /etc/linrdp/config.yaml. Every key that
+file carries is described in it; `linrdp config` edits it.
 ";
 
 /// Supervisor mode forks per connection, and `fork` in a multi-threaded
@@ -139,8 +138,25 @@ fn keeper_main() -> anyhow::Result<()> {
     let state_dir = session::keeper_main::state_dir_from(args.opt_value_from_str("--keeper-state-dir")?);
     let size_spec: String = args.opt_value_from_str("--keeper-size")?.unwrap_or_else(|| "1920x1080".to_owned());
     let session_exec: String = args.opt_value_from_str("--keeper-exec")?.unwrap_or_default();
-    let log_file: Option<String> = args.opt_value_from_str("--log-file")?;
-    setup_logging(log_file.as_deref());
+    if let Some(path) = args.opt_value_from_str::<_, PathBuf>("--config")? {
+        config::set_path(path);
+    }
+
+    // The one place a bad configuration is not fatal. A worker that cannot
+    // read the file drops its connection; a keeper that refused to start would
+    // deny somebody their desktop over a typo in a key it does not even use.
+    // It reads the log block and nothing else, and says so when it falls back.
+    let (log, complaint) = match config::load_strict(config::path()) {
+        Ok(config) => (config.log, None),
+        Err(error) => (config::Log::default(), Some(format!("{error:#}"))),
+    };
+    setup_logging(&log);
+    if let Some(complaint) = complaint {
+        tracing::warn!(
+            error = %complaint,
+            "keeper: cannot read the configuration — logging with the built-in defaults, and starting the session anyway"
+        );
+    }
 
     let size = match size_spec.split_once(['x', 'X']) {
         Some((w, h)) => (
@@ -277,8 +293,17 @@ fn supervisor_main() -> anyhow::Result<()> {
     let bind_addr: SocketAddr = args
         .opt_value_from_str("--bind-addr")?
         .unwrap_or_else(|| "0.0.0.0:3389".parse().expect("valid default bind addr"));
-    let log_file: Option<String> = args.opt_value_from_str("--log-file")?;
-    setup_logging(log_file.as_deref());
+    if let Some(path) = args.opt_value_from_str::<_, PathBuf>("--config")? {
+        config::set_path(path);
+    }
+    let loaded = config::load_or_default(config::path())?;
+    setup_logging(&loaded.config.log);
+    if loaded.from_defaults {
+        tracing::info!(
+            path = %config::path().display(),
+            "no configuration file — serving the built-in defaults; `linrdp service install` writes one"
+        );
+    }
 
     // Seal a legacy cleartext SAM once, here in the long-lived root supervisor,
     // before any worker is forked. No-op when the store is missing or already
@@ -369,7 +394,9 @@ async fn serve() -> anyhow::Result<()> {
         .opt_value_from_str("--bind-addr")?
         .unwrap_or_else(|| "0.0.0.0:3389".parse().expect("valid default bind addr"));
 
-    let log_file: Option<String> = args.opt_value_from_str("--log-file")?;
+    if let Some(path) = args.opt_value_from_str::<_, PathBuf>("--config")? {
+        config::set_path(path);
+    }
 
     // Session lifecycle (KRdp SessionController pattern): lock the logind
     // session when the last client disconnects / unlock on reconnect, and
@@ -390,7 +417,24 @@ async fn serve() -> anyhow::Result<()> {
         None => None,
     };
 
-    setup_logging(log_file.as_deref());
+    // A worker is answering "what did the operator ask for on this port?", and
+    // there is no safe guess at that: it loads strictly and refuses the
+    // connection rather than serving one it invented. Without `--serve-fd`
+    // this process is somebody running linrdp by hand on a machine that may
+    // never have been configured, which is what the defaults are for.
+    let config = if serve_fd.is_some() {
+        config::load_strict(config::path())?
+    } else {
+        let loaded = config::load_or_default(config::path())?;
+        if loaded.from_defaults {
+            eprintln!(
+                "linrdp: no {} — using the built-in defaults",
+                config::path().display()
+            );
+        }
+        loaded.config
+    };
+    setup_logging(&config.log);
 
     // Seal a legacy cleartext store, once. In `--supervisor` mode the migration
     // already ran there before any worker forked (see `supervisor_main`); only
@@ -854,25 +898,30 @@ impl ironrdp_server::RdpServerInputHandler for AnyInput {
     }
 }
 
-fn setup_logging(log_file: Option<&str>) {
+/// Start logging as `log` asks.
+///
+/// The verbosity was `LINRDP_LOG` and the destination was `--log-file`; both
+/// are `log.level` and `log.file` now, so that "why is this machine quiet?"
+/// has one answer and it is in the same file as everything else.
+fn setup_logging(log: &config::Log) {
     use tracing_subscriber::EnvFilter;
 
-    let filter = EnvFilter::try_from_env("LINRDP_LOG").unwrap_or_else(|_| EnvFilter::new("info,ironrdp=warn"));
+    // A malformed filter must not be the reason a server does not start.
+    let filter = EnvFilter::try_new(&log.level).unwrap_or_else(|error| {
+        eprintln!("linrdp: log.level `{}` is not a filter ({error}); using info", log.level);
+        EnvFilter::new("info,ironrdp=warn")
+    });
 
-    // Prefer a file (--log-file, or /var/log/linrdp/linrdp.log when the
-    // directory can be created) so logs survive the terminal; the fallback
-    // is the terminal itself.
-    let default_path = std::path::Path::new("/var/log/linrdp/linrdp.log");
-    let path = match log_file {
-        Some(path) => std::path::PathBuf::from(path),
-        None => {
-            let dir = default_path.parent().expect("non-root default log path");
-            if std::fs::create_dir_all(dir).is_ok() {
-                default_path.to_path_buf()
-            } else {
-                PathBuf::new()
+    // A file so the log survives the terminal. `log.file: null` says the
+    // terminal is the destination, which under systemd means the journal.
+    let path = match &log.file {
+        Some(path) => {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
             }
+            path.clone()
         }
+        None => PathBuf::new(),
     };
 
     let file = if path.as_os_str().is_empty() {

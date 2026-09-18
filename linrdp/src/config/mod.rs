@@ -32,6 +32,30 @@ pub(crate) use validate::validate;
 /// Where the file lives unless `--config` says otherwise.
 pub(crate) const CONFIG_PATH: &str = "/etc/linrdp/config.yaml";
 
+static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Remember which file this process was pointed at.
+///
+/// Set once, from `--config`, before anything reads the configuration. A
+/// process-wide cell rather than a parameter because the keeper is spawned
+/// four layers below the entry point that parsed the flag, and threading a
+/// path through those four layers to reach one `Command` is how the keeper
+/// came to be spawned without `--log-file` in the first place.
+pub(crate) fn set_path(path: PathBuf) {
+    let _ = PATH.set(path);
+}
+
+/// The configuration file this process reads.
+pub(crate) fn path() -> &'static Path {
+    PATH.get_or_init(|| PathBuf::from(CONFIG_PATH))
+}
+
+/// Whether the path is the installed one, i.e. whether a child process needs
+/// to be told about it explicitly.
+pub(crate) fn path_is_default() -> bool {
+    path() == Path::new(CONFIG_PATH)
+}
+
 /// The address a listener binds when the file does not exist yet.
 const DEFAULT_BIND: &str = "0.0.0.0:3389";
 
@@ -471,21 +495,30 @@ fn parse(path: &Path, body: &str) -> anyhow::Result<Config> {
     Ok(config)
 }
 
+/// A configuration and where it came from.
+///
+/// `from_defaults` is carried out rather than logged in place because the
+/// first thing every caller does with the result is set up logging from it —
+/// a line emitted here would be written before there is a subscriber to write
+/// it to.
+#[derive(Debug)]
+pub(crate) struct Loaded {
+    pub(crate) config: Config,
+    pub(crate) from_defaults: bool,
+}
+
 /// Read the configuration, or the built-in defaults when the file does not
 /// exist.
 ///
-/// The ONLY caller is the supervisor at startup. A file that exists and is
-/// wrong is still an error: the defaults answer "nobody has configured this
-/// machine", never "this machine is configured incorrectly".
-pub(crate) fn load_or_default(path: &Path) -> anyhow::Result<Config> {
+/// Only the supervisor and the single-process development path call this. A
+/// file that exists and is wrong is still an error: the defaults answer
+/// "nobody has configured this machine", never "this machine is configured
+/// incorrectly".
+pub(crate) fn load_or_default(path: &Path) -> anyhow::Result<Loaded> {
     match std::fs::read_to_string(path) {
-        Ok(body) => parse(path, &body),
+        Ok(body) => parse(path, &body).map(|config| Loaded { config, from_defaults: false }),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            tracing::info!(
-                path = %path.display(),
-                "no configuration file — serving the built-in defaults; `linrdp service install` writes one"
-            );
-            Ok(Config::builtin_default())
+            Ok(Loaded { config: Config::builtin_default(), from_defaults: true })
         }
         Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
     }
@@ -530,7 +563,9 @@ mod tests {
     fn a_missing_file_yields_exactly_one_default_listener() {
         let missing = std::env::temp_dir().join(format!("linrdp-absent-{}.yaml", std::process::id()));
         let _ = std::fs::remove_file(&missing);
-        let config = load_or_default(&missing).expect("defaults");
+        let loaded = load_or_default(&missing).expect("defaults");
+        assert!(loaded.from_defaults, "the caller has to be able to say so in the log");
+        let config = loaded.config;
         assert_eq!(config.listeners.len(), 1);
         assert_eq!(config.listeners[0].bind, DEFAULT_BIND);
         assert_eq!(config.listeners[0].auth, Auth::Both);
