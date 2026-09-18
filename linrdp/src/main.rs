@@ -292,6 +292,33 @@ fn warn_if_no_accounts() {
 fn capture_credential() {
     use std::io::Read as _;
 
+    // Logging comes first, before the first line worth recording, and it is
+    // this helper's own — not `setup_logging`. `setup_logging` announces itself
+    // ("linrdp: logging to <path>") and falls back to stderr when the file will
+    // not open; both are fine for a server started by systemd and both are a
+    // line on the terminal of every `su`, `ssh`, `sudo` and console login,
+    // because pam_exec runs this on the machine's own authentication stack.
+    //
+    // The config is read the tolerant way the keeper reads it: a typo in a key
+    // this helper does not even use must never keep it from running — and, here,
+    // must never make it say so on a terminal.
+    let mut args = pico_args::Arguments::from_env();
+    let _ = args.contains("--capture-credential");
+    if let Ok(Some(path)) = args.opt_value_from_str::<_, PathBuf>("--config") {
+        config::set_path(path);
+    }
+    let (log, complaint) = match config::load_strict(config::path()) {
+        Ok(config) => (config.log, None),
+        Err(error) => (config::Log::default(), Some(format!("{error:#}"))),
+    };
+    setup_helper_logging(&log);
+    if let Some(complaint) = complaint {
+        tracing::warn!(
+            error = %complaint,
+            "credential capture: cannot read the configuration — logging with the built-in defaults"
+        );
+    }
+
     let Ok(username) = std::env::var("PAM_USER") else {
         tracing::debug!("credential capture: no PAM_USER — not called from pam_exec");
         return;
@@ -933,22 +960,61 @@ impl ironrdp_server::RdpServerInputHandler for AnyInput {
     }
 }
 
+/// Start logging for the credential-capture helper: the configured file, or
+/// nowhere.
+///
+/// This is `setup_logging` with the two things that reach a terminal taken
+/// out. `setup_logging` prints "linrdp: logging to <path>" once it has the file
+/// open, and drops back to stderr when it cannot open it or when the filter is
+/// malformed. Every one of those writes is correct for a server whose stderr is
+/// the journal, and wrong for this helper, which pam_exec runs on every
+/// authentication on the machine: the notice would print on every login, and
+/// the fallback would turn any misconfiguration into console noise on all of
+/// them. So here a bad filter falls back silently, and a file that will not
+/// open means no subscriber at all rather than one aimed at the terminal.
+fn setup_helper_logging(log: &config::Log) {
+    use tracing_subscriber::EnvFilter;
+
+    let filter = EnvFilter::try_new(&log.level).unwrap_or_else(|_| EnvFilter::new("info,ironrdp=warn"));
+
+    // No file configured means the journal for the server; the helper has no
+    // journal of its own, and stderr is the terminal, so it stays silent.
+    let Some(path) = log.file.as_ref() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let _ = tracing_subscriber::fmt()
+        .compact()
+        .with_env_filter(filter)
+        .with_writer(std::sync::Mutex::new(file))
+        .try_init();
+}
+
 /// Start logging as `log` asks.
 ///
 /// The verbosity was `LINRDP_LOG` and the destination was `--log-file`; both
 /// are `log.level` and `log.file` now, so that "why is this machine quiet?"
 /// has one answer and it is in the same file as everything else.
 fn setup_logging(log: &config::Log) {
-    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    use tracing_subscriber::{EnvFilter, fmt};
 
     // A malformed filter must not be the reason a server does not start.
-    let filter = EnvFilter::try_new(&log.level).unwrap_or_else(|error| {
-        eprintln!("linrdp: log.level `{}` is not a filter ({error}); using info", log.level);
-        EnvFilter::new("info,ironrdp=warn")
-    });
+    let filter = || {
+        EnvFilter::try_new(&log.level).unwrap_or_else(|error| {
+            eprintln!("linrdp: log.level `{}` is not a filter ({error}); using info", log.level);
+            EnvFilter::new("info,ironrdp=warn")
+        })
+    };
 
-    // A file so the log survives the terminal. `log.file: null` says the
-    // terminal is the destination, which under systemd means the journal.
     let path = match &log.file {
         Some(path) => {
             if let Some(dir) = path.parent() {
@@ -972,16 +1038,39 @@ fn setup_logging(log: &config::Log) {
     };
 
     match file {
+        // A file AND the terminal — which, under the unit, is the journal.
+        //
+        // The file alone left `journalctl -u linrdp` and `systemctl status`
+        // empty, which is the first place anyone looks and the worst possible
+        // place to find nothing.
+        //
+        // The two carry different amounts on purpose. The file gets exactly
+        // `log.level`; the journal gets the same filter capped at INFO, so
+        // `debug` and `trace` — which log per frame — stay out of journald's
+        // ring buffer. Duplicating those there would evict *other services'*
+        // logs, a cost paid by the whole machine rather than by linrdp. The
+        // cap only ever quietens: `log.level: warn` gives warn in both.
         Some(file) => {
-            eprintln!("linrdp: logging to {}", path.display());
-            let _ = tracing_subscriber::fmt()
-                .compact()
-                .with_env_filter(filter)
-                .with_writer(std::sync::Mutex::new(file))
+            eprintln!("linrdp: logging to {} (and to the journal, at info)", path.display());
+            let _ = tracing_subscriber::registry()
+                // `log.level` governs everything...
+                .with(filter())
+                .with(
+                    fmt::layer()
+                        .compact()
+                        // No escape codes in a file somebody will grep.
+                        .with_ansi(false)
+                        .with_writer(std::sync::Mutex::new(file)),
+                )
+                // ...and the journal is quietened further, never louder.
+                .with(fmt::layer().compact().with_writer(std::io::stderr).with_filter(LevelFilter::INFO))
                 .try_init();
         }
+        // No file: the terminal is the whole log, and it gets everything that
+        // was asked for — capping here would take `debug` away from the one
+        // person who typed it.
         None => {
-            let _ = tracing_subscriber::fmt().compact().with_env_filter(filter).try_init();
+            let _ = tracing_subscriber::fmt().compact().with_env_filter(filter()).try_init();
         }
     }
 }
