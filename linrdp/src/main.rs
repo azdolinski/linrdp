@@ -1000,6 +1000,17 @@ fn setup_helper_logging(log: &config::Log) {
 /// The verbosity was `LINRDP_LOG` and the destination was `--log-file`; both
 /// are `log.level` and `log.file` now, so that "why is this machine quiet?"
 /// has one answer and it is in the same file as everything else.
+/// Whether colour belongs on stderr.
+///
+/// Under the unit stderr is journald, not a terminal, and the escape codes go
+/// into the journal as literal bytes — the same wart the log file carried
+/// until it was written with `with_ansi(false)`. Run by hand, stderr is a
+/// terminal and the colour is worth having.
+fn stderr_is_a_terminal() -> bool {
+    use std::io::IsTerminal as _;
+    std::io::stderr().is_terminal()
+}
+
 fn setup_logging(log: &config::Log) {
     use tracing_subscriber::filter::LevelFilter;
     use tracing_subscriber::Layer as _;
@@ -1063,14 +1074,24 @@ fn setup_logging(log: &config::Log) {
                         .with_writer(std::sync::Mutex::new(file)),
                 )
                 // ...and the journal is quietened further, never louder.
-                .with(fmt::layer().compact().with_writer(std::io::stderr).with_filter(LevelFilter::INFO))
+                .with(
+                    fmt::layer()
+                        .compact()
+                        .with_ansi(stderr_is_a_terminal())
+                        .with_writer(std::io::stderr)
+                        .with_filter(LevelFilter::INFO),
+                )
                 .try_init();
         }
         // No file: the terminal is the whole log, and it gets everything that
         // was asked for — capping here would take `debug` away from the one
         // person who typed it.
         None => {
-            let _ = tracing_subscriber::fmt().compact().with_env_filter(filter()).try_init();
+            let _ = tracing_subscriber::fmt()
+                .compact()
+                .with_ansi(stderr_is_a_terminal())
+                .with_env_filter(filter())
+                .try_init();
         }
     }
 }
