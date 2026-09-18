@@ -47,6 +47,11 @@ pub(crate) const COMMANDS: &[Command] = &[
         summary: "Run in the foreground with everything on screen (default: debug)",
     },
     Command {
+        path: "version",
+        args: None,
+        summary: "Show the version and the build this binary came from (also `--version`)",
+    },
+    Command {
         path: "tree",
         args: None,
         summary: "Show this command tree",
@@ -108,6 +113,15 @@ pub(crate) const COMMANDS: &[Command] = &[
     },
 ];
 
+/// Whether this argument is the version flag.
+///
+/// `-V` and `--version` are how the rest of the world asks for this, so they
+/// are answered — but the answer is the `version` command in the table above,
+/// not a second implementation of it.
+pub(crate) fn is_the_version_flag(arg: &str) -> bool {
+    arg == "--version" || arg == "-V"
+}
+
 /// The table entry for a dotted path.
 pub(crate) fn command(path: &str) -> Option<&'static Command> {
     COMMANDS.iter().find(|c| c.path == path)
@@ -167,6 +181,24 @@ mod tests {
                 assert!(command(parent).is_some(), "{} has no parent entry", c.path);
             }
         }
+    }
+
+    /// Capital `-V` only: a lowercase `-v` is verbosity everywhere else, and
+    /// answering it with a version string would be answering a question
+    /// nobody asked.
+    #[test]
+    fn the_version_flag_is_spelled_the_way_every_other_program_spells_it() {
+        assert!(is_the_version_flag("--version"));
+        assert!(is_the_version_flag("-V"));
+        assert!(!is_the_version_flag("-v"));
+        assert!(!is_the_version_flag("--listener"));
+    }
+
+    /// The flag and the word are the same answer, so the word is in the table
+    /// and the tree prints it like any other command.
+    #[test]
+    fn the_version_is_a_command_as_well_as_a_flag() {
+        assert!(is_a_top_level_command("version"), "the table has no `version`");
     }
 
     #[test]

@@ -67,7 +67,7 @@ fn main() -> anyhow::Result<()> {
     // this has not been done.
     if std::env::args().nth(1).as_deref().is_some_and(|word| {
         cli::meta::is_a_top_level_command(word) && word != "debug"
-    }) || std::env::args().any(|arg| arg == "-h" || arg == "--help")
+    }) || std::env::args().any(|arg| arg == "-h" || arg == "--help" || cli::meta::is_the_version_flag(&arg))
     {
         cli::die_quietly_on_a_closed_pipe();
     }
@@ -80,6 +80,17 @@ fn main() -> anyhow::Result<()> {
             Some(word) if cli::meta::is_a_top_level_command(word) => print!("{}", cli::subtree(word)),
             _ => print!("{}", cli::help()),
         }
+        return Ok(());
+    }
+
+    // `--version`, `-V` and the `version` command are one question with one
+    // answer, answered here rather than in three places. Like `--help`, the
+    // flag is honoured wherever it appears: `linrdp service --version` is
+    // somebody asking what this binary is, not asking to start anything.
+    if std::env::args().any(|arg| cli::meta::is_the_version_flag(&arg))
+        || std::env::args().nth(1).as_deref() == Some("version")
+    {
+        println!("{}", build_info::version_line());
         return Ok(());
     }
 

@@ -35,9 +35,38 @@ fn describe(commit: &str, profile: &str, date: &str) -> String {
         .join(", ")
 }
 
+/// What `linrdp version` prints.
+pub(crate) fn version_line() -> String {
+    line(VERSION, &build())
+}
+
+/// The name, the version, and the build in brackets after it — the shape
+/// every other command-line program answers this question in.
+fn line(version: &str, build: &str) -> String {
+    if build.is_empty() {
+        return format!("linrdp {version}");
+    }
+    format!("linrdp {version} ({build})")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_version_line_carries_the_build_that_produced_it() {
+        assert_eq!(
+            line("0.1.0", "1b11b79, release, 2026-09-18"),
+            "linrdp 0.1.0 (1b11b79, release, 2026-09-18)"
+        );
+    }
+
+    /// With no git and no profile there is nothing to put in the brackets,
+    /// and empty brackets are worse than none.
+    #[test]
+    fn a_build_that_knows_nothing_leaves_no_empty_brackets() {
+        assert_eq!(line("0.1.0", ""), "linrdp 0.1.0");
+    }
 
     #[test]
     fn a_build_out_of_a_git_checkout_names_the_commit_the_profile_and_the_day() {
