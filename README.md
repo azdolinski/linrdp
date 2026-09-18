@@ -40,8 +40,76 @@ cargo build --release -p linrdp
 
 ```sh
 sudo install -m755 target/release/linrdp /usr/local/bin/linrdp
-sudo install -m644 deploy/pam.d-linrdp /etc/pam.d/linrdp
+sudo linrdp service install
 ```
+
+`service install` writes one systemd unit, creates `/etc/linrdp/config.yaml`
+(only if there is none — re-running it to upgrade the binary leaves your
+settings alone), installs `/etc/pam.d/linrdp`, creates `/var/lib/linrdp` and
+`/var/log/linrdp`, wires the credential capture into the system PAM stack
+(see **Authentication** below), and starts the service. `sudo linrdp service
+uninstall` takes back exactly that and leaves the configuration, the TLS
+identity and the logs where they are.
+
+## Configuration
+
+Everything is in `/etc/linrdp/config.yaml`. The unit takes no arguments and
+sets no environment, so there is nowhere else for a setting to be.
+
+```yaml
+listeners:
+  - bind: 0.0.0.0:3389
+    auth: both              # both | nla | system | greeter
+  - bind: 0.0.0.0:3390
+    auth: greeter
+    overrides:
+      features: { usb: true }
+
+session:
+  display_range: 10-99      # service-wide; see below
+  fixed_size: null          # e.g. 2880x1800 to pin every session's screen
+  lock_on_disconnect: false
+  switch_to_greeter: false
+  console:
+    enabled: false          # serve one shared screen instead of per-user sessions
+    display: null           # required when enabled — there is no default
+    xauthority: null
+
+features:
+  usb: false                # USB redirection (MS-RDPEUSB)
+  udp: true                 # UDP transport (MS-RDPEMT) alongside TCP
+  avc444v2: true            # full-resolution chroma where the client negotiates it
+  wayland: false            # portal + PipeWire + libei instead of X
+
+tls:
+  cert: null                # null keeps a self-signed identity in /var/lib/linrdp
+  key:  null
+
+log:
+  level: info
+  file:  /var/log/linrdp/linrdp.log
+```
+
+The file written on install carries every key's description and every value's
+consequences as comments, so `less /etc/linrdp/config.yaml` is the reference.
+
+```sh
+sudo linrdp config          # the same, browsable: tree on the left, help on the right
+linrdp config --print       # the commented file on stdout, for a pipe or a bug report
+```
+
+A listener may override any key in `session`, `features` or `tls` for itself.
+Two keys are service-wide and refuse to be overridden, with the reason
+attached: `log`, because one process writes one log, and
+`session.display_range`, because display numbers are handed out under a single
+`flock` in `/run/linrdp` — and that is exactly what makes a user arriving on
+either port land on the same desktop.
+
+Changing the set of listeners takes effect on `systemctl restart linrdp`;
+every other key is read again for each new connection. A key linrdp cannot
+make sense of stops the service rather than being quietly dropped: the quiet
+outcome of dropping `auth` would be `both`, which is weaker than anything you
+would have written.
 
 ## Authentication — one required step
 
@@ -55,21 +123,21 @@ expected response from the account secret (MS-NLMP) — a one-way
 choice; it is why xrdp offers no NLA for local accounts.
 
 So linrdp is handed each password by the system's own authentication, the way
-Samba's `pam_smbpass` kept its database in step. Add this line to the PAM
-stack (`deploy/pam-capture` explains every part of it, including how to undo
-it):
-
-```sh
-sudo sh -c 'cat deploy/pam-capture >> /etc/pam.d/common-auth'
-```
+Samba's `pam_smbpass` kept its database in step. `sudo linrdp service install`
+adds this line for you — to `common-auth` and `common-password` on Debian, to
+`system-auth` and `password-auth` on RHEL/SUSE, whichever exist:
 
 ```
 auth      optional  pam_exec.so expose_authtok quiet /usr/local/bin/linrdp --capture-credential
 ```
 
-On RHEL/SUSE-style stacks the file is `/etc/pam.d/system-auth`. To follow
-password changes too, add the same call as a `password` line in
-`/etc/pam.d/common-password`.
+`optional` is the word that matters: PAM ignores the result, so a linrdp that
+is missing, broken or slow can never keep anyone out of the machine. The line
+is marked as linrdp's, so `service uninstall` removes exactly it and leaves
+any `pam_exec` line of yours alone; the file is backed up before it is
+touched; and running `install` again does not add it twice.
+`deploy/pam-capture` explains every part of it, including how to undo it by
+hand.
 
 From then on, whenever an account authenticates (`su -`, `ssh`, console
 login) the password PAM just verified is handed to linrdp, **re-verified
@@ -90,7 +158,7 @@ What this costs, stated plainly: the password ends up stored recoverably in
 inherent to NLA. If that trade or the PAM edit is unacceptable, use the
 second option below instead.
 
-### `--auth` — what each port accepts
+### `auth` — what each port accepts
 
 The default is `both`: a port advertises TLS **and** CredSSP, and each client
 negotiates the strongest it supports (MS-RDPBCGR 5.4.5.1). There is no wrong
@@ -105,8 +173,10 @@ port to connect to.
 
 ### `greeter` — a logon screen, and no PAM integration at all
 
-```sh
-sudo /usr/local/bin/linrdp --supervisor --auth greeter --bind-addr 0.0.0.0:3390
+```yaml
+listeners:
+  - bind: 0.0.0.0:3390
+    auth: greeter
 ```
 
 The client connects without sending anything, linrdp draws a login form, and
@@ -123,7 +193,8 @@ on the keyboard layout works, which a hand-rolled scancode table would get
 wrong. Only once the form accepts does the worker move to the user's own
 desktop, and the session gate allows that move in one direction only.
 
-`deploy/linrdp-alt-port.service` runs this on port 3390.
+One process serves it alongside the NLA port; both are listeners in the same
+file.
 
 Under `system` a client that only speaks NLA sends no credentials at all and
 is refused: mstsc reports **0x904** the moment you press Connect. MS-RDPBCGR
@@ -132,34 +203,27 @@ offers no way to ask a client to prompt — `LOGON_FAILED_BAD_PASSWORD`
 does not draw. So `system` is for deployments that would rather refuse mstsc
 than store anything.
 
-`deploy/linrdp-alt-port.service` runs a second listener on 3390 for
-deployments that want another address. Both instances share `/run/linrdp` and
-the display range on purpose: display numbers are handed out under a `flock`,
-so a user arriving on either port lands on their own single session, and
-moving between ports returns to the same desktop.
+Running both at once is the usual shape — `auth: both` on 3389 for every
+client, `auth: greeter` on 3390 for deployments that want nothing to do with
+PAM. They are one process and one display range on purpose: numbers are handed
+out under a `flock`, so a user arriving on either port lands on their own
+single session, and moving between ports returns to the same desktop.
 
 ## Run
 
-Multi-session: one worker per connection, each serving its own user's desktop.
-
 ```sh
-sudo /usr/local/bin/linrdp --supervisor --bind-addr 0.0.0.0:3389
-# or: sudo systemctl enable --now linrdp   (deploy/linrdp.service)
+sudo systemctl enable --now linrdp    # `service install` has already done this
 ```
 
-```
---auth both|nla|system|greeter  what the port accepts (default both; see above)
---display-range L-H    X display numbers workers may allocate (default 10-99)
---console              attach to $DISPLAY instead of a per-user session
-                       (the mstsc /admin equivalent, for a shared screen)
---fixed-size WxH       pin every session's screen instead of following the
-                       connecting client
---usb                  USB device redirection (MS-RDPEUSB)
---lock-session         lock the logind session when the last client leaves
---switch-to-greeter    flip the seat to the greeter when a client takes over
---wayland              xdg-desktop-portal capture + libei input
-                       (binary built with --features wayland)
-```
+One process binds every listener in the configuration and forks a worker per
+connection, each serving its own user's desktop. There are no service flags:
+the only arguments linrdp takes are `--config <PATH>` to read a file somewhere
+else, and `--listener <ADDRESS:PORT>` to serve one listener in the foreground
+without forking, which is the shape to use while working on the code.
+
+An argument linrdp does not recognise stops it rather than being ignored — a
+machine still carrying an old unit that said `--auth system` would otherwise
+have quietly served `both`.
 
 Each session gets its own `Xvfb`, its own MIT-MAGIC-COOKIE and its own PAM
 session, and outlives the connection: reconnecting returns to the same
@@ -181,11 +245,17 @@ no sound at all, because systemd's own `pulseaudio.socket` carries
 `ConditionUser=!root` and never starts a sound server for uid 0.
 
 Upgrading in place is safe: replace `/usr/local/bin/linrdp` and the running
-supervisor execs the new binary for the next connection. (Restart the unit
-too if you want the supervisor itself on the new code.)
+supervisor execs the new binary for the next connection. (Restart the unit too
+if you want the supervisor itself on the new code.) Re-running
+`sudo linrdp service install` refreshes the unit and leaves
+`/etc/linrdp/config.yaml` exactly as it is.
 
-On first start it generates a self-signed TLS certificate
-(`linrdp-cert.pem` / `linrdp-key.pem` next to the crate) and reuses it.
+On first start it generates a self-signed TLS certificate in
+`/var/lib/linrdp` and reuses it, so a client that accepted it once goes on
+accepting it. Setting `tls.cert` and `tls.key` means you are providing an
+identity instead: a path that is not there then stops the service rather than
+being replaced by a fresh self-signed certificate under your filename, which
+would break pinning on every client at once.
 
 ## Connect
 
@@ -203,8 +273,14 @@ microphone packets reach the server.
 
 ## Design
 
-- `deploy/` — example systemd units (`linrdp-xvfb.service` +
-  `linrdp.service`) for a headless Xvfb desktop with auto-restart
+- `linrdp/src/config/` — `/etc/linrdp/config.yaml`: the types, the two
+  loaders, the validator, and the metadata table every description in the file
+  and in `linrdp config` is rendered from
+- `linrdp/src/service/` — `service install` / `uninstall`: the unit, the
+  directories, and the PAM stack edit
+- `linrdp/src/configtui/` — `linrdp config`: the settings tree and its help
+- `deploy/` — `linrdp-xvfb.service` for a headless Xvfb desktop, and
+  `pam-capture`, which explains the credential-capture line in full
 - `linrdp/src/session_ctl.rs` — logind lock/unlock + greeter switch on
   connect/disconnect (KRdp SessionController pattern, via zbus)
 - `linrdp/src/pam.rs` — PAM fallback authentication (dlopen libpam; used

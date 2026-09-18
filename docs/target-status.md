@@ -34,9 +34,11 @@ Data: 2026-09-09. Serwer: `linrdp/target/debug/linrdp` (single binary, czysty Ru
 
 ## Uruchomienie
 ```
-sudo env DISPLAY=:99 XAUTHORITY=/home/user/.Xauthority \
-  LINRDP_LOG=info ./target/debug/linrdp
+sudo install -m755 target/release/linrdp /usr/local/bin/linrdp
+sudo linrdp service install
 # 0.0.0.0:3389; login/hasło: dowolne konto systemowe (np. linrdptest/test123)
+# Konfiguracja: /etc/linrdp/config.yaml — `sudo linrdp config` albo `linrdp config --print`
+# Praca nad kodem, bez forkowania: sudo ./target/debug/linrdp --listener 0.0.0.0:3389
 ```
 
 ## Kolejność dalszych prac
@@ -79,3 +81,24 @@ Rozwiązanie zgodne z dokumentacją Microsoft:
   zgodnie z MS-NLMP (serwer sprawdza odpowiedź NTLMv2 wyliczoną z sekretu konta).
 Weryfikacja: poprawne hasło → CredSSP NTLM Ok → "Client accepted" → stream; złe hasło →
 LogonDenied na CredSSP → odrzucenie. Konta w SAM: root, linrdptest.
+
+## Punkt 8 — parametry w /etc/linrdp ✅ (2026-09-18)
+`docs/target.md` przewidywał plik parametrów w `/etc/linrdp/`. Jest nim
+`/etc/linrdp/config.yaml` i jest jedynym źródłem prawdy: jednostka systemd nie
+ma żadnego argumentu ani `Environment=`, a `LINRDP_LOG`, `LINRDP_AVC444V2` i
+`LINRDP_NO_UDP` przestały być czytane.
+
+Cztery pliki `.service` (w tym dwa różniące się wyłącznie portem i trybem
+`--auth`) zastąpił jeden: supervisor binduje wszystkie listenery z pliku w
+jednym procesie i forkuje worker per połączenie, a worker dostaje wyłącznie
+adres swojego listenera i czyta ten sam plik. `linrdp service install` stawia
+to jedną komendą razem z linią przechwytywania hasła w systemowym stosie PAM;
+`linrdp config` przegląda i edytuje konfigurację, a opisy w pliku, pomoc w tym
+edytorze i komunikaty walidatora renderują się z jednej tablicy metadanych, co
+uniemożliwia ich rozjazd.
+
+Odmowa zamiast cichego złagodzenia: nieznany klucz, nieznana wartość, duplikat
+`bind` albo nierozpoznany argument zatrzymują usługę — cichym skutkiem
+zgubienia `auth` byłoby `both`, czyli tryb słabszy niż ten, który operator
+zapisał. Worker, który nie znajdzie swojego listenera, zrywa to jedno
+połączenie i nigdy nie spada na domyślne.

@@ -16,22 +16,28 @@
 # /etc/shadow, and kept for NLA. It cannot drift from the system password,
 # because it IS the system password, refreshed every time it is used.
 #
-# HOW TO INSTALL (Debian/Ubuntu)
+# HOW TO INSTALL
+#
+#   sudo linrdp service install
+#
+# That adds the line below to whichever stacks this distribution has — the
+# `auth` one to /etc/pam.d/common-auth and the `password` one to
+# /etc/pam.d/common-password on Debian, both to /etc/pam.d/system-auth and
+# /etc/pam.d/password-auth on RHEL/SUSE — after backing each file up, marking
+# the line as linrdp's, and checking the result still reads as a stack. It is
+# idempotent, so running it again to upgrade the binary adds nothing.
+#
+# The `password` line is not decoration: without it a password change leaves
+# the stored copy stale until the account next authenticates.
+#
+# By hand, if you would rather:
 #
 #   sudo sh -c 'cat /path/to/deploy/pam-capture >> /etc/pam.d/common-auth'
-#
-# To follow password changes too, add the same call as a `password` line —
-# the type must match the stack it lives in, so this one is written out rather
-# than appended from this file:
-#
 #   sudo sh -c 'echo "password  optional  pam_exec.so expose_authtok quiet \
 #     /usr/local/bin/linrdp --capture-credential" >> /etc/pam.d/common-password'
 #
-# Without it a password change leaves the stored copy stale until the account
-# next authenticates — the next su/ssh/console login refreshes it.
-#
-# On RHEL/SUSE-style stacks the equivalents are /etc/pam.d/system-auth and
-# /etc/pam.d/password-auth.
+# The type must match the stack it lives in — a `password` line in the auth
+# stack is never run.
 #
 # Verify with: sudo linrdp doctor
 #
@@ -50,12 +56,17 @@
 #   same trust model as /etc/shadow itself.
 # * This does mean the password is stored recoverably, which /etc/shadow does
 #   not do. That is inherent to NLA, and it is the trade this file exists to
-#   make explicit. To avoid it entirely, run linrdp with `--auth system` and
-#   use a client that sends credentials without NLA.
+#   make explicit. To avoid it entirely, give the listener `auth: greeter` in
+#   /etc/linrdp/config.yaml — the server draws the logon form, every client
+#   works and nothing is stored — or `auth: system`, which stores nothing but
+#   refuses clients that speak only NLA.
 #
 # TO REMOVE
 #
-# Delete the line below and empty the store:
+#   sudo linrdp service uninstall
+#
+# It removes the line it added and leaves any pam_exec line of yours alone.
+# To forget the passwords as well:
 #   sudo sh -c ': > /var/lib/linrdp/sam'
 
 auth      optional  pam_exec.so expose_authtok quiet /usr/local/bin/linrdp --capture-credential
