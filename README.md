@@ -60,6 +60,10 @@ Day to day:
 | `sudo linrdp service restart` | restart it, picking up a changed configuration |
 | `linrdp service status` | what systemd says, then the listeners in effect |
 
+`linrdp tree` prints every command with what it does; `linrdp --help` prints
+the same tree and then the prose below. Any group answers for itself —
+`linrdp service --help` lists just its six verbs.
+
 `status` is worth the extra line over `systemctl status linrdp`: the unit
 carries no arguments, so systemd cannot tell you which ports are served or how
 they authenticate. That answer is in the configuration file, and `status`

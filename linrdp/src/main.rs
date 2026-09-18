@@ -20,6 +20,7 @@ mod input;
 mod mic;
 mod pam;
 mod sam;
+mod cli;
 mod service;
 mod sound;
 mod sound_real;
@@ -44,55 +45,6 @@ use ironrdp_server::{CliprdrServerFactory, RdpServer};
 use crate::capture::X11Display;
 use crate::input::X11InputHandler;
 
-const HELP: &str = "\
-USAGE:
-  linrdp                       serve every listener in the configuration
-  linrdp doctor [<account>]    report what this machine, or one account, can do
-  linrdp service install       install the systemd unit and the config file
-  linrdp service uninstall     remove what `service install` put there
-  linrdp service start|stop    start or stop the service
-  linrdp service restart       restart it, picking up a changed configuration
-  linrdp service status        what systemd says, plus the listeners in effect
-  linrdp config [--print]      browse and edit the configuration
-
-Serves a real Linux desktop over RDP.
-
-CONFIGURATION
-
-Everything is in /etc/linrdp/config.yaml, and that file describes itself: every
-key carries its meaning and every value its consequences, so `linrdp config` and
-`less /etc/linrdp/config.yaml` answer the same questions. The systemd unit takes
-no arguments and sets no environment; there is nowhere else for a setting to
-hide.
-
-  listeners       the addresses served, and how each one authenticates
-                  (`auth: both | nla | system | greeter`)
-  session         display range, pinned size, locking, the shared screen
-  features        USB redirection, UDP transport, AVC444v2, Wayland capture
-  tls             the certificate to serve, or none to keep a self-signed one
-  log             level and destination
-
-AUTHENTICATION
-
-Whatever the listener offers, the password checked is the account's system
-password. There is no linrdp password to set and no command that sets one.
-CredSSP/NTLM does require the server to know the secret (MS-NLMP: it computes
-the expected response from it), so linrdp learns each password from the
-system's own authentication, the way Samba's pam_smbpass did — see
-deploy/pam-capture, which `linrdp service install` wires up for you. Authenticate
-once on this machine (su -, ssh, console) and RDP works from then on.
-
-`linrdp doctor` reports whether that capture is wired and whose password it has
-seen. `sudo linrdp doctor <account>` answers the narrower question the machine
-report cannot: will this account work here?
-
-OPTIONS
-
-  --config <PATH>    read a configuration file other than /etc/linrdp/config.yaml
-  --listener <ADDR>  serve just this one listener, in this process, without
-                     forking — the path to use while working on linrdp
-  --serve-fd <N>     internal: serve the connection the supervisor handed over
-";
 
 /// Supervisor mode forks per connection, and `fork` in a multi-threaded
 /// runtime leaves only the calling thread alive in the child. So the argv is
@@ -107,17 +59,38 @@ fn main() -> anyhow::Result<()> {
     // everything that decides it is per-account: the runtime directory the
     // session gets, whether the password is usable, and whether systemd will
     // start a sound server for that uid at all.
-    if std::env::args().nth(1).as_deref() == Some("doctor") {
-        return match std::env::args().nth(2) {
-            Some(account) => doctor::run_account(&account),
-            None => doctor::run(),
-        };
+    // Asking for help never runs the command: `linrdp config --help` opening
+    // a full-screen editor instead of answering the question is the kind of
+    // surprise a tree advertising its commands invites.
+    if std::env::args().any(|arg| arg == "-h" || arg == "--help") {
+        match std::env::args().nth(1).as_deref() {
+            Some(word) if cli::meta::is_a_top_level_command(word) => print!("{}", cli::subtree(word)),
+            _ => print!("{}", cli::help()),
+        }
+        return Ok(());
     }
-    if std::env::args().nth(1).as_deref() == Some("config") {
-        return configtui::run(std::env::args().any(|arg| arg == "--print"));
-    }
-    if std::env::args().nth(1).as_deref() == Some("service") {
-        return service::run(std::env::args().nth(2).as_deref());
+
+    match std::env::args().nth(1).as_deref() {
+        Some("doctor") => {
+            return match std::env::args().nth(2) {
+                Some(account) => doctor::run_account(&account),
+                None => doctor::run(),
+            };
+        }
+        Some("config") => return configtui::run(std::env::args().any(|arg| arg == "--print")),
+        Some("service") => return service::run(std::env::args().nth(2).as_deref()),
+        Some("tree") => {
+            print!("{}", cli::tree());
+            return Ok(());
+        }
+        // A word that is not a flag and not in the table. Without this it
+        // would fall through to the supervisor and be refused as a stray
+        // argument, which says nothing about what could have been typed.
+        Some(word) if !word.starts_with('-') && !cli::meta::is_a_top_level_command(word) => {
+            print!("{}", cli::tree());
+            anyhow::bail!("`linrdp {word}` is not a command");
+        }
+        _ => {}
     }
     if std::env::args().any(|arg| arg == "--keeper") {
         return keeper_main();
@@ -137,9 +110,7 @@ fn main() -> anyhow::Result<()> {
     // working on linrdp (`--listener` alone). Everything else — which is to
     // say the systemd unit, whose ExecStart carries no arguments at all — is
     // the supervisor.
-    let serves_a_connection = std::env::args()
-        .any(|arg| arg == "--serve-fd" || arg == "--listener")
-        || std::env::args().any(|arg| arg == "-h" || arg == "--help");
+    let serves_a_connection = std::env::args().any(|arg| arg == "--serve-fd" || arg == "--listener");
     if !serves_a_connection {
         return supervisor_main();
     }
@@ -404,10 +375,6 @@ fn supervisor_main() -> anyhow::Result<()> {
 
 async fn serve() -> anyhow::Result<()> {
     let mut args = pico_args::Arguments::from_env();
-    if args.contains(["-h", "--help"]) {
-        println!("{HELP}");
-        return Ok(());
-    }
 
     // `--serve-fd` marks a worker the supervisor forked: it serves exactly the
     // one connection on that descriptor. `--listener` names which listener in

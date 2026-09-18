@@ -94,7 +94,7 @@ enum Verb {
 }
 
 /// Every verb, in the order the help lists them.
-const VERBS: [&str; 6] = ["install", "uninstall", "start", "stop", "restart", "status"];
+pub(crate) const VERBS: [&str; 6] = ["install", "uninstall", "start", "stop", "restart", "status"];
 
 fn parse(verb: Option<&str>) -> anyhow::Result<Verb> {
     match verb {
@@ -104,15 +104,19 @@ fn parse(verb: Option<&str>) -> anyhow::Result<Verb> {
         Some("stop") => Ok(Verb::Control { verb: "stop", done: "stopped" }),
         Some("restart") => Ok(Verb::Control { verb: "restart", done: "restarted" }),
         Some("status") => Ok(Verb::Status),
-        Some(other) => anyhow::bail!("`linrdp service {other}` — expected {}", VERBS.join(", ")),
-        None => anyhow::bail!("`linrdp service` expects one of: {}", VERBS.join(", ")),
+        Some(other) => anyhow::bail!("`linrdp service {other}` is not one of them"),
+        None => anyhow::bail!("no command specified"),
     }
 }
 
 /// `linrdp service <verb>`.
 pub(crate) fn run(verb: Option<&str>) -> anyhow::Result<()> {
     let layout = Layout::system();
-    match parse(verb)? {
+    // A refused verb is shown the group, not a list squeezed into the error:
+    // six verbs with what each does is what the operator needs, and it is
+    // already written down once, in `cli::meta`.
+    let parsed = parse(verb).inspect_err(|_| print!("{}", crate::cli::subtree("service")))?;
+    match parsed {
         Verb::Install => install(&layout),
         Verb::Uninstall => uninstall(&layout),
         Verb::Control { verb, done } => control(&layout, verb, done),
@@ -511,12 +515,12 @@ mod tests {
         assert!(pam::looks_like_a_stack(PAM_SERVICE));
     }
 
-    /// Every verb the help lists is a verb `run` will take. A name that only
-    /// exists in the help text is a command that does not work, and the same
-    /// list writes both the dispatch and the refusal, so a new verb cannot be
-    /// added to one without the other.
+    /// Every verb this accepts is a verb an operator can find. The table in
+    /// `cli::meta` is what they are shown — a test there holds it to exactly
+    /// this list — and the refusal prints it, so neither half can grow a verb
+    /// the other has never heard of.
     #[test]
-    fn every_verb_there_is_parses_and_the_refusal_names_them_all() {
+    fn every_verb_there_is_parses_and_is_in_what_a_refusal_shows() {
         for verb in VERBS {
             let parsed = parse(Some(verb)).unwrap_or_else(|_| panic!("`linrdp service {verb}` is not accepted"));
             // English does not conjugate from the verb: `stop` + `ed` is
@@ -525,14 +529,15 @@ mod tests {
                 assert!(done.ends_with("ed") && !done.ends_with("oped"), "`{verb}` reports as `{done}`");
             }
         }
-        for message in [
-            format!("{:#}", parse(Some("frobnicate")).expect_err("refused")),
-            format!("{:#}", parse(None).expect_err("refused")),
-        ] {
-            for verb in VERBS {
-                assert!(message.contains(verb), "`{verb}` is not offered by: {message}");
-            }
+        let shown = crate::cli::subtree("service");
+        for verb in VERBS {
+            assert!(shown.contains(verb), "`{verb}` is not in what a refusal prints:\n{shown}");
         }
+        assert!(
+            format!("{:#}", parse(Some("frobnicate")).expect_err("refused")).contains("frobnicate"),
+            "the refusal repeats what was typed"
+        );
+        assert!(format!("{:#}", parse(None).expect_err("refused")).contains("no command"));
     }
 
     /// Half an install is worse than none, so it refuses before the first
