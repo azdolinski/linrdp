@@ -202,9 +202,9 @@ pub(crate) static FIELDS: &[Field] = &[
     },
     Field {
         path: "session.console.display",
-        description: "Which X display the shared screen is. Required when console is \
-                      enabled, and deliberately has no default: a wrong guess here serves \
-                      somebody else's screen to whoever connects.",
+        description: "Which X display the shared screen is. Unset is only valid with \
+                      console off; there is deliberately no default, because a wrong guess \
+                      here serves somebody else's screen to whoever connects.",
         kind: Kind::Text("an X display, e.g. :0"),
         default: Some("unset"),
         overridable: Overridable::Yes,
@@ -268,16 +268,21 @@ pub(crate) static FIELDS: &[Field] = &[
     },
     Field {
         path: "tls.cert",
-        description: "PEM certificate chain to serve. Setting it means linrdp will not \
-                      generate anything: a path that does not exist is a refusal to start, \
-                      not a fresh self-signed certificate under your filename.",
+        description: "PEM certificate chain to serve. Unset is not \"no TLS\" — RDP has \
+                      no such mode: linrdp generates a self-signed certificate, keeps it in \
+                      /var/lib/linrdp and reuses it across restarts, so a client that \
+                      trusted it once keeps trusting it. Set, linrdp generates nothing: a \
+                      path that does not exist is a refusal to start, not a fresh \
+                      self-signed certificate under your filename.",
         kind: Kind::Path,
         default: Some("unset"),
         overridable: Overridable::Yes,
     },
     Field {
         path: "tls.key",
-        description: "PEM private key for that certificate. Set both keys or neither.",
+        description: "PEM private key for that certificate. Unset alongside an unset \
+                      `cert` is the generated pair above. Set both keys or neither: half an \
+                      identity is a refusal to start.",
         kind: Kind::Path,
         default: Some("unset"),
         overridable: Overridable::Yes,
@@ -398,6 +403,26 @@ mod tests {
         for f in FIELDS {
             if let Overridable::No(reason) = &f.overridable {
                 assert!(reason.len() > 20, "{} refuses overrides without a reason", f.path);
+            }
+        }
+    }
+
+    /// `default: unset` is the one default that does not say what happens.
+    /// Every other default is the value itself, so reading it is reading the
+    /// behaviour; "unset" reads as "off" or "disabled" to anybody who has not
+    /// got the parent block's help open — which is exactly what `tls.cert`
+    /// looked like, promising a generated certificate on the `tls` branch and
+    /// saying only "unset" on the key underneath it. So a key that defaults to
+    /// unset has to spend a sentence of its own on what unset means.
+    #[test]
+    fn a_key_that_defaults_to_unset_says_what_unset_does() {
+        for f in FIELDS {
+            if f.default == Some("unset") {
+                assert!(
+                    f.description.contains("Unset") || f.description.contains("unset"),
+                    "{} defaults to unset without saying what unset does",
+                    f.path
+                );
             }
         }
     }
