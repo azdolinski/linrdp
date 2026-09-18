@@ -258,7 +258,27 @@ fn harden(dir: &Path, mode: u32) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    fn layout(tag: &str) -> Layout {
+    /// The temporary tree a test layout lives under, remembered rather than
+    /// recomputed: `cleanup` once walked one parent too far and aimed
+    /// `remove_dir_all` at /tmp itself, which deleted other tests' fixtures
+    /// out from under them mid-run.
+    struct Fixture {
+        root: PathBuf,
+        layout: Layout,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            assert!(
+                self.root.starts_with(std::env::temp_dir()) && self.root != std::env::temp_dir(),
+                "refusing to remove {}",
+                self.root.display()
+            );
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn fixture(tag: &str) -> Fixture {
         let root = std::env::temp_dir().join(format!("linrdp-svc-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let layout = Layout {
@@ -272,20 +292,14 @@ mod tests {
         for dir in [&layout.etc, &layout.unit_dir, &layout.pam_dir, &layout.state, &layout.log] {
             std::fs::create_dir_all(dir).expect("temp layout");
         }
-        layout
-    }
-
-    fn cleanup(layout: &Layout) {
-        if let Some(root) = layout.etc.parent().and_then(Path::parent).and_then(Path::parent) {
-            let _ = std::fs::remove_dir_all(root);
-        }
+        Fixture { root, layout }
     }
 
     /// Re-running `install` is how a binary upgrade is applied. A configuration
     /// rewritten there would silently reset every choice the operator made.
     #[test]
     fn install_never_overwrites_an_existing_configuration() {
-        let layout = layout("keepconfig");
+        let layout = &fixture("keepconfig").layout;
         let mine = "listeners:\n  - bind: 10.0.0.1:3389\n    auth: system\n";
         std::fs::write(layout.config_file(), mine).expect("seed");
 
@@ -297,24 +311,22 @@ mod tests {
             mine,
             "byte for byte what the operator wrote"
         );
-        cleanup(&layout);
     }
 
     /// And on a machine that has none, it does write one.
     #[test]
     fn install_writes_a_configuration_when_there_is_none() {
-        let layout = layout("newconfig");
+        let layout = &fixture("newconfig").layout;
         assert!(ensure_config(&layout.config_file()).expect("written"));
         assert!(!ensure_config(&layout.config_file()).expect("second run"), "only the first time");
         crate::config::load_strict(&layout.config_file()).expect("the service starts on it");
-        cleanup(&layout);
     }
 
     /// The file `install` writes on a fresh machine has to be one the service
     /// will actually start on, and one an operator can read to learn the keys.
     #[test]
     fn the_configuration_install_writes_is_valid_and_self_describing() {
-        let layout = layout("freshconfig");
+        let layout = &fixture("freshconfig").layout;
         let fresh = crate::config::load_or_default(&layout.config_file()).expect("defaults").config;
         let body = crate::config::render(&fresh);
         crate::atomic::write(&layout.config_file(), &body, 0o644).expect("write");
@@ -322,7 +334,6 @@ mod tests {
         let reloaded = crate::config::load_strict(&layout.config_file()).expect("starts on it");
         assert_eq!(reloaded, fresh);
         assert!(body.contains("# How a login is verified"), "the keys are described: {body}");
-        cleanup(&layout);
     }
 
     /// The PAM service file is what gives a session its /run/user/<uid>, and

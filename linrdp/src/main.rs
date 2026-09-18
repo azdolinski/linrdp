@@ -11,6 +11,7 @@ mod auth;
 mod capture;
 mod clipboard;
 mod config;
+mod configtui;
 mod doctor;
 mod greeter;
 mod gfx;
@@ -108,6 +109,9 @@ fn main() -> anyhow::Result<()> {
             Some(account) => doctor::run_account(&account),
             None => doctor::run(),
         };
+    }
+    if std::env::args().nth(1).as_deref() == Some("config") {
+        return configtui::run(std::env::args().any(|arg| arg == "--print"));
     }
     if std::env::args().nth(1).as_deref() == Some("service") {
         return service::run(std::env::args().nth(2).as_deref());

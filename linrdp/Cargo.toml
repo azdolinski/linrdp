@@ -66,6 +66,11 @@ console = "0.16.6"
 # reason the file is parsed with serde rather than by hand.
 serde = { version = "1", features = ["derive"] }
 serde_norway = "0.9"
+# `linrdp config` — the settings browser. Only the base widgets: the tree is a
+# list of rows computed by `configtui::model`, which is both fewer dependencies
+# than a tree widget and a pure function that can be tested without a terminal.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+crossterm = "0.29"
 
 [features]
 # Wayland capture path: xdg-desktop-portal + PipeWire + libei (see src/wayland).

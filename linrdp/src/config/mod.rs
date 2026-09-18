@@ -499,10 +499,14 @@ pub(crate) struct Loaded {
 /// Read the configuration, or the built-in defaults when the file does not
 /// exist.
 ///
-/// Only the supervisor and the single-process development path call this. A
-/// file that exists and is wrong is still an error: the defaults answer
-/// "nobody has configured this machine", never "this machine is configured
-/// incorrectly".
+/// Callers are the ones whose question is "what should a machine nobody has
+/// configured do?": the supervisor at startup, the single-process development
+/// path, `service install` writing the first file, and `linrdp config` opening
+/// on a machine that has none. A worker is never among them.
+///
+/// A file that exists and is wrong is still an error either way: the defaults
+/// answer "nobody has configured this machine", never "this machine is
+/// configured incorrectly".
 pub(crate) fn load_or_default(path: &Path) -> anyhow::Result<Loaded> {
     match std::fs::read_to_string(path) {
         Ok(body) => parse(path, &body).map(|config| Loaded { config, from_defaults: false }),
@@ -530,9 +534,10 @@ pub(crate) fn load_for_diagnostics(path: &Path) -> (Config, Option<String>) {
 /// Read the configuration. A missing file is an error like any other.
 ///
 /// There is no defaults branch in this function and there must not be one.
-/// Its callers — the worker, `doctor`, `service`, `config` — are all answering
-/// "what did the operator ask for?", and a plausible guess is the wrong answer
-/// to that question every time.
+/// Its callers are answering "what did the operator ask for?", and a plausible
+/// guess is the wrong answer to that question every time — most sharply in a
+/// worker, where guessing `auth: both` over a written `auth: system` would
+/// authenticate more weakly than anyone asked, in silence.
 pub(crate) fn load_strict(path: &Path) -> anyhow::Result<Config> {
     let body = std::fs::read_to_string(path)
         .with_context(|| format!("read {}", path.display()))?;
