@@ -116,8 +116,9 @@ pub(crate) fn write_cookie(runtime_dir: &str, display: u16, owner: &UserIds) -> 
     // can connect to, reported as "Authorization required" much later.
     let mut pipe = [0i32; 2];
     // SAFETY: a two-element array, which is what pipe(2) writes into.
+    let piped = unsafe { libc::pipe(pipe.as_mut_ptr()) };
     anyhow::ensure!(
-        unsafe { libc::pipe(pipe.as_mut_ptr()) } == 0,
+        piped == 0,
         "pipe for the cookie writer: {}",
         std::io::Error::last_os_error()
     );

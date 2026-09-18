@@ -134,6 +134,14 @@ fn main() -> anyhow::Result<()> {
         return keeper_main();
     }
 
+    // The clipboard's file helper: one per session, running as the session
+    // user so the worker never opens a user's files with root's credentials.
+    // Handled here for the same reason the keeper is — it needs no runtime,
+    // no configuration and, above all, no privileges.
+    if std::env::args().any(|arg| arg == "--file-agent") {
+        return file_agent_main();
+    }
+
     // Credential capture, invoked by `pam_exec` from the system PAM stack on
     // every authentication this machine performs. Handled here, before any
     // runtime is built: a `su` at the console should not be paying for a
@@ -180,6 +188,22 @@ fn refuse_leftovers(args: pico_args::Arguments) -> anyhow::Result<()> {
         names.join(" "),
         config::path().display()
     )
+}
+
+/// Serve one session's clipboard file operations as that session's user
+/// (see `session::fileagent`).
+fn file_agent_main() -> anyhow::Result<()> {
+    let mut args = pico_args::Arguments::from_env();
+    let _ = args.contains("--file-agent");
+    let user: String = args.value_from_str("--file-agent-user")?;
+    if let Some(path) = args.opt_value_from_str::<_, PathBuf>("--config")? {
+        config::set_path(path);
+    }
+    // Same tolerance the keeper has: a typo in a key the helper does not read
+    // must not cost somebody their clipboard.
+    let log = config::load_strict(config::path()).map(|c| c.log).unwrap_or_default();
+    logging::setup(&log);
+    session::fileagent::agent_main(&user)
 }
 
 /// Own one user's session for its whole life (see `session::keeper_main`).

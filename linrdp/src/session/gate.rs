@@ -71,6 +71,10 @@ pub(crate) enum Binding {
 #[derive(Debug, Clone)]
 struct Bound {
     kind: Binding,
+    /// Whose session this is, for the subsystems that must act with the
+    /// user's own credentials rather than the worker's. `None` for the logon
+    /// screen, which belongs to nobody.
+    user: Option<String>,
     display: String,
     xauthority: String,
     /// Desktop size this client negotiated — the size the session's screen is
@@ -189,7 +193,30 @@ pub(crate) fn bind(
     client_size: (u16, u16),
 ) -> anyhow::Result<()> {
     let audio = audio_for(user, runtime_dir);
-    bind_kind(Binding::Session, display, xauthority, runtime_dir, client_size, audio)
+    bind_kind(
+        Binding::Session,
+        Some(user.to_owned()),
+        display,
+        xauthority,
+        runtime_dir,
+        client_size,
+        audio,
+    )
+}
+
+/// Whose session this worker is bound to, if it is bound to one.
+///
+/// The clipboard's file helper is the caller that matters: a worker is root,
+/// and opening a file named by the session — or creating one named by the
+/// client — with root's credentials is the boundary violation this answers.
+/// The logon screen has no user, so file transfer there has nobody to act as
+/// and does not happen.
+pub(crate) fn session_user() -> Option<String> {
+    BOUND
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .and_then(|bound| bound.user.clone())
 }
 
 /// This session's audio target, or `None` with the reason in the log.
@@ -221,11 +248,12 @@ pub(crate) fn bind_greeter(
     // No audio: the logon screen is linrdp's own X server with nobody's
     // session on it, so there is no daemon to capture and nothing that could
     // make a sound. Silence there is the correct behaviour, not a gap.
-    bind_kind(Binding::Greeter, display, xauthority, runtime_dir, client_size, None)
+    bind_kind(Binding::Greeter, None, display, xauthority, runtime_dir, client_size, None)
 }
 
 fn bind_kind(
     kind: Binding,
+    user: Option<String>,
     display: u16,
     xauthority: &str,
     runtime_dir: &str,
@@ -234,6 +262,7 @@ fn bind_kind(
 ) -> anyhow::Result<()> {
     let wanted = Bound {
         kind,
+        user,
         display: format!(":{display}"),
         xauthority: xauthority.to_owned(),
         client_size,
@@ -459,6 +488,10 @@ mod tests {
     fn sample(kind: Binding, display: &str) -> Bound {
         Bound {
             kind,
+            user: match kind {
+                Binding::Greeter => None,
+                Binding::Session => Some("rdptest".to_owned()),
+            },
             display: display.to_owned(),
             xauthority: format!("/run/user/1000/linrdp/Xauthority{display}"),
             client_size: (1920, 1080),

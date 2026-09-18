@@ -69,8 +69,9 @@ impl DisplayLease {
         // immediately before exec and nothing else in this process uses it.
         let file = unsafe { File::from_raw_fd(fd) };
         // SAFETY: a valid open fd; LOCK_NB never blocks.
+        let held = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         anyhow::ensure!(
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+            held == 0,
             "the descriptor handed over for display :{number} does not hold its lock: {}",
             std::io::Error::last_os_error()
         );

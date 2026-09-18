@@ -3,6 +3,7 @@
 //! See `docs/superpowers/specs/2026-09-16-multi-session-design.md`.
 
 pub(crate) mod detect;
+pub(crate) mod fileagent;
 pub(crate) mod display_alloc;
 pub(crate) mod gate;
 pub(crate) mod keeper;
@@ -181,6 +182,8 @@ fn spawn_keeper(
     if !crate::config::path_is_default() {
         command.arg("--config").arg(crate::config::path());
     }
+    // SAFETY: the unsafe here is `pre_exec` below — its closure runs between
+    // fork and exec and calls only dup2 and fcntl, both async-signal-safe.
     let mut child = unsafe { command
         .arg("--keeper")
         .arg("--keeper-user")

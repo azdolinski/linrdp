@@ -24,6 +24,8 @@ use core::time::Duration;
 use std::collections::{HashMap, VecDeque};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+
+use anyhow::Context as _;
 use std::sync::{Arc, Mutex};
 
 use ironrdp_cliprdr::backend::{ClipboardMessage, ClipboardMessageProxy, CliprdrBackend};
@@ -141,6 +143,13 @@ struct DownloadTarget {
     /// Index of the descriptor inside the remote FILEGROUPDESCRIPTORW
     /// (FileContentsRequest addresses files by this index).
     index: i32,
+    /// Where the file goes, **relative to the paste directory**. The absolute
+    /// path is never resolved here: the file helper resolves it once, under
+    /// its own directory descriptor, with no symlink followed. What comes back
+    /// is the descriptor, and a descriptor cannot be redirected afterwards.
+    relative: PathBuf,
+    /// The absolute path the same file will have, for the `file://` URI the
+    /// desktop is offered afterwards. Used to name the file, never to open it.
     path: PathBuf,
     size: Option<u64>,
 }
@@ -148,11 +157,16 @@ struct DownloadTarget {
 #[derive(Debug)]
 enum CurrentDownload {
     /// The descriptor carried no size; a SIZE request is outstanding.
-    SizeQuery { index: i32, path: PathBuf },
+    SizeQuery {
+        index: i32,
+        relative: PathBuf,
+        path: PathBuf,
+    },
     /// RANGE requests are streaming into `file`.
     Ranges {
         file: std::fs::File,
         index: i32,
+        relative: PathBuf,
         path: PathBuf,
         remaining: u64,
         offset: u64,
@@ -165,6 +179,9 @@ struct Download {
     stream_id: u32,
     next_stream_id: u32,
     dest_dir: PathBuf,
+    /// The helper that creates every file below `dest_dir`, as the session
+    /// user. The download cannot start without one.
+    files: Arc<Mutex<Option<crate::session::fileagent::FileAgent>>>,
     /// Files not yet started.
     pending: VecDeque<DownloadTarget>,
     current: Option<CurrentDownload>,
@@ -179,10 +196,15 @@ impl Download {
         self.next_stream_id
     }
 
+    /// Create one pasted file, as the session user.
+    fn create(&self, relative: &Path) -> anyhow::Result<std::fs::File> {
+        X11CliprdrBackend::with_files(&self.files, |agent| agent.create_file(relative))
+    }
+
     /// Drop the file being downloaded (if any), removing the partial result.
     fn skip_current(&mut self) {
-        if let Some(CurrentDownload::Ranges { path, .. }) = self.current.take() {
-            let _ = std::fs::remove_file(path);
+        if let Some(CurrentDownload::Ranges { relative, .. }) = self.current.take() {
+            let _ = X11CliprdrBackend::with_files(&self.files, |agent| agent.remove(&relative));
         }
     }
 
@@ -197,12 +219,13 @@ impl Download {
                     self.stream_id = self.alloc_stream_id();
                     self.current = Some(CurrentDownload::SizeQuery {
                         index: next.index,
+                        relative: next.relative,
                         path: next.path,
                     });
                 }
                 Some(0) => {
-                    if let Err(e) = std::fs::File::create(&next.path) {
-                        tracing::warn!(path = %next.path.display(), %e, "clipboard: cannot create pasted file");
+                    if let Err(e) = self.create(&next.relative) {
+                        tracing::warn!(path = %next.path.display(), error = format!("{e:#}"), "clipboard: cannot create pasted file");
                         continue;
                     }
                     self.done.push(next.path);
@@ -211,20 +234,21 @@ impl Download {
                     tracing::warn!(size, path = %next.path.display(), "clipboard: skipping oversized file");
                     continue;
                 }
-                Some(size) => match std::fs::File::create(&next.path) {
+                Some(size) => match self.create(&next.relative) {
                     Ok(file) => {
                         self.total_budget -= size;
                         self.stream_id = self.alloc_stream_id();
                         self.current = Some(CurrentDownload::Ranges {
                             file,
                             index: next.index,
+                            relative: next.relative,
                             path: next.path,
                             remaining: size,
                             offset: 0,
                         });
                     }
                     Err(e) => {
-                        tracing::warn!(path = %next.path.display(), %e, "clipboard: cannot create pasted file");
+                        tracing::warn!(path = %next.path.display(), error = format!("{e:#}"), "clipboard: cannot create pasted file");
                         continue;
                     }
                 },
@@ -258,14 +282,23 @@ impl Download {
     }
 }
 
-/// Build `dest_dir/relative_dir/name`, keeping the result inside `dest_dir`.
-/// (The cliprdr core sanitizes descriptors too; this is belt and braces.)
-fn safe_join(dest_dir: &Path, relative_dir: Option<&str>, name: &str) -> Option<PathBuf> {
+/// Turn a remote descriptor's directory and name into a path **relative to**
+/// the paste directory.
+///
+/// Relative on purpose. This used to build the absolute path the worker then
+/// opened as root, which meant a textual containment check was standing in for
+/// a guarantee only the kernel can give: a symlink anywhere along the way is
+/// invisible here and is followed at `open`. What comes out now is handed to
+/// the file helper, which walks it one component at a time under its own
+/// directory descriptor with `O_NOFOLLOW`. This remains as the first filter —
+/// a name with a separator in it is a malformed descriptor worth refusing
+/// outright — not as the protection.
+fn safe_relative(relative_dir: Option<&str>, name: &str) -> Option<PathBuf> {
     let name = name.trim();
     if name.is_empty() || name.contains(['/', '\\']) {
         return None;
     }
-    let mut path = dest_dir.to_path_buf();
+    let mut path = PathBuf::new();
     if let Some(rel) = relative_dir {
         for component in rel.split(['\\', '/']) {
             let component = component.trim();
@@ -498,6 +531,17 @@ pub(crate) struct X11CliprdrBackend {
     /// Hold those fetches a few seconds; the data syncs once the session is
     /// up (a genuine new copy mid-session is fetched immediately).
     hold_image_fetch_until: Option<std::time::Instant>,
+
+    /// The helper that touches files for this session, running as the session
+    /// user.
+    ///
+    /// Every file this module opens or creates goes through it. The worker is
+    /// root, and both directions of file transfer are named by somebody who
+    /// is not: the session names what to read, the remote client names what
+    /// to write. `None` means no session is bound (the logon screen) or the
+    /// helper could not start — either way file transfer is off, which is the
+    /// safe direction. Text and images are unaffected.
+    files: Arc<Mutex<Option<crate::session::fileagent::FileAgent>>>,
 }
 
 impl X11CliprdrBackend {
@@ -506,6 +550,7 @@ impl X11CliprdrBackend {
             proxy: Arc::new(Mutex::new(None)),
             display,
             xauthority,
+            files: Arc::new(Mutex::new(None)),
             incoming: None,
             incoming_gen: 0,
             copy_generation: 0,
@@ -586,28 +631,40 @@ impl X11CliprdrBackend {
         );
     }
 
-    /// Delete paste leftovers older than a day (best-effort).
-    fn clean_stale_paste_dirs(&self) {
-        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+    /// Start the per-session file helper, or say why file transfer is off.
+    ///
+    /// Not fatal: a session with no file helper still syncs text and images.
+    /// What it must never do is fall back to doing the work itself — that is
+    /// the root-opens-your-files bug this replaces.
+    fn start_file_helper(&mut self) {
+        let Some(user) = crate::session::gate::session_user() else {
+            tracing::info!(
+                "clipboard: no session is bound, so there is nobody to open files as — \
+                 file transfer is off for this connection"
+            );
             return;
         };
-        let cutoff = std::time::SystemTime::now() - Duration::from_secs(24 * 60 * 60);
-        for entry in entries.flatten() {
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            if !name.starts_with("linrdp-paste-") {
-                continue;
-            }
-            let stale = entry
-                .metadata()
-                .and_then(|meta| meta.modified())
-                .map(|modified| modified < cutoff)
-                .unwrap_or(false);
-            if stale {
-                let _ = std::fs::remove_dir_all(entry.path());
-            }
+        match crate::session::fileagent::FileAgent::start(&user) {
+            Ok(agent) => *self.files.lock().expect("poisoned") = Some(agent),
+            Err(error) => tracing::warn!(
+                user,
+                error = format!("{error:#}"),
+                "clipboard: no file helper for this session — text and images still sync, \
+                 file transfer does not"
+            ),
         }
+    }
+
+    /// Run `f` against the file helper, or explain that there is none.
+    fn with_files<T>(
+        files: &Arc<Mutex<Option<crate::session::fileagent::FileAgent>>>,
+        f: impl FnOnce(&mut crate::session::fileagent::FileAgent) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let mut guard = files.lock().expect("poisoned");
+        let agent = guard
+            .as_mut()
+            .context("this session has no file helper, so no file can be opened as its user")?;
+        f(agent)
     }
 }
 
@@ -625,7 +682,7 @@ impl CliprdrBackend for X11CliprdrBackend {
 
     fn on_ready(&mut self) {
         tracing::info!("clipboard: channel ready (X11 ↔ RDP sync: text + files + images)");
-        self.clean_stale_paste_dirs();
+        self.start_file_helper();
         self.hold_image_fetch_until = Some(std::time::Instant::now() + Duration::from_secs(4));
 
         // Poll the X11 clipboard for local copies (Linux → Windows). A poller
@@ -633,6 +690,7 @@ impl CliprdrBackend for X11CliprdrBackend {
         // window here; the echo guard keeps remote-sourced data from being
         // advertised straight back.
         let proxy = Arc::clone(&self.proxy);
+        let files = Arc::clone(&self.files);
         let outgoing_files = Arc::clone(&self.outgoing_files);
         let files_advertised = Arc::clone(&self.files_advertised);
         let echo_guard = Arc::clone(&self.echo_guard);
@@ -702,8 +760,24 @@ impl CliprdrBackend for X11CliprdrBackend {
                         let mut descriptors = Vec::new();
                         let mut offered: HashMap<i32, OfferedFile> = HashMap::new();
                         for (i, path) in paths.iter().enumerate() {
-                            let Ok(meta) = std::fs::metadata(path) else { continue };
-                            if !meta.is_file() {
+                            // Through the helper, as the session user. Doing
+                            // this as root is how a program on the desktop
+                            // could put `file:///etc/shadow` on the clipboard
+                            // and have it served to the RDP client: naming
+                            // the file was enough, because the account that
+                            // named it never needed to be able to read it.
+                            let facts = match Self::with_files(&files, |agent| agent.stat(path)) {
+                                Ok(facts) => facts,
+                                Err(error) => {
+                                    tracing::debug!(
+                                        path = %path.display(),
+                                        error = format!("{error:#}"),
+                                        "clipboard: not offering a file this session cannot read"
+                                    );
+                                    continue;
+                                }
+                            };
+                            if !facts.is_file {
                                 continue;
                             }
                             let name = path
@@ -712,13 +786,13 @@ impl CliprdrBackend for X11CliprdrBackend {
                                 .unwrap_or_else(|| format!("file{i}"));
                             descriptors.push(
                                 FileDescriptor::new(name.clone())
-                                    .with_file_size(meta.len())
+                                    .with_file_size(facts.size)
                                     .with_attributes(ClipboardFileAttributes::ARCHIVE),
                             );
                             offered.insert(
                                 i as i32,
                                 OfferedFile {
-                                    size: meta.len(),
+                                    size: facts.size,
                                     linux_path: path.clone(),
                                 },
                             );
@@ -953,7 +1027,23 @@ impl CliprdrBackend for X11CliprdrBackend {
             Some(file) if request.flags.contains(FileContentsFlags::SIZE) => {
                 FileContentsResponse::new_data_response(request.stream_id, file.size.to_le_bytes().to_vec())
             }
-            Some(file) => read_file_range(file, &request),
+            Some(file) => {
+                // Opened by the helper, as the session user. The descriptor
+                // that comes back is the answer to "which file is this" —
+                // there is no second path resolution for anything to be
+                // substituted into.
+                match Self::with_files(&self.files, |agent| agent.open_read(&file.linux_path)) {
+                    Ok(handle) => read_file_range(file, handle, &request),
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %file.linux_path.display(),
+                            error = format!("{error:#}"),
+                            "clipboard: cannot serve a file this session cannot open"
+                        );
+                        FileContentsResponse::new_error(request.stream_id)
+                    }
+                }
+            }
             None => FileContentsResponse::new_error(request.stream_id),
         };
         self.send_msg(ClipboardMessage::SendFileContentsResponse(response));
@@ -973,29 +1063,30 @@ impl CliprdrBackend for X11CliprdrBackend {
             download.skip_current();
         } else {
             match download.current.as_mut() {
-                Some(CurrentDownload::SizeQuery { index, path }) => {
-                    let path = path.clone();
+                Some(CurrentDownload::SizeQuery { index, relative, path }) => {
+                    let (index, relative, path) = (*index, relative.clone(), path.clone());
                     match response.data_as_size().ok() {
                         Some(0) => {
-                            if std::fs::File::create(&path).is_ok() {
+                            if download.create(&relative).is_ok() {
                                 download.done.push(path);
                             }
                             download.current = None;
                         }
                         Some(size) if size <= MAX_FILE_SIZE && size <= download.total_budget => {
-                            match std::fs::File::create(&path) {
+                            match download.create(&relative) {
                                 Ok(file) => {
                                     download.total_budget -= size;
                                     download.current = Some(CurrentDownload::Ranges {
                                         file,
-                                        index: *index,
+                                        index,
+                                        relative,
                                         path,
                                         remaining: size,
                                         offset: 0,
                                     });
                                 }
                                 Err(e) => {
-                                    tracing::warn!(path = %path.display(), %e, "clipboard: cannot create pasted file");
+                                    tracing::warn!(path = %path.display(), error = format!("{e:#}"), "clipboard: cannot create pasted file");
                                     download.current = None;
                                 }
                             }
@@ -1049,30 +1140,47 @@ impl CliprdrBackend for X11CliprdrBackend {
 
     /// File list metadata from the client: start streaming the files to disk.
     fn on_remote_file_list(&mut self, files: &[FileDescriptor], clip_data_id: Option<u32>) {
-        static PASTE_SEQ: AtomicU32 = AtomicU32::new(0);
-        let seq = PASTE_SEQ.fetch_add(1, Ordering::Relaxed);
-        let dest_dir = std::env::temp_dir().join(format!("linrdp-paste-{seq}"));
-        if let Err(e) = std::fs::create_dir_all(&dest_dir) {
-            tracing::warn!(dir = %dest_dir.display(), %e, "clipboard: cannot create paste directory");
-            return;
-        }
+        // The directory belongs to the session user and is made by the helper:
+        // a random name, `mkdir` exclusive, mode 0700. Every worker used to
+        // number its own from zero, so two sessions shared `linrdp-paste-0`
+        // and the same file name in both meant one truncating the other's
+        // download — while `umask 022` left the lot readable by every account
+        // on the machine.
+        let dest_dir = match Self::with_files(&self.files, crate::session::fileagent::FileAgent::paste_dir) {
+            Ok(dir) => dir,
+            Err(error) => {
+                tracing::warn!(
+                    error = format!("{error:#}"),
+                    "clipboard: refusing a file paste — there is no helper to write it as the \
+                     session user, and the worker is root"
+                );
+                return;
+            }
+        };
 
         let mut pending = VecDeque::new();
         for (i, file) in files.iter().enumerate() {
             let is_dir = file
                 .attributes
                 .is_some_and(|attributes| attributes.contains(ClipboardFileAttributes::DIRECTORY));
-            let Some(path) = safe_join(&dest_dir, file.relative_path.as_deref(), &file.name) else {
+            let Some(relative) = safe_relative(file.relative_path.as_deref(), &file.name) else {
                 tracing::warn!(name = %file.name, "clipboard: skipping file with unsafe name");
                 continue;
             };
             if is_dir {
-                let _ = std::fs::create_dir_all(&path);
+                if let Err(error) = Self::with_files(&self.files, |agent| agent.make_dir(&relative)) {
+                    tracing::warn!(
+                        dir = %relative.display(),
+                        error = format!("{error:#}"),
+                        "clipboard: cannot create pasted directory"
+                    );
+                }
                 continue;
             }
             pending.push_back(DownloadTarget {
                 index: i as i32,
-                path,
+                path: dest_dir.join(&relative),
+                relative,
                 size: file.file_size,
             });
         }
@@ -1083,6 +1191,7 @@ impl CliprdrBackend for X11CliprdrBackend {
             stream_id: 0,
             next_stream_id: 1,
             dest_dir,
+            files: Arc::clone(&self.files),
             pending,
             current: None,
             done: Vec::new(),
@@ -1112,8 +1221,16 @@ fn range_response_len(offered_size: u64, position: u64, requested: u32) -> usize
     usize::try_from(capped).unwrap_or(0)
 }
 
-/// Serve a RANGE FileContentsRequest from a local file.
-fn read_file_range(file: &OfferedFile, request: &FileContentsRequest) -> FileContentsResponse<'static> {
+/// Serve a RANGE FileContentsRequest from an already-open file.
+///
+/// `handle` arrives open on purpose: it was opened by the session's file
+/// helper with the session user's credentials, and this function is not given
+/// a path it could open itself.
+fn read_file_range(
+    file: &OfferedFile,
+    mut f: std::fs::File,
+    request: &FileContentsRequest,
+) -> FileContentsResponse<'static> {
     use std::io::{Read, Seek};
     let want = range_response_len(file.size, request.position, request.requested_size);
     if want == 0 {
@@ -1121,9 +1238,6 @@ fn read_file_range(file: &OfferedFile, request: &FileContentsRequest) -> FileCon
         // nothing. Both are answered, never allocated for.
         return FileContentsResponse::new_data_response(request.stream_id, Vec::new());
     }
-    let Ok(mut f) = std::fs::File::open(&file.linux_path) else {
-        return FileContentsResponse::new_error(request.stream_id);
-    };
     if f.seek(std::io::SeekFrom::Start(request.position)).is_err() {
         return FileContentsResponse::new_error(request.stream_id);
     }
@@ -1399,6 +1513,12 @@ mod tests {
     fn file_download_streams_to_disk() {
         let _guard = crate::x11_selection::X11_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let (mut backend, proxy) = backend_with_proxy();
+        // Every pasted file is created by the session's own file helper now,
+        // so a backend without one has nowhere to put them — which is the
+        // point: the worker is root and must not create them itself.
+        *backend.files.lock().expect("poisoned") =
+            Some(crate::session::fileagent::FileAgent::in_process_for_test().expect("helper"));
+        let paste_dir = paste_dir_of(&backend);
 
         let files = vec![
             FileDescriptor::new("small.bin").with_file_size(10),
@@ -1430,23 +1550,34 @@ mod tests {
             "uri-list must be published (echo guard primed)"
         );
 
-        // Both files must exist with the served contents; clean up after.
-        let mut found = 0;
-        let entries = std::fs::read_dir(std::env::temp_dir()).expect("temp dir");
-        for entry in entries.flatten() {
-            if !entry.file_name().to_string_lossy().starts_with("linrdp-paste-") {
-                continue;
-            }
-            let small = entry.path().join("small.bin");
-            let sized = entry.path().join("sized-by-query.bin");
-            if small.exists() && sized.exists() {
-                assert_eq!(std::fs::read(&small).unwrap(), vec![7u8; 10]);
-                assert_eq!(std::fs::read(&sized).unwrap().len(), 1234);
-                let _ = std::fs::remove_dir_all(entry.path());
-                found += 1;
-            }
-        }
-        assert_eq!(found, 1, "exactly one paste dir with both files");
+        // Both files must exist with the served contents, inside this
+        // session's own private directory and nowhere else.
+        let small = paste_dir.join("small.bin");
+        let sized = paste_dir.join("sized-by-query.bin");
+        assert_eq!(std::fs::read(&small).expect("small.bin"), vec![7u8; 10]);
+        assert_eq!(std::fs::read(&sized).expect("sized-by-query.bin").len(), 1234);
+        let _ = std::fs::remove_dir_all(&paste_dir);
+    }
+
+    /// Without a file helper there is nobody to write as, and the worker is
+    /// root — so a paste is refused rather than performed with root's
+    /// credentials in a directory every session shared.
+    #[test]
+    fn a_paste_without_a_file_helper_is_refused() {
+        let _guard = crate::x11_selection::X11_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (mut backend, proxy) = backend_with_proxy();
+        backend.on_remote_file_list(&[FileDescriptor::new("loot.bin").with_file_size(10)], None);
+        assert!(backend.download.is_none(), "nothing may be downloaded");
+        assert!(
+            proxy.0.lock().expect("poisoned").is_empty(),
+            "not a single file contents request may be sent"
+        );
+    }
+
+    /// Where this backend's helper put its paste directory.
+    fn paste_dir_of(backend: &X11CliprdrBackend) -> PathBuf {
+        let mut guard = backend.files.lock().expect("poisoned");
+        guard.as_mut().expect("helper").paste_dir().expect("paste dir")
     }
 
     #[test]
@@ -1617,16 +1748,30 @@ mod tests {
         assert_eq!(path_to_uri(Path::new("/tmp/linrdp-paste-1/żółć.png")), "file:///tmp/linrdp-paste-1/%C5%BC%C3%B3%C5%82%C4%87.png");
     }
 
+    /// A descriptor from the client names where a pasted file goes, and what
+    /// comes out of this must stay a *relative* path — the absolute one is the
+    /// file helper's to resolve, under its own directory descriptor.
     #[test]
-    fn safe_join_stays_inside_dest_dir() {
-        let dir = Path::new("/tmp/linrdp-paste-0");
+    fn a_remote_descriptor_yields_a_relative_path_with_no_way_out() {
         assert_eq!(
-            safe_join(dir, Some("sub\\dir"), "file.txt"),
-            Some(dir.join("sub/dir/file.txt"))
+            safe_relative(Some("sub\\dir"), "file.txt"),
+            Some(PathBuf::from("sub/dir/file.txt"))
         );
-        assert_eq!(safe_join(dir, Some("..\\..\\etc"), "passwd"), Some(dir.join("etc/passwd")));
-        assert_eq!(safe_join(dir, None, ""), None);
-        assert_eq!(safe_join(dir, None, "a/b"), None);
+        assert_eq!(
+            safe_relative(Some("..\\..\\etc"), "passwd"),
+            Some(PathBuf::from("etc/passwd")),
+            "`..` components are dropped, never followed"
+        );
+        assert_eq!(safe_relative(None, ""), None);
+        assert_eq!(safe_relative(None, "a/b"), None, "a separator in the name is malformed");
+
+        let relative = safe_relative(Some("a\\b"), "c.txt").expect("a name");
+        assert!(relative.is_relative(), "an absolute path would be resolved by the wrong process");
+        assert!(
+            relative.components().all(|c| matches!(c, std::path::Component::Normal(_))),
+            "only plain names survive: {}",
+            relative.display()
+        );
     }
 
     #[test]
