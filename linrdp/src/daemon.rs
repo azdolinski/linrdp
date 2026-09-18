@@ -33,21 +33,214 @@ pub(crate) fn write_pid_file() {
     }
 }
 
-/// The pid of the supervisor running here, if one is.
-///
-/// Two checks, because either alone lies. A pid file outlives the process that
-/// wrote it, and the number in it is handed out again to something unrelated;
-/// so the pid has to exist *and* be a linrdp before the answer is yes.
-pub(crate) fn running() -> Option<u32> {
-    let pid: u32 = std::fs::read_to_string(PID_FILE).ok()?.trim().parse().ok()?;
-    is_a_live_linrdp(pid).then_some(pid)
+/// A supervisor found running on this machine, and how it looks from outside.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Running {
+    pub(crate) pid: u32,
+    pub(crate) health: Health,
 }
 
-fn is_a_live_linrdp(pid: u32) -> bool {
-    let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) else {
-        return false; // no such process
+/// What could be established about it without talking to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Health {
+    /// It holds the listening sockets for these ports, in the order the
+    /// configuration names them. This is the process that will refuse your
+    /// bind, and this is exactly what it is holding.
+    Serving(Vec<u16>),
+    /// Process state `T` or `t`: stopped by a signal or under a debugger. It
+    /// keeps every socket it had and will never accept another connection —
+    /// alive by every cheaper test, and serving nobody.
+    Stopped,
+    /// Alive, and a supervisor, but none of the configured ports is on its
+    /// descriptors. Either it is still starting, or it is on its way out.
+    NotListening,
+    /// Its descriptors could not be read. /proc/<pid>/fd is readable by the
+    /// process's own user and by root, so this is what a non-root `status`
+    /// sees — "I could not tell", which is not the same as "nothing".
+    Unknown,
+}
+
+impl Health {
+    /// The sentence that follows "linrdp is already running (pid N)".
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::Serving(ports) => {
+                let list: Vec<String> = ports.iter().map(u16::to_string).collect();
+                let plural = if ports.len() == 1 { "port" } else { "ports" };
+                format!("serving {plural} {}", list.join(", "))
+            }
+            Self::Stopped => {
+                "STOPPED by a signal — it still holds the ports and will never accept a \
+                 connection. `kill -CONT <pid>` resumes it; `kill <pid>` ends it"
+                    .to_owned()
+            }
+            Self::NotListening => "not listening on any configured port — starting, or stopping".to_owned(),
+            Self::Unknown => "cannot see its sockets from here; try as root".to_owned(),
+        }
+    }
+}
+
+/// The supervisor running here, if there is one.
+///
+/// Four questions, because each of the cheap ones alone lies:
+///
+/// 1. Is the pid alive? A pid file outlives the process that wrote it.
+/// 2. Is it *this* program, invoked as a supervisor? Pids are handed out
+///    again, and a reused one is often one of linrdp's own workers or keepers
+///    — which share the name and would pass a `comm` check.
+/// 3. Is it a zombie? An exited process with an unreaped parent is in /proc,
+///    answers a signal-0, and serves nothing.
+/// 4. Does it hold one of the ports? That is the question the caller actually
+///    has, and the only one whose answer is not a proxy for it.
+///
+/// None of this is the interlock against two servers — the listening socket
+/// is, and it needs no cooperation from anybody. This is here so the refusal
+/// can say which process, and in what state, rather than "address in use".
+pub(crate) fn look(ports: &[u16]) -> Option<Running> {
+    let pid: u32 = std::fs::read_to_string(PID_FILE).ok()?.trim().parse().ok()?;
+    look_at(pid, ports)
+}
+
+fn look_at(pid: u32, ports: &[u16]) -> Option<Running> {
+    if !is_a_supervisor(pid) {
+        return None;
+    }
+    let health = match state_of(pid) {
+        // Exited, waiting to be reaped. It holds nothing.
+        Some('Z') => return None,
+        Some('T' | 't') => Health::Stopped,
+        _ => match socket_inodes(pid) {
+            None => Health::Unknown,
+            Some(held) => {
+                let listening = listening_on(ports);
+                // In the configuration's order, not the kernel's: the file
+                // reads 3389 then 3390, and so should the answer.
+                let mine: Vec<u16> = ports
+                    .iter()
+                    .filter(|port| {
+                        listening
+                            .iter()
+                            .any(|(listening_port, inode)| listening_port == *port && held.contains(inode))
+                    })
+                    .copied()
+                    .collect();
+                if mine.is_empty() {
+                    Health::NotListening
+                } else {
+                    Health::Serving(mine)
+                }
+            }
+        },
     };
-    comm.trim() == "linrdp"
+    Some(Running { pid, health })
+}
+
+/// Whether `pid` is this program, started as a supervisor.
+///
+/// The name alone is not enough: every worker, keeper and greeter linrdp forks
+/// is also called `linrdp`, so a reused pid lands on one of them more often
+/// than on anything else. What separates them is the argv — a supervisor is
+/// `linrdp` or `linrdp debug`, and never carries any of the flags below.
+fn is_a_supervisor(pid: u32) -> bool {
+    let Some(argv) = cmdline(pid) else {
+        return false;
+    };
+    let Some(program) = argv.first() else {
+        return false;
+    };
+    if !std::path::Path::new(program)
+        .file_name()
+        .is_some_and(|name| name == "linrdp")
+    {
+        return false;
+    }
+    !argv
+        .iter()
+        .any(|arg| ["--listener", "--serve-fd", "--keeper", "--capture-credential"].contains(&arg.as_str()))
+}
+
+fn cmdline(pid: u32) -> Option<Vec<String>> {
+    let raw = std::fs::read_to_string(format!("/proc/{pid}/cmdline")).ok()?;
+    Some(
+        raw.split('\0')
+            .filter(|arg| !arg.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+/// The process state letter from /proc/<pid>/stat.
+fn state_of(pid: u32) -> Option<char> {
+    state_in(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// Field three of a stat line, parsed the only way that is safe.
+///
+/// Field two is the executable name in parentheses, and it is the raw name: it
+/// can contain spaces and it can contain parentheses. Splitting on whitespace
+/// and taking the third field is the classic way to read the wrong character.
+/// The *last* `)` is the end of that field, whatever is inside it.
+fn state_in(stat: &str) -> Option<char> {
+    stat[stat.rfind(')')? + 1..].split_whitespace().next()?.chars().next()
+}
+
+/// The inode of every socket `pid` has open, or `None` if that cannot be read.
+fn socket_inodes(pid: u32) -> Option<std::collections::HashSet<u64>> {
+    let entries = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+    Some(
+        entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+            .filter_map(|target| {
+                target
+                    .to_str()?
+                    .strip_prefix("socket:[")?
+                    .strip_suffix(']')?
+                    .parse::<u64>()
+                    .ok()
+            })
+            .collect(),
+    )
+}
+
+/// `(port, inode)` for every socket on this machine listening on one of
+/// `ports`, from /proc/net/tcp and its v6 twin.
+fn listening_on(ports: &[u16]) -> Vec<(u16, u64)> {
+    let mut found = Vec::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(body) = std::fs::read_to_string(table) else {
+            continue;
+        };
+        for line in body.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            // local_address, st, ..., inode — the layout is fixed, but a
+            // kernel that prints fewer columns must not panic the server.
+            let (Some(local), Some(state), Some(inode)) = (fields.get(1), fields.get(3), fields.get(9)) else {
+                continue;
+            };
+            if *state != "0A" {
+                continue; // 0A is TCP_LISTEN; everything else is a connection
+            }
+            let Some(port) = local.rsplit(':').next().and_then(|hex| u16::from_str_radix(hex, 16).ok()) else {
+                continue;
+            };
+            if ports.contains(&port) {
+                if let Ok(inode) = inode.parse::<u64>() {
+                    found.push((port, inode));
+                }
+            }
+        }
+    }
+    found
+}
+
+/// The ports a configuration asks for, for [`look`].
+pub(crate) fn ports_of(config: &crate::config::Config) -> Vec<u16> {
+    config
+        .listeners
+        .iter()
+        .filter_map(|listener| listener.bind.rsplit(':').next()?.parse().ok())
+        .collect()
 }
 
 /// `linrdp daemon <verb>`.
@@ -72,6 +265,14 @@ pub(crate) const VERBS: [&str; 3] = ["start", "stop", "status"];
 fn start() -> anyhow::Result<()> {
     require_root("start")?;
 
+    // Read the configuration here, in the foreground, where a complaint about
+    // it lands on the terminal of the person who typed the command. After the
+    // fork it would go wherever the log goes, which on a machine with no
+    // journal and no `log.file` is nowhere. It also names the ports, which is
+    // what makes the check below more than a guess.
+    let config = crate::config::load_or_default(crate::config::path())?.config;
+    crate::config::validate(&config)?;
+
     // systemd first. Its supervisor writes the same pid file, so asking that
     // question first would answer "already running (pid N)" — true, and no
     // help at all to somebody who needs to know that the way to touch this one
@@ -84,16 +285,9 @@ fn start() -> anyhow::Result<()> {
              command for that one; `daemon` is for machines without systemd."
         );
     }
-    if let Some(pid) = running() {
-        anyhow::bail!("a linrdp supervisor is already running (pid {pid})");
+    if let Some(found) = look(&ports_of(&config)) {
+        anyhow::bail!("{}", already_running(&found));
     }
-
-    // Read the configuration here, in the foreground, where a complaint about
-    // it lands on the terminal of the person who typed the command. After the
-    // fork it would go wherever the log goes, which on a machine with no
-    // journal and no `log.file` is nowhere.
-    let config = crate::config::load_or_default(crate::config::path())?.config;
-    crate::config::validate(&config)?;
 
     let exe = std::env::current_exe().context("find this binary")?;
     let mut child = std::process::Command::new(&exe);
@@ -140,9 +334,11 @@ fn start() -> anyhow::Result<()> {
 
 fn stop() -> anyhow::Result<()> {
     require_root("stop")?;
-    let Some(pid) = running() else {
+    let ports = crate::config::load_for_diagnostics(crate::config::path()).0;
+    let Some(found) = look(&ports_of(&ports)) else {
         anyhow::bail!("no linrdp supervisor is running here");
     };
+    let pid = found.pid;
 
     // SAFETY: kill takes two integers and touches no memory.
     let sent = unsafe { libc::kill(pid.cast_signed(), libc::SIGTERM) };
@@ -152,7 +348,7 @@ fn stop() -> anyhow::Result<()> {
     // the same reason `KillMode=process` is in the unit — they are owned by
     // keepers re-parented to init.
     for _ in 0..50 {
-        if running().is_none() {
+        if look(&ports_of(&ports)).is_none() {
             let _ = std::fs::remove_file(PID_FILE);
             println!("stopped (pid {pid}). Sessions already open are still running.");
             return Ok(());
@@ -163,9 +359,10 @@ fn stop() -> anyhow::Result<()> {
 }
 
 fn status() -> anyhow::Result<()> {
-    match running() {
-        Some(pid) => {
-            println!("running (pid {pid})");
+    let ports = ports_of(&crate::config::load_for_diagnostics(crate::config::path()).0);
+    match look(&ports) {
+        Some(found) => {
+            println!("running (pid {}, {})", found.pid, found.health.describe());
             if crate::service::unit::systemctl(&["is-active", "--quiet", crate::service::unit::UNIT_NAME])
                 == Some(true)
             {
@@ -186,6 +383,21 @@ fn status() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// What to say to somebody who asked for a second server.
+///
+/// One sentence, first, naming the process — because the alternative is what
+/// this replaces: two "address already in use" lines and the useful fact
+/// underneath them, where it reads like a footnote to a failure rather than
+/// the reason nothing was attempted.
+pub(crate) fn already_running(found: &Running) -> String {
+    format!(
+        "linrdp is already running (pid {}, {}) — nothing was started.\n\
+         Stop it with `linrdp daemon stop`, or `linrdp service stop` if systemd started it.",
+        found.pid,
+        found.health.describe()
+    )
 }
 
 /// Where a detached supervisor's own stderr goes.
@@ -227,16 +439,57 @@ mod tests {
     use super::*;
 
     /// A pid file outlives whatever wrote it, and the number is handed out
-    /// again. Trusting the file alone would have `daemon start` refuse to run
-    /// because of a process that is now somebody's text editor.
+    /// again — often to one of linrdp's own workers or keepers, which carry
+    /// the same name. Trusting the pid, or even the name, would have a start
+    /// refused because of a process that is now somebody's text editor.
     #[test]
-    fn a_pid_belonging_to_something_else_is_not_a_running_linrdp() {
-        // This test process is alive and is not called linrdp.
-        assert!(!is_a_live_linrdp(std::process::id()), "cargo's test binary is not linrdp");
+    fn a_pid_belonging_to_something_else_is_not_a_supervisor() {
+        // This test process is alive and is not linrdp.
+        assert!(!is_a_supervisor(std::process::id()), "cargo's test binary is not linrdp");
         // Pid 1 exists on every Linux machine and is not linrdp either.
-        assert!(!is_a_live_linrdp(1), "init is not linrdp");
+        assert!(!is_a_supervisor(1), "init is not linrdp");
         // Nothing has this pid: /proc says so by not being there.
-        assert!(!is_a_live_linrdp(0x3FFF_FFFF), "an impossible pid is not running");
+        assert!(!is_a_supervisor(0x3FFF_FFFF), "an impossible pid is not running");
+    }
+
+    /// The question the caller actually has is "is that process holding my
+    /// port", and this is the only check that answers it rather than standing
+    /// in for it. Asked with a socket this very process is listening on, so
+    /// the answer is known before it is asked.
+    #[test]
+    fn a_process_is_found_by_the_port_it_is_listening_on() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port of our own");
+        let port = listener.local_addr().expect("bound").port();
+        let me = std::process::id();
+
+        let held = socket_inodes(me).expect("our own descriptors are readable");
+        let listening = listening_on(&[port]);
+        assert!(!listening.is_empty(), "the kernel does not list our listening socket");
+        assert!(
+            listening.iter().any(|(_, inode)| held.contains(inode)),
+            "the socket we are listening on is not among ours"
+        );
+
+        // Ours specifically, not "nothing at all": the suite runs in parallel
+        // and an ephemeral port freed here can be handed to another test
+        // before this line runs. The inode cannot be handed to anybody.
+        drop(listener);
+        assert!(
+            listening_on(&[port]).iter().all(|(_, inode)| !held.contains(inode)),
+            "a closed socket is still reported as listening"
+        );
+    }
+
+    /// Field two of a stat line is the executable name in parentheses, and it
+    /// is the raw name: it may contain spaces and parentheses. Taking the
+    /// third whitespace-separated field is the classic way to read the wrong
+    /// character and call a running process stopped.
+    #[test]
+    fn the_process_state_survives_an_executable_with_a_silly_name() {
+        assert_eq!(state_in("42 (linrdp) S 1 42 42 0 -1"), Some('S'));
+        assert_eq!(state_in("42 (a b) c) T 1 42"), Some('T'), "the LAST paren ends the name");
+        assert_eq!(state_in("42 (evil S name) Z 1"), Some('Z'), "not the one inside the name");
+        assert_eq!(state_in("nonsense"), None);
     }
 
     /// Every verb the tree shows is a verb this takes. The listing an operator

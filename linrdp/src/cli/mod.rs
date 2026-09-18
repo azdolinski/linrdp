@@ -40,6 +40,23 @@ pub(crate) fn help() -> String {
     format!("{}\n{PROSE}", tree())
 }
 
+/// Let a closed pipe end this process instead of panicking in it.
+///
+/// Rust starts every program with SIGPIPE ignored, so a write to a pipe whose
+/// reader has gone gives EPIPE — which `println!` turns into a panic and a
+/// backtrace. `linrdp tree | head` ended in one.
+///
+/// Restoring the default disposition is the usual fix, and it is applied only
+/// to the commands that print something and exit. Never to the server: a
+/// worker writes to sockets, and on Linux a write to a connection the client
+/// has closed raises SIGPIPE too. Killed by signal 13, a worker would lose a
+/// session to a disconnection that its error path already handles.
+pub(crate) fn die_quietly_on_a_closed_pipe() {
+    // SAFETY: setting a signal disposition to SIG_DFL is async-signal-safe and
+    // takes no memory.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+}
+
 fn draw(root_label: &str, root_path: &str, root_summary: &str) -> String {
     let mut rows = vec![Row {
         stem: String::new(),

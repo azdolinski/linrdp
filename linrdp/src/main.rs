@@ -61,6 +61,16 @@ fn main() -> anyhow::Result<()> {
     // everything that decides it is per-account: the runtime directory the
     // session gets, whether the password is usable, and whether systemd will
     // start a sound server for that uid at all.
+    // Every branch below this line prints and exits; none of them serves a
+    // socket. `debug` is the exception and is dispatched further down, where
+    // this has not been done.
+    if std::env::args().nth(1).as_deref().is_some_and(|word| {
+        cli::meta::is_a_top_level_command(word) && word != "debug"
+    }) || std::env::args().any(|arg| arg == "-h" || arg == "--help")
+    {
+        cli::die_quietly_on_a_closed_pipe();
+    }
+
     // Asking for help never runs the command: `linrdp config --help` opening
     // a full-screen editor instead of answering the question is the kind of
     // surprise a tree advertising its commands invites.
@@ -383,6 +393,15 @@ fn supervisor_main(mut args: pico_args::Arguments) -> anyhow::Result<()> {
     // Before the first connection, so the certificate an operator has to
     // import into their clients exists the moment the service is up.
     tls::ensure_default_identity(&loaded.config.tls).context("failed to prepare the TLS identity")?;
+
+    // Before the bind, not after it. A second server is not a failure to
+    // discover halfway through opening sockets: it is a reason not to start,
+    // and saying so first — with the process that is already there — is the
+    // difference between an answer and two lines of errno with the answer
+    // underneath them.
+    if let Some(found) = daemon::look(&daemon::ports_of(&loaded.config)) {
+        anyhow::bail!("{}", daemon::already_running(&found));
+    }
 
     let bound = supervisor::bind_all(&loaded.config)?;
 

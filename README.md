@@ -69,11 +69,30 @@ turns it up further.
 
 On a machine without systemd, `sudo linrdp daemon start` puts the same
 supervisor in the background, `daemon stop` ends it and `daemon status` says
-whether one is running. What actually stops two servers colliding is the
-listening socket, not the pid file in `/run/linrdp`: the second one cannot bind
-and refuses every listener rather than coming up half-open. The pid file only
-answers the two questions the socket cannot — which process to signal, and who
-is holding the port you were just refused.
+whether one is running. Starting a second server anywhere — `linrdp`, `linrdp debug`, `daemon start`,
+the unit — refuses before it opens a socket, naming the process that is already
+there:
+
+```
+Error: linrdp is already running (pid 1792227, serving ports 3389, 3390) — nothing was started.
+```
+
+That check does not believe the pid file on its own. The pid has to be alive,
+to be *this* program invoked as a supervisor (a reused pid is most often one of
+linrdp's own workers or keepers, which share the name), not a zombie, and to
+actually hold one of the configured listening sockets — matched through
+`/proc/net/tcp` to the descriptors it has open. A supervisor stopped by a
+signal says so, because it holds the ports and will never accept anything:
+
+```
+Error: linrdp is already running (pid 1792227, STOPPED by a signal — it still holds
+the ports and will never accept a connection. `kill -CONT <pid>` resumes it...
+```
+
+What *guarantees* only one server is still the listening socket, not that check:
+the second process cannot bind, and refuses every listener rather than coming up
+half-open. The pid file only lets the refusal name a process instead of an
+errno.
 
 `linrdp tree` prints every command with what it does; `linrdp --help` prints
 the same tree and then the prose below. Any group answers for itself —

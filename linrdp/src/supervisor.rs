@@ -57,8 +57,17 @@ pub(crate) fn bind_all(config: &Config) -> anyhow::Result<Vec<Bound>> {
         // The listening socket is what stops two supervisors, so this is where
         // that shows up — as "address already in use", which describes the
         // symptom and not the cause. Name the process holding it.
-        let held_by = match crate::daemon::running() {
-            Some(pid) => format!("\n  another linrdp supervisor is running (pid {pid})"),
+        // Reached when the pid file said nothing — no file, or a supervisor
+        // that never got far enough to write one — so the port is the only
+        // witness left. Ask it who is there anyway: a hand-started
+        // `--listener`, or a supervisor whose /run was not writable, is
+        // exactly the case the earlier check cannot cover.
+        let held_by = match crate::daemon::look(&crate::daemon::ports_of(config)) {
+            Some(found) => format!(
+                "\n  another linrdp supervisor is running (pid {}, {})",
+                found.pid,
+                found.health.describe()
+            ),
             None => String::new(),
         };
         // `bound` is dropped on the way out, so nothing stays half-open.
