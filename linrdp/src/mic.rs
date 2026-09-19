@@ -3,11 +3,11 @@
 //! virtual channel. We act as the DVC initiator and RDPEAI "client" role
 //! (per MS-RDPEAI 1.3.1 the capturing side is the DVC server — mstsc).
 //!
-//! Captured PCM packets are handed to [`MicPacketSink`] — a pure-Rust sink
-//! that currently counts/logs them (no OS capture device is required, so the
-//! single-binary constraint holds; a desktop build would forward to PipeWire).
+//! Packets from the client are handed to [`MicPacketSink`], registered on the
+//! channel at construction. The supervisor points it at the session's
+//! PulseAudio pipe-source FIFO, so Linux applications see an ordinary
+//! microphone without any OS capture device on our side.
 
-use ironrdp_core::impl_as_any;
 use ironrdp_core::AsAny;
 use ironrdp_dvc::{DvcMessage, DvcProcessor, DvcServerProcessor};
 use ironrdp_pdu::PduResult;
@@ -15,7 +15,7 @@ use ironrdp_rdpeai::client::{RdpeaiClient, RdpeaiCaptureHandler};
 use ironrdp_rdpsnd::pdu::AudioFormat;
 
 /// Receive decoded microphone packets from the client.
-pub type MicPacketSink = Box<dyn FnMut(Vec<u8>) + Send>;
+pub(crate) type MicPacketSink = Box<dyn FnMut(Vec<u8>) + Send>;
 
 /// RDPEAI capture handler: negotiates PCM and collects packets coming from
 /// the client's microphone.
@@ -35,13 +35,14 @@ impl RdpeaiCaptureHandler for MicCaptureBackend {
         _capture_format: &AudioFormat,
         _encode_format: &AudioFormat,
         _packet_size: usize,
-        mut sink: ironrdp_rdpeai::client::AudioPacketSink,
+        _sink: ironrdp_rdpeai::client::AudioPacketSink,
     ) -> i32 {
         self.packet_count = 0;
         tracing::info!("microphone capture opened (client mic streaming to server)");
-        // Keep the sink live: packets arrive through the channel processor;
-        // store nothing else here (the sink is consumed by the processor).
-        let _ = &mut sink;
+        // `_sink` is the server-to-client direction — capture performed *here*,
+        // sent to the peer. We never capture on the server, so it is dropped.
+        // The client's microphone travels the other way and reaches the sink
+        // registered with `set_data_sink` in `MicInputChannel::new`.
         0 // S_OK
     }
 
@@ -76,9 +77,12 @@ impl MicInputChannel {
     pub(crate) fn new(sink: MicPacketSink) -> Self {
         let uplink: ironrdp_rdpeai::client::DvcUplink =
             Box::new(|_channel_id, _messages| Ok(())); // uplink unused on the initiator side
-        Self {
-            inner: RdpeaiClient::new(Box::new(MicCaptureBackend::default()), uplink),
-        }
+        let mut inner = RdpeaiClient::new(Box::new(MicCaptureBackend::default()), uplink);
+        // Register the sink, or the client's microphone goes nowhere: the Data
+        // PDUs arriving on this channel are delivered to whatever was handed to
+        // `set_data_sink`, and to nothing else.
+        inner.set_data_sink(sink);
+        Self { inner }
     }
 }
 
