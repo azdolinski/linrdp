@@ -13,7 +13,6 @@ use std::path::Path;
 use anyhow::Context as _;
 
 /// Where the supervisor keeps display locks and session records.
-#[expect(dead_code, reason = "consumed by the display allocator in the next task")]
 pub(crate) const STATE_DIR: &str = "/run/linrdp";
 
 /// Create `base` if absent and enforce mode 0700 whether or not it existed.

@@ -10,7 +10,6 @@ ironrdp-server = { path = "../crates/ironrdp-server", features = ["helper", "usb
 ironrdp-egfx = { path = "../crates/ironrdp-egfx", features = ["openh264-bundled"] }
 ironrdp-connector = { path = "../crates/ironrdp-connector" }
 ironrdp-cliprdr = { path = "../crates/ironrdp-cliprdr" }
-ironrdp-cliprdr-native = { path = "../crates/ironrdp-cliprdr-native" }
 async-trait = "0.1"
 sha-crypt = "0.5"
 yescrypt = { version = "0.1", features = ["password-hash"] }
@@ -36,8 +35,6 @@ opus2 = { version = "0.4", features = ["bundled"] }
 ironrdp-rdpeudp-tokio = { path = "../crates/ironrdp-rdpeudp-tokio", features = ["rustls-aws-lc-rs"] }
 ironrdp-rdpemt = { path = "../crates/ironrdp-rdpemt", features = ["std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
-byteorder = "1"
-arboard = "3.6"
 png = "0.18"
 ironrdp-dvc = { path = "../crates/ironrdp-dvc" }
 ironrdp-svc = { path = "../crates/ironrdp-svc" }
@@ -54,8 +51,8 @@ pico-args = "0.5"
 rcgen = "0.13"
 # Session lifecycle (logind lock/unlock, greeter switch) over the system bus.
 zbus = { version = "5", default-features = false, features = ["tokio"] }
-# MessageStream::next in the portal client.
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# MessageStream::next in the portal client — Wayland-only, hence optional.
+futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 cliclack = "0.5.6"
 console = "0.16.6"
 # Configuration file (/etc/linrdp/config.yaml). serde_yaml itself is
@@ -75,8 +72,13 @@ crossterm = "0.29"
 [features]
 # Wayland capture path: xdg-desktop-portal + PipeWire + libei (see src/wayland).
 # Off by default until it has been exercised on a real Wayland session.
-wayland = []
+wayland = ["dep:futures-util"]
 
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# Tests only: the clipboard tests publish a large selection through arboard to
+# check our own X11 reader follows the INCR protocol its owner uses.
+arboard = "3.6"
