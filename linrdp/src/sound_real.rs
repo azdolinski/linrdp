@@ -65,8 +65,6 @@ const CHUNK_BYTES: usize = SAMPLE_RATE as usize / 1000 * CHUNK_MS as usize * 4; 
 // ~320 ms of audio; drop backlog beyond that so latency can never grow
 // unbounded between the PA monitor and the sender
 const MAX_QUEUE: usize = 8;
-// Opus frame of 40 ms @ 48 kHz stereo = 1920 samples/frame
-const OPUS_FRAME_SAMPLES: usize = SAMPLE_RATE as usize / 1000 * CHUNK_MS as usize;
 const OPUS_MAX_PACKET: usize = 4000;
 
 // Same shape the ironrdp-rdpsnd-native client advertises for Opus, so

@@ -59,10 +59,6 @@ const H264_MIN_INTERVAL: Duration = Duration::from_millis(12);
 /// connection replaces it.
 const GRAB_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Hard ceiling for connecting a replacement grabber, same rationale as
-/// [`GRAB_TIMEOUT`].
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-
 /// Hard ceiling for processing one grab (encode + queue + drain). Whatever
 /// wedges inside — encoder deadlock, a lock held across a stuck writer — the
 /// loop resets its codec state and keeps running instead of freezing the
@@ -206,13 +202,6 @@ fn egfx_decision(state: EgfxState) -> EgfxDecision {
 /// resolution anchor (7.5 Mbit/s at 4K); this only bounds pathological frames.
 /// (Kept as an absolute last-resort clamp for the rate controller.)
 const H264_BITRATE_CEILING_BPS: u32 = 50_000_000;
-
-/// OpenH264 multi-threading works through size-limited slices (single-slice
-/// mode internally forces `iMultipleThreadIdc = 1`); 32 KB slices split a
-/// 2880x1800 frame into enough parallel units with negligible per-slice
-/// header overhead. Measured on this machine (`examples/h264_bench.rs`):
-/// screen-content single-slice 424 ms/frame -> camera-mode sliced 32 ms.
-const ENCODER_SLICE_BYTES: u32 = 32 * 1024;
 
 /// Bitrate multiplier applied when the link shows no strain (RTT flat,
 /// client keeping up). The quality anchors are conservative "works over

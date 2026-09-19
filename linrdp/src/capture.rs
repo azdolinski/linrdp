@@ -134,12 +134,6 @@ impl X11Display {
         Ok(())
     }
 
-    /// Frames are held while the desktop settles after a resize; callers
-    /// hold off encoding until this instant passes, then repaint in full.
-    pub(crate) fn settle_until(&self) -> Instant {
-        self.settle_until
-    }
-
     /// A fresh damage-tracking poller over this display's root window.
     pub(crate) fn grabber(&self) -> ScreenGrabber {
         let mut grabber = ScreenGrabber::new(

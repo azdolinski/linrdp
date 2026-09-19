@@ -25,7 +25,6 @@ mod cli;
 mod daemon;
 mod logging;
 mod service;
-mod sound;
 mod sound_real;
 mod tls;
 mod x264_encoder;

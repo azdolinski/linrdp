@@ -193,10 +193,9 @@ pub(crate) fn wait_for_display(display: u16, timeout: core::time::Duration) -> a
 
 /// Start `cmd` as a direct child, running as `user`, and return its pid.
 ///
-/// Used by the keeper, which stays alive to supervise what it starts — so
-/// unlike [`spawn_detached`] the child is reapable and its death is
-/// observable, which is what lets the keeper end the session when the X
-/// server exits.
+/// Used by the keeper, which stays alive to supervise what it starts: the
+/// child is reapable and its death is observable, which is what lets the
+/// keeper end the session when the X server exits.
 pub(crate) fn spawn_child(
     cmd: &DesktopCommand,
     env: &[(String, String)],
@@ -239,94 +238,6 @@ pub(crate) fn spawn_child(
             }
         }
         pid => Ok(pid),
-    }
-}
-
-/// Start `cmd` as a detached child of init, running as `user`.
-///
-/// Double-fork: the intermediate child exits immediately, so the grandchild
-/// is re-parented to init and survives the worker that created it. That is
-/// what makes the desktop outlive the connection.
-///
-/// The privilege drop happens in the grandchild, after `setsid`, and any
-/// failure there `_exit`s rather than returning — a child that failed to
-/// become the session user must never go on to exec the desktop as root.
-pub(crate) fn spawn_detached(
-    cmd: &DesktopCommand,
-    env: &[(String, String)],
-    user: &UserIds,
-    log_path: &std::path::Path,
-) -> anyhow::Result<()> {
-    // execve does NOT search PATH — a bare "Xvfb" fails with ENOENT in the
-    // grandchild, where nothing can report it. Resolve here, where the error
-    // still has somewhere to go.
-    let resolved = resolve_program(&cmd.program)
-        .with_context(|| format!("{} not found in PATH", cmd.program))?;
-    let program = std::ffi::CString::new(resolved.as_str()).context("program name NUL")?;
-    let mut argv_owned = vec![program.clone()];
-    for a in &cmd.args {
-        argv_owned.push(std::ffi::CString::new(a.as_str()).context("argument NUL")?);
-    }
-    let mut envp_owned = Vec::with_capacity(env.len());
-    for (k, v) in env {
-        envp_owned.push(std::ffi::CString::new(format!("{k}={v}")).context("env NUL")?);
-    }
-    let log_c = std::ffi::CString::new(log_path.as_os_str().as_encoded_bytes()).context("log path NUL")?;
-
-    // SAFETY: fork from a context the caller guarantees is single-threaded
-    // (the worker does this before starting its runtime).
-    match unsafe { libc::fork() } {
-        -1 => anyhow::bail!("fork: {}", std::io::Error::last_os_error()),
-        0 => {
-            // Intermediate child: detach into a new session, fork again, exit.
-            // SAFETY: setsid on a fresh child always succeeds.
-            unsafe { libc::setsid() };
-            // SAFETY: same single-threaded reasoning as above.
-            match unsafe { libc::fork() } {
-                // Only _exit here: the normal exit path would run atexit
-                // handlers and flush buffers this forked copy shares with
-                // the parent.
-                //
-                // SAFETY: _exit is async-signal-safe and never returns.
-                -1 => unsafe { libc::_exit(1) },
-                0 => {
-                    // Grandchild. Give it somewhere to complain first: it is
-                    // detached, so without this its stdout and stderr die with
-                    // the worker and a desktop that fails to start does so in
-                    // complete silence — which is exactly how a failed Xvfb
-                    // first looked like a working session.
-                    restore_default_sigchld();
-                    redirect_stdio(&log_c);
-                    // Become the user, then become the desktop.
-                    if crate::session::privilege::drop_to(user).is_err() {
-                        // SAFETY: as above.
-                        unsafe { libc::_exit(1) };
-                    }
-                    let mut argv: Vec<*const std::ffi::c_char> =
-                        argv_owned.iter().map(|a| a.as_ptr()).collect();
-                    argv.push(std::ptr::null());
-                    let mut envp: Vec<*const std::ffi::c_char> =
-                        envp_owned.iter().map(|e| e.as_ptr()).collect();
-                    envp.push(std::ptr::null());
-                    // SAFETY: NUL-terminated argv and envp built above;
-                    // execve only returns on failure.
-                    unsafe {
-                        libc::execve(program.as_ptr(), argv.as_ptr(), envp.as_ptr());
-                        libc::_exit(1)
-                    }
-                }
-                // SAFETY: as above.
-                _ => unsafe { libc::_exit(0) },
-            }
-        }
-        pid => {
-            // Reap the intermediate child so it does not linger as a zombie;
-            // the grandchild belongs to init by then.
-            let mut status = 0;
-            // SAFETY: waiting on our own direct child.
-            unsafe { libc::waitpid(pid, &mut status, 0) };
-            Ok(())
-        }
     }
 }
 
