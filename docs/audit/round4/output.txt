@@ -1,0 +1,2 @@
+U02 CONFIRMED (controlled lifecycle): timeout released account lock; two live display leases and two records for one UID
+U01 CONFIRMED: production text getter restores stale DISPLAY/XAUTHORITY after handover; no X server needed

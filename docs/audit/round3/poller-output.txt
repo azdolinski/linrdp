@@ -1,0 +1,1 @@
+T02 CONFIRMED: poller initialized with stale :77; gate generation already 1, so refresh branch is skipped; global DISPLAY/XAUTHORITY overwritten

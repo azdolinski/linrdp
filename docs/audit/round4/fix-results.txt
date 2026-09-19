@@ -1,0 +1,15 @@
+cargo test -p linrdp --offline --no-default-features
+test result: ok. 307 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.73s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.03s
+
+cargo test -p ironrdp-server --offline --lib
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.96s
+
+cargo test -p linrdp --offline --no-default-features --bin linrdp clipboard::tests::poller_does_not_restore_the_screen_captured_before_binding -- --exact --nocapture
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 306 filtered out; finished in 2.46s
+
+cargo clippy -p linrdp --offline --no-default-features --all-targets
+Completed without errors, with warnings.
+Main suites: 329 passed. Xvfb poller regression also run separately.

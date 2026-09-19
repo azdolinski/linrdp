@@ -112,12 +112,13 @@ pub(crate) fn resolve_display(
 ///
 /// The password goes to the keeper on a pipe, never on argv or in the
 /// environment, where any local user could read it out of /proc.
-pub(crate) fn create(
+fn create(
     base: &Path,
     user: &str,
     password: &str,
     range: RangeInclusive<u16>,
     size: (u16, u16),
+    account: &AccountLock,
 ) -> anyhow::Result<registry::SessionRecord> {
     // Claim a number and KEEP the claim, then hand the descriptor holding it
     // to the keeper. The claim is never released in between, so the number
@@ -142,7 +143,7 @@ pub(crate) fn create(
     // From here the keeper owns the claim. On failure the lease is dropped
     // below, which releases it and frees the number again.
     let lock_fd = lease.into_handoff_fd();
-    let spawned = spawn_keeper(base, user, password, display, size, &session_exec, lock_fd)
+    let spawned = spawn_keeper(base, user, password, display, size, &session_exec, lock_fd, account)
         .with_context(|| format!("start the session keeper for {user}"));
     // This process's copy of the descriptor has done its job: `flock` belongs
     // to the open file description, which the keeper inherited, so closing
@@ -169,11 +170,18 @@ fn spawn_keeper(
     size: (u16, u16),
     session_exec: &str,
     lock_fd: std::os::fd::RawFd,
+    account: &AccountLock,
 ) -> anyhow::Result<()> {
     use std::io::Write as _;
     use std::os::unix::process::CommandExt as _;
     use std::process::{Command, Stdio};
 
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    // Keep the source away from destinations 4/5: dup2(display, 4) must
+    // not overwrite the source account lock before it is copied to fd 5.
+    let account_fd = unsafe { libc::fcntl(account._file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
+    anyhow::ensure!(account_fd >= 0, "duplicate account lock: {}", std::io::Error::last_os_error());
+    let account_copy = unsafe { std::fs::File::from_raw_fd(account_fd) };
     let exe = std::env::current_exe().context("locate the linrdp binary")?;
     let mut command = Command::new(exe);
     // A keeper started from a worker that was pointed at a different
@@ -196,6 +204,8 @@ fn spawn_keeper(
         .arg(format!("{}x{}", size.0, size.1))
         .arg("--keeper-exec")
         .arg(session_exec)
+        .arg("--keeper-account-fd")
+        .arg("5")
         .arg("--keeper-lock-fd")
         .arg(KEEPER_LOCK_FD.to_string())
         .stdin(Stdio::piped())
@@ -214,6 +224,9 @@ fn spawn_keeper(
                 if libc::dup2(lock_fd, KEEPER_LOCK_FD) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+                if libc::dup2(account_fd, 5) < 0 || libc::fcntl(5, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 // dup2 clears FD_CLOEXEC on the copy — except when the two
                 // numbers are equal, where POSIX says it does nothing at all.
                 if libc::fcntl(KEEPER_LOCK_FD, libc::F_SETFD, 0) < 0 {
@@ -225,6 +238,7 @@ fn spawn_keeper(
         .spawn() }
         .context("spawn the session keeper")?;
 
+    drop(account_copy);
     child
         .stdin
         .take()
@@ -252,14 +266,24 @@ fn spawn_keeper(
 /// Keyed by uid rather than by the name as typed, so `Alice` and `alice`
 /// cannot end up on either side of the same lock.
 ///
-/// `flock`, like everything else here, so the kernel releases it if the holder
-/// dies mid-login rather than wedging that account out of its own desktop.
-struct AccountLock {
+/// Worker and starting keeper share the same flock. A worker timeout cannot
+/// release the keeper's claim; publication (or keeper death) ends the claim.
+pub(crate) struct AccountLock {
     /// Held purely for its `flock`; closing it releases the claim.
     _file: std::fs::File,
 }
 
 impl AccountLock {
+    /// Adopt the worker's same open file description, preserving its flock.
+    pub(crate) fn adopt(fd: std::os::fd::RawFd) -> anyhow::Result<Self> {
+        use std::os::fd::FromRawFd as _;
+        anyhow::ensure!(fd >= 0, "invalid account lock descriptor");
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        anyhow::ensure!(unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } >= 0,
+            "account lock CLOEXEC: {}", std::io::Error::last_os_error());
+        Ok(Self { _file: file })
+    }
+
     fn acquire(base: &Path, user: &str) -> anyhow::Result<Self> {
         use std::os::fd::AsRawFd as _;
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -297,12 +321,12 @@ pub(crate) fn attach_or_create(
     range: RangeInclusive<u16>,
     size: (u16, u16),
 ) -> anyhow::Result<registry::SessionRecord> {
-    let _account = AccountLock::acquire(base, user)?;
+    let account = AccountLock::acquire(base, user)?;
     if let Some(existing) = attach_live(base, user, range.clone()) {
         tracing::info!(user, display = existing.display, "attached to the existing session");
         return Ok(existing);
     }
-    create(base, user, password, range, size)
+    create(base, user, password, range, size, &account)
 }
 
 
@@ -438,6 +462,73 @@ mod tests {
             "a record with no live keeper must not be attached to"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn account_claim_survives_worker_timeout_until_keeper_publishes() {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        use std::os::unix::process::CommandExt as _;
+        use std::io::Read as _;
+        const CHILD: &str = "LINRDP_TEST_ACCOUNT_KEEPER";
+        if let Some(base) = std::env::var_os(CHILD) {
+            let base = std::path::PathBuf::from(base);
+            let account = AccountLock::adopt(5).unwrap();
+            let flags = unsafe { libc::fcntl(5, libc::F_GETFD) };
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+            std::fs::write(base.join("ready"), b"ready").unwrap();
+            let mut input = Vec::new();
+            std::io::stdin().read_to_end(&mut input).unwrap();
+            let user = std::env::var("LINRDP_TEST_ACCOUNT_USER").unwrap();
+            registry::write_record(&base, &registry::SessionRecord {
+                user, display: 51000, runtime_dir: "fixture".into(), xauthority: "fixture".into(), locked: false, logind_id: None,
+            }).unwrap();
+            drop(account);
+            return;
+        }
+        let base = temp_base("late-keeper");
+        let user = unsafe { std::ffi::CStr::from_ptr((*libc::getpwuid(libc::getuid())).pw_name).to_string_lossy().into_owned() };
+        for publish in [true, false] {
+            let _ = std::fs::remove_file(base.join("ready"));
+            let _ = registry::forget_record(&base, 51000);
+            let account = AccountLock::acquire(&base, &user).unwrap();
+            let lease = display_alloc::allocate(&base, 51000..=51000).unwrap();
+            let raw = unsafe { libc::fcntl(account._file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
+            assert!(raw >= 0);
+            let copy = unsafe { std::fs::File::from_raw_fd(raw) };
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "session::tests::account_claim_survives_worker_timeout_until_keeper_publishes"])
+                .env(CHILD, &base).env("LINRDP_TEST_ACCOUNT_USER", &user)
+                .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null());
+            unsafe { command.pre_exec(move || {
+                if libc::dup2(raw, 5) < 0 || libc::fcntl(5, libc::F_SETFD, 0) < 0 { return Err(std::io::Error::last_os_error()); }
+                Ok(())
+            }); }
+            let mut child = command.spawn().unwrap();
+            drop(copy);
+            let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
+            while !base.join("ready").exists() {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(core::time::Duration::from_millis(10));
+            }
+            assert!(keeper_main::wait_for_record(&base, 51000, &user, core::time::Duration::from_millis(1)).is_err());
+            drop(account); // Worker exits after timeout; child retains the same claim.
+            let probe = std::fs::OpenOptions::new().read(true).write(true)
+                .open(base.join(format!("account-{}.lock", unsafe { libc::getuid() }))).unwrap();
+            assert_ne!(unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0,
+                "another worker must not start a second session while keeper is pending");
+            if publish {
+                drop(child.stdin.take());
+                assert!(child.wait().unwrap().success());
+                assert_eq!(attach_live(&base, &user, 51000..=51000).unwrap().display, 51000);
+            } else {
+                child.kill().unwrap(); child.wait().unwrap();
+                assert!(registry::read_one(&base, 51000).is_none());
+            }
+            assert_eq!(unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0,
+                "publication or keeper death must release the account claim");
+            drop(probe); drop(lease);
+        }
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     /// Two logins for one account must not become two desktops.

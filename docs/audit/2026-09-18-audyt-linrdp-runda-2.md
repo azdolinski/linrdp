@@ -1,5 +1,7 @@
 # LinRDP — drugi przebieg audytu, 18 września 2026
 
+> Weryfikacja napraw: [trzeci przebieg audytu](2026-09-18-audyt-linrdp-runda-3.md). Trzeci przebieg wskazał dalszą pracę przy R05, R06 i R10; naprawy z 19 września opisano na końcu trzeciego raportu. Poniższe notatki zachowano jako zapis wcześniejszego stanu.
+
 Badany commit: `35caab4c1a0a278294afc1da38bf6ce00b39660f`. Porównanie napraw ze stanem pierwszego audytu: `5f6fb9cdeec2819dc2c7b2c8fbcfdde372be99c6`. Drzewo robocze przed przeglądem było czyste. Przeczytano raport wraz z dopisanymi notatkami napraw, prześledzono zmienione ścieżki i ich wywołania. Zakres obejmuje również wcześniej istniejące błędy, które ujawnił przegląd napraw; nie jest ograniczony do regresji diffu.
 
 ## Ustalenia wymagające dalszej pracy

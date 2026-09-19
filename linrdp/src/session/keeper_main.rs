@@ -25,6 +25,7 @@ use super::{display_alloc, keeper, privilege, registry, xauth};
 
 /// Everything the keeper is told to do.
 pub(crate) struct KeeperArgs {
+    pub(crate) account_fd: std::os::fd::RawFd,
     pub(crate) user: String,
     pub(crate) display: u16,
     pub(crate) state_dir: PathBuf,
@@ -43,6 +44,9 @@ pub(crate) struct KeeperArgs {
 
 /// Run as the session keeper. Returns only when the session is over.
 pub(crate) fn run(args: &KeeperArgs) -> anyhow::Result<()> {
+    // Retain the account claim even if the worker times out or dies.
+    // Close-on-exec prevents desktop children from prolonging it.
+    let account = super::AccountLock::adopt(args.account_fd)?;
     let mut password = String::new();
     std::io::stdin()
         .read_to_string(&mut password)
@@ -153,6 +157,7 @@ pub(crate) fn run(args: &KeeperArgs) -> anyhow::Result<()> {
 
     lease.record_owner(&args.user)?;
     registry::write_record(&args.state_dir, &rec)?;
+    drop(account); // A reconnect can now find the published session.
     tracing::info!(user = %args.user, display = args.display, "session ready");
 
     // The session lasts as long as BOTH its X server and its desktop.

@@ -379,6 +379,19 @@ pub(crate) fn display_name() -> anyhow::Result<String> {
     }
 }
 
+/// Snapshot both X11 values under one lock, so handover cannot mix cookies.
+pub(crate) fn clipboard_target() -> anyhow::Result<(String, String)> {
+    if is_armed() {
+        let bound = BOUND.lock().unwrap_or_else(|p| p.into_inner());
+        let bound = bound.as_ref().ok_or_else(|| anyhow::anyhow!("no clipboard session bound"))?;
+        return Ok((bound.display.clone(), bound.xauthority.clone()));
+    }
+    if let Some(console) = console() {
+        return Ok((console.display, console.xauthority.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()));
+    }
+    Ok((display_name()?, std::env::var("XAUTHORITY").unwrap_or_default()))
+}
+
 /// The display number this worker is bound to, if any.
 fn bound_display_number() -> Option<u16> {
     BOUND

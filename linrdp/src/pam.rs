@@ -1,11 +1,11 @@
-//! PAM authentication fallback via `dlopen("libpam.so.0")` — no build-time
+//! PAM authentication via `dlopen("libpam.so.0")` — no build-time
 //! dependency on libpam headers, mirroring KRdp's `pam_start` /
 //! `pam_authenticate` / `pam_acct_mgmt` flow (`service = "login"`).
 //!
 //! Why dlopen: the rest of this server is a single static binary with no
-//! C dependencies; PAM is optional at runtime. If libpam is absent (e.g. a
-//! minimal container), [`authenticate`] returns `Err` and the caller keeps
-//! its previous verdict.
+//! C dependencies. Authentication requires usable PAM at runtime: a loader
+//! failure (including an absent library) refuses access, never downgrades
+//! policy to a password-only check.
 //!
 //! The conversation callback answers only `PAM_PROMPT_ECHO_ON` (username)
 //! and `PAM_PROMPT_ECHO_OFF` (password) prompts — anything else (2FA,
@@ -227,7 +227,7 @@ pub(crate) fn account_valid(username: &str) -> Result<bool, NoVerdict> {
 
     let api = match PAM.get_or_init(load_pam) {
         Ok(api) => api,
-        Err(reason) => return Err(NoVerdict::NotInstalled((*reason).to_owned())),
+        Err(reason) => return Err(NoVerdict::BackendFailed((*reason).to_owned())),
     };
 
     // SAFETY: the handle is created, used and ended within this call; the
@@ -254,30 +254,16 @@ pub(crate) fn account_valid(username: &str) -> Result<bool, NoVerdict> {
     }
 }
 
-/// Why PAM produced no verdict.
-///
-/// The distinction is the whole point, and collapsing it into one error was a
-/// hole: "this machine has no libpam" is a configuration a caller may fall
-/// back from, while "the stack is here and it broke" is a failure of the
-/// authority itself. Treating the second like the first meant a `pam_start`
-/// failure — after the library had loaded perfectly well — silently handed the
-/// decision to `/etc/shadow`, which knows nothing about `pam_access`,
-/// `pam_time` or anything else the stack would have applied.
+/// PAM could not run. Loader and stack failures both require refusing access.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NoVerdict {
-    /// libpam is not installed, or lacks a symbol this build needs. There is
-    /// no PAM policy on this machine to bypass.
-    NotInstalled(String),
-    /// libpam loaded and then failed: `pam_start` refused, the service is
-    /// missing, the conversation could not run. Policy exists and did not
-    /// execute, which is not the same as policy not existing.
+    /// The library could not load or the PAM stack could not start.
     BackendFailed(String),
 }
 
 impl core::fmt::Display for NoVerdict {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::NotInstalled(reason) => write!(f, "libpam is not usable here: {reason}"),
             Self::BackendFailed(reason) => write!(f, "the PAM stack failed: {reason}"),
         }
     }
@@ -285,9 +271,8 @@ impl core::fmt::Display for NoVerdict {
 
 /// Verify a username/password pair through the system PAM stack.
 ///
-/// `Ok(true/false)` = authenticated/not. `Err` = no verdict, and [`NoVerdict`]
-/// says whether that is because PAM is absent or because it broke — which the
-/// caller must not conflate.
+/// `Ok(true/false)` = authenticated/not. `Err` means PAM could not run;
+/// callers must refuse access for loader errors and stack errors alike.
 pub(crate) fn authenticate(username: &str, password: &str) -> Result<bool, NoVerdict> {
     // Reject embedded NULs up front: they cannot travel through CString
     // into PAM, and truncation would authenticate the wrong string.
@@ -298,7 +283,7 @@ pub(crate) fn authenticate(username: &str, password: &str) -> Result<bool, NoVer
 
     let api = match PAM.get_or_init(load_pam) {
         Ok(api) => api,
-        Err(reason) => return Err(NoVerdict::NotInstalled((*reason).to_owned())),
+        Err(reason) => return Err(NoVerdict::BackendFailed((*reason).to_owned())),
     };
 
     // SAFETY: the handle is created, used and destroyed within this call;

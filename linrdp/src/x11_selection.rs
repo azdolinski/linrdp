@@ -93,8 +93,21 @@ fn atom_name(atoms: &[(Atom, String, Vec<u8>)], atom: Atom) -> String {
 /// Used by the poller to read file-manager targets (`x-special/gnome-copied-files`,
 /// `text/uri-list`) that arboard's text API cannot see.
 pub(crate) fn read_selection_target(display: &str, target_name: &str) -> Option<Vec<u8>> {
-    let dpy = if display.is_empty() { None } else { Some(display) };
-    let (conn, screen_num) = x11rb::connect(dpy).ok()?;
+    read_selection_target_with_auth(display, "", target_name)
+}
+
+pub(crate) fn read_selection_target_with_auth(display: &str, xauthority: &str, target_name: &str) -> Option<Vec<u8>> {
+    let (conn, screen_num) = if xauthority.is_empty() {
+        x11rb::connect(if display.is_empty() { None } else { Some(display) }).ok()?
+    } else {
+        let mut parts = display.strip_prefix(':')?.split('.');
+        let number = parts.next()?.parse::<u16>().ok()?;
+        let screen = parts.next().unwrap_or("0").parse::<usize>().ok()?;
+        let socket = std::os::unix::net::UnixStream::connect(format!("/tmp/.X11-unix/X{number}")).ok()?;
+        let (stream, _) = x11rb::rust_connection::DefaultStream::from_unix_stream(socket).ok()?;
+        let (name, data) = crate::session::xauth::cookie_for(std::path::Path::new(xauthority), number).ok()?;
+        (RustConnection::connect_to_stream_with_auth_info(stream, screen, name, data).ok()?, screen)
+    };
     let screen = &conn.setup().roots[screen_num];
     let win = conn.generate_id().ok()?;
     conn.create_window(
@@ -108,7 +121,7 @@ pub(crate) fn read_selection_target(display: &str, target_name: &str) -> Option<
         0,
         WindowClass::INPUT_OUTPUT,
         0,
-        &CreateWindowAux::new(),
+        &CreateWindowAux::new().event_mask(EventMask::PROPERTY_CHANGE),
     )
     .ok()?;
     conn.flush().ok()?;
@@ -120,19 +133,37 @@ pub(crate) fn read_selection_target(display: &str, target_name: &str) -> Option<
 
     // poll_for_event never blocks; bound the total wait so a misbehaving
     // selection owner cannot hang the poller thread.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    let incr = intern(&conn, b"INCR");
+    let mut chunks: Option<Vec<u8>> = None;
+    let mut deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
     loop {
         match conn.poll_for_event() {
             Ok(Some(Event::SelectionNotify(notify))) => {
                 if notify.property == x11rb::NONE {
                     return None;
                 }
-                return conn
-                    .get_property(false, win, property, AtomEnum::ANY, 0, 2 * 1024 * 1024)
-                    .ok()?
-                    .reply()
-                    .ok()
-                    .map(|reply| reply.value);
+                let reply = conn.get_property(true, win, property, AtomEnum::ANY, 0, 2 * 1024 * 1024).ok()?.reply().ok()?;
+                if reply.type_ == incr {
+                    // ICCCM INCR: deleting each property acknowledges a chunk.
+                    chunks = Some(Vec::new());
+                    deadline = Instant::now() + Duration::from_secs(3);
+                    conn.flush().ok()?;
+                } else {
+                    return (reply.bytes_after == 0).then_some(reply.value);
+                }
+            }
+            Ok(Some(Event::PropertyNotify(event))) if chunks.is_some()
+                && event.atom == property && event.state == x11rb::protocol::xproto::Property::NEW_VALUE => {
+                let reply = conn.get_property(true, win, property, AtomEnum::ANY, 0, 2 * 1024 * 1024).ok()?.reply().ok()?;
+                // Ignore a queued notification for the initial INCR property
+                // that was already deleted by SelectionNotify handling.
+                if reply.type_ == x11rb::NONE { continue; }
+                if reply.bytes_after != 0 { return None; }
+                let data = chunks.as_mut()?;
+                if reply.value.is_empty() { return chunks; }
+                if data.len().checked_add(reply.value.len())? > 8 * 1024 * 1024 { return None; }
+                data.extend_from_slice(&reply.value);
+                conn.flush().ok()?;
             }
             Ok(Some(_)) => {}
             Ok(None) => {}

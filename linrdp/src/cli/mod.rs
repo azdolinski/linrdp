@@ -150,10 +150,8 @@ report cannot: will this account work here?
 OPTIONS
 
   --config <PATH>    read a configuration file other than /etc/linrdp/config.yaml
-  --listener <ADDR>  serve just this one listener in this process, without
-                     forking. Only for `session.console.enabled`: one process
-                     cannot route per-user sessions. Use `linrdp debug` to
-                     work on linrdp — it is the supervisor, just louder
+  --listener <ADDR>  internal: identify the supervisor's listener; requires
+                     --serve-fd. Use `linrdp debug` for foreground development
   --serve-fd <N>     internal: serve the connection the supervisor handed over
 ";
 

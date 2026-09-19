@@ -6,14 +6,10 @@
 //! half of a login, and the other half (is this account still allowed to log
 //! in *right now*?) used to be asked on some paths and not others.
 //!
-//! PAM first, `/etc/shadow` only when PAM is unavailable. The order is the
-//! fix: verifying the hash ourselves and stopping there skipped `pam_acct_mgmt`
-//! entirely, so an expired, disabled or `pam_access`-refused account kept
-//! working as long as its old password still hashed correctly — and failed
-//! attempts never reached `pam_faillock`, which counts them. The pure-Rust
-//! `/etc/shadow` verifier (SHA-256 / SHA-512 / YESCRYPT / MD5 crypt) remains
-//! for hosts with no libpam, and it now checks shadow's own expiry fields
-//! rather than the hash alone.
+//! PAM checks both the password and account policy. Any PAM failure refuses
+//! access, including loader failures; there is no automatic shadow fallback.
+//! The pure-Rust shadow verifier is used only for credential capture inside
+//! an already running PAM stack, where re-entering PAM would recurse.
 
 use std::collections::HashMap;
 
@@ -21,7 +17,7 @@ use async_trait::async_trait;
 
 use ironrdp_server::{CredentialDecision, CredentialValidationError, CredentialValidator, Credentials};
 
-/// Validator backed by `/etc/shadow`, with the system PAM stack behind it.
+/// Validator backed by the system PAM authentication and account stack.
 ///
 /// This is the only authenticator that checks the account's **real** system
 /// password. It runs on the TLS path, where the client sends its credentials
@@ -202,7 +198,7 @@ pub(crate) enum Login {
     /// Refused, with the reason for the log — never for the client, which is
     /// told only that the login failed.
     Deny(String),
-    /// Neither PAM nor `/etc/shadow` could answer. Not a verdict: callers
+    /// PAM could not answer. Not a verdict: callers
     /// must refuse, not guess.
     Unavailable(String),
 }
@@ -210,54 +206,20 @@ pub(crate) enum Login {
 /// The single login-policy point: is this secret right, **and** is this
 /// account allowed to log in at this moment?
 ///
-/// PAM answers both halves in one pass (`pam_authenticate` then
-/// `pam_acct_mgmt`) and is therefore asked first, so failed attempts land in
-/// whatever counts them and account state is honoured. `/etc/shadow` is the
-/// fallback for a host with no libpam, and it checks shadow's own ageing and
-/// expiry fields — not just the hash.
+/// PAM answers both halves (`pam_authenticate` then `pam_acct_mgmt`).
+/// Failure to consult it must never substitute a weaker authority.
 pub(crate) fn decide(username: &str, password: &str) -> Login {
     if username.is_empty() {
         return Login::Deny("no user name".to_owned());
     }
+    login_from_pam(crate::pam::authenticate(username, password))
+}
 
-    match crate::pam::authenticate(username, password) {
-        Ok(true) => return Login::Accept,
-        Ok(false) => return Login::Deny(format!("PAM ({}) refused", crate::pam::login_service())),
-        // The stack exists and did not run. That is not the same as there
-        // being no stack, and treating it as such was a hole: a `pam_start`
-        // failure — after libpam had loaded perfectly well — used to hand the
-        // decision to `/etc/shadow`, which knows nothing about `pam_access`,
-        // `pam_time`, or anything else the stack would have applied. A correct
-        // local password plus an unexpired shadow entry was then an `Accept`
-        // with the policy never consulted. Refuse instead: a policy that
-        // cannot run closes the door.
-        Err(crate::pam::NoVerdict::BackendFailed(reason)) => {
-            return Login::Unavailable(format!(
-                "the PAM stack ({}) failed and no other source may stand in for it: {reason}",
-                crate::pam::login_service()
-            ));
-        }
-        // No libpam on this machine at all. There is no policy here to bypass,
-        // so `/etc/shadow` is the authority by default rather than by failure.
-        Err(crate::pam::NoVerdict::NotInstalled(reason)) => {
-            tracing::warn!(
-                %username,
-                %reason,
-                "PAM is not installed — falling back to /etc/shadow, which cannot apply \
-                 pam_access, pam_time or pam_faillock"
-            );
-        }
-    }
-
-    match shadow_verdict(username, password) {
-        Ok(false) => Login::Deny("/etc/shadow: wrong password".to_owned()),
-        Ok(true) => match shadow_account_policy(username) {
-            Ok(()) => Login::Accept,
-            Err(reason) => Login::Deny(format!("/etc/shadow: {reason}")),
-        },
-        Err(reason) => Login::Unavailable(
-            reason.unwrap_or_else(|| format!("{username} is not in /etc/shadow and PAM is unavailable")),
-        ),
+fn login_from_pam(verdict: Result<bool, crate::pam::NoVerdict>) -> Login {
+    match verdict {
+        Ok(true) => Login::Accept,
+        Ok(false) => Login::Deny(format!("PAM ({}) refused", crate::pam::login_service())),
+        Err(reason) => Login::Unavailable(format!("PAM ({}) failed: {reason}", crate::pam::login_service())),
     }
 }
 
@@ -279,73 +241,6 @@ pub(crate) fn authorize_for_desktop(username: &str, password: &str) -> anyhow::R
             anyhow::bail!("cannot check whether {username} may log in ({reason}) — refusing")
         }
     }
-}
-
-/// Days since the epoch, the unit `/etc/shadow` ages accounts in.
-fn today_in_shadow_days() -> Option<i64> {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    i64::try_from(secs / 86_400).ok()
-}
-
-/// Whether `/etc/shadow`'s ageing fields still allow this account to log in.
-///
-/// Only consulted when PAM is unavailable, so this is a stand-in for
-/// `pam_unix`'s `account` phase rather than a second opinion on it.
-fn shadow_account_policy(username: &str) -> Result<(), String> {
-    let Ok(content) = std::fs::read_to_string("/etc/shadow") else {
-        return Err("unreadable".to_owned());
-    };
-    let Some(today) = today_in_shadow_days() else {
-        return Err("the system clock is before the epoch".to_owned());
-    };
-    account_policy_in(&content, username, today)
-}
-
-/// The rule itself, separated from the file so every shape of entry can be
-/// tested on a machine that has none of them.
-fn account_policy_in(shadow: &str, username: &str, today: i64) -> Result<(), String> {
-    for line in shadow.lines() {
-        let fields: Vec<&str> = line.split(':').collect();
-        if fields.first() != Some(&username) {
-            continue;
-        }
-        let num = |index: usize| -> Option<i64> { fields.get(index)?.trim().parse().ok() };
-        let last_change = num(2);
-        let max_age = num(4);
-        let inactive = num(6);
-        let expire = num(7);
-
-        if let Some(expire) = expire.filter(|v| *v >= 0) && today >= expire {
-            return Err("the account expired".to_owned());
-        }
-        if last_change == Some(0) {
-            return Err("the password must be changed before the next login".to_owned());
-        }
-        if let (Some(last), Some(max)) = (last_change, max_age)
-            && last > 0
-            && max >= 0
-        {
-            let must_change_by = last + max;
-            if today > must_change_by {
-                // Past `max` the password is expired; `inactive` is the grace
-                // period pam_unix allows for changing it, and there is no way
-                // to change a password over RDP.
-                let grace = inactive.filter(|v| *v >= 0).unwrap_or(0);
-                if today > must_change_by + grace {
-                    return Err("the password expired".to_owned());
-                }
-                return Err("the password expired and can only be changed outside RDP".to_owned());
-            }
-        }
-        return Ok(());
-    }
-    // Not in /etc/shadow at all: an NSS-only account (LDAP, SSSD) whose
-    // policy lives where PAM would have read it. Without PAM there is nothing
-    // to check and nothing to claim.
-    Err("the account is not in /etc/shadow, so its policy cannot be checked without PAM".to_owned())
 }
 
 impl ShadowValidator {
@@ -576,79 +471,13 @@ mod tests {
         );
     }
 
-    /// A correct password is only half of a login. `/etc/shadow`'s ageing
-    /// fields are the other half on the PAM-less fallback path, and they used
-    /// to be ignored entirely.
     #[test]
-    fn shadow_ageing_fields_can_refuse_an_account_with_the_right_password() {
-        // Fields: name:hash:lastchg:min:max:warn:inactive:expire:flag
-        let today = 20_000i64;
-        let shadow = "\
-alice:$6$x$y:19000:0:99999:7:::
-expired:$6$x$y:19000:0:99999:7::19500:
-mustchange:$6$x$y:0:0:99999:7:::
-aged:$6$x$y:19000:0:30:7::: 
-future:$6$x$y:19000:0:99999:7::20500:
-";
-        assert_eq!(account_policy_in(shadow, "alice", today), Ok(()), "an ordinary account logs in");
-        assert!(
-            account_policy_in(shadow, "expired", today).is_err(),
-            "an expired account must be refused however right its password is"
-        );
-        assert!(
-            account_policy_in(shadow, "mustchange", today).is_err(),
-            "lastchg=0 means the password must be changed, which RDP cannot do"
-        );
-        assert!(
-            account_policy_in(shadow, "aged", today).is_err(),
-            "a password past its maximum age must be refused"
-        );
-        assert_eq!(
-            account_policy_in(shadow, "future", today),
-            Ok(()),
-            "an expiry date still ahead is not an expiry"
-        );
-    }
-
-    /// An account nothing knows about must not be waved through.
-    #[test]
-    fn an_account_outside_shadow_is_not_approved_without_pam() {
-        assert!(
-            account_policy_in("alice:$6$x$y:19000:0:99999:7:::\n", "bob", 20_000).is_err(),
-            "no record and no PAM means no basis to allow the login"
-        );
-    }
-
-    /// A PAM stack that exists and breaks is not a PAM stack that is absent.
-    ///
-    /// Regression: `decide` fell back to `/etc/shadow` on *any* error from
-    /// `pam::authenticate`, and `pam_start` failing — after libpam had loaded
-    /// perfectly well — produced exactly that error. A correct local password
-    /// plus an unexpired shadow entry was then an `Accept`, with `pam_access`,
-    /// `pam_time` and the rest of the stack never consulted. The two cases now
-    /// have different types, and only one of them may fall back.
-    #[test]
-    fn a_broken_pam_stack_closes_the_door_while_an_absent_one_falls_back() {
-        use crate::pam::NoVerdict;
-
-        assert!(
-            matches!(fallback_allowed(&NoVerdict::NotInstalled("no libpam.so.0".to_owned())), true),
-            "a machine with no libpam has no policy to bypass"
-        );
-        assert!(
-            !fallback_allowed(&NoVerdict::BackendFailed("pam_start: 3".to_owned())),
-            "a stack that failed to run must not be stood in for"
-        );
-
-        // And the refusal is an Unavailable, which callers treat as "closed",
-        // never a Deny that could be mistaken for a wrong password.
-        let outcome = Login::Unavailable("the PAM stack (linrdp) failed".to_owned());
-        assert!(authorize_for_desktop_from(outcome).is_err());
-    }
-
-    /// The rule `decide` applies, as a value that can be asserted on.
-    fn fallback_allowed(reason: &crate::pam::NoVerdict) -> bool {
-        matches!(reason, crate::pam::NoVerdict::NotInstalled(_))
+    fn pam_errors_never_fall_back_to_shadow() {
+        for reason in ["libpam.so.0 not loadable", "missing symbol pam_getenvlist", "pam_start: 4"] {
+            assert!(matches!(login_from_pam(Err(crate::pam::NoVerdict::BackendFailed(reason.into()))), Login::Unavailable(_)));
+        }
+        assert!(matches!(login_from_pam(Ok(false)), Login::Deny(_)));
+        assert!(matches!(login_from_pam(Ok(true)), Login::Accept));
     }
 
     /// Nothing may be accepted on a "cannot tell".

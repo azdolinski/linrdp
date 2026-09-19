@@ -1,0 +1,12 @@
+Commit: 99b25881d1bea496e968a937241337282a4c3b5d
+Date: 2026-09-18
+
+cargo test -p linrdp --offline --no-default-features
+test result: ok. 306 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.66s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+cargo test -p ironrdp-server --offline --lib
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.96s
+
+Total: 324 passed, 0 failed.
+Scope: selected packages/features; not end-to-end RDP/X11/PAM/logind.

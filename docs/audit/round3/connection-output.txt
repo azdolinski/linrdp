@@ -1,0 +1,2 @@
+PASS F07: silent stream rejected after 51.441962ms
+PASS R04: run_connection invoked on_disconnected exactly once

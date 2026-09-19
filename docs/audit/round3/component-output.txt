@@ -1,0 +1,7 @@
+PASS R01: cookie succeeds after greeter runtime creation
+PASS R02: UNPRIVILEGED_CHILD_HAS_NO_LEASE_FD
+PASS R03: second display preserves first cookie
+PASS F03: helper refuses second unprivileged UID's mode-0600 sentinel
+PASS F03/F04: actual exec helper reads its user's file and refuses root-owned mode-0600 sentinel
+PASS: received SCM_RIGHTS descriptor is CLOEXEC
+PASS R07: repeated paste preserves original URI content

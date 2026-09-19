@@ -1,7 +1,7 @@
 //! Real clipboard synchronization: X11 ↔ RDP (MS-RDPECLIP), server side.
 //!
 //! Linux → Windows (we advertise, client pulls):
-//! - Text: X11 clipboard text (read via `arboard`) ↔ CF_UNICODETEXT.
+//! - Text: X11 clipboard text (read on an explicit X connection) ↔ CF_UNICODETEXT.
 //! - Files: X11 `file://` URI list ↔ FileGroupDescriptorW + FileContents,
 //!   served from local paths (MS-RDPECLIP 2.2.5 / 2.2.6).
 //!
@@ -93,18 +93,10 @@ pub(crate) struct OfferedFile {
     pub linux_path: PathBuf,
 }
 
-/// Read the X11 clipboard text (arboard needs DISPLAY set and is not Sync).
+/// Read text on an explicit X connection; never change process environment.
 pub(crate) fn x11_get_text(display: &str, xauthority: &str) -> Option<String> {
-    // SAFETY: arboard reads these only during its constructor/getters, and
-    // every other access in this module writes the same captured values.
-    if !display.is_empty() {
-        unsafe { std::env::set_var("DISPLAY", display) };
-    }
-    if !xauthority.is_empty() {
-        unsafe { std::env::set_var("XAUTHORITY", xauthority) };
-    }
-    let mut board = arboard::Clipboard::new().ok()?;
-    board.get_text().ok().filter(|t| !t.is_empty())
+    let bytes = x11_selection::read_selection_target_with_auth(display, xauthority, "UTF8_STRING")?;
+    String::from_utf8(bytes).ok().filter(|text| !text.is_empty())
 }
 
 /// Parse an `x-special/gnome-copied-files` / text/uri-list payload into
@@ -186,6 +178,7 @@ struct Download {
     pending: VecDeque<DownloadTarget>,
     current: Option<CurrentDownload>,
     done: Vec<PathBuf>,
+    expected: Vec<PathBuf>,
     /// Bytes still allowed for the rest of the list.
     total_budget: u64,
 }
@@ -505,6 +498,8 @@ static POLLER_GENERATION: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Debug)]
 pub(crate) struct X11CliprdrBackend {
+    #[cfg(test)]
+    poller_thread: Option<std::thread::JoinHandle<()>>,
     proxy: Arc<Mutex<Option<Box<dyn ClipboardMessageProxy>>>>,
     display: String,
     xauthority: String,
@@ -555,6 +550,8 @@ pub(crate) struct X11CliprdrBackend {
 impl X11CliprdrBackend {
     pub(crate) fn new(display: String, xauthority: String) -> Self {
         Self {
+            #[cfg(test)]
+            poller_thread: None,
             proxy: Arc::new(Mutex::new(None)),
             display,
             xauthority,
@@ -585,9 +582,7 @@ impl X11CliprdrBackend {
     /// unarmed worker (single session, or console mode) has and is correct
     /// there.
     fn target(&self) -> (String, String) {
-        let display = crate::session::gate::display_name().unwrap_or_else(|_| self.display.clone());
-        let xauthority = crate::session::gate::xauthority().unwrap_or_else(|| self.xauthority.clone());
-        (display, xauthority)
+        crate::session::gate::clipboard_target().unwrap_or_else(|_| (self.display.clone(), self.xauthority.clone()))
     }
 
     /// Read the current X11 clipboard text (best-effort).
@@ -641,10 +636,11 @@ impl X11CliprdrBackend {
             count = download.done.len(),
             "clipboard: files pasted from client"
         );
-        if download.done.is_empty() {
+        let roots = publication_roots(&download.dest_dir, &download.expected, &download.done);
+        if roots.is_empty() {
             return;
         }
-        let uris: Vec<String> = download.done.iter().map(|path| path_to_uri(path)).collect();
+        let uris: Vec<String> = roots.iter().map(|path| path_to_uri(path)).collect();
         let uri_list = uris.join("\r\n").into_bytes();
         let gnome_copied = format!("copy\n{}", uris.join("\n"));
         // Prime the echo guard with the exact payload we are about to serve,
@@ -731,35 +727,21 @@ impl CliprdrBackend for X11CliprdrBackend {
         // owner to run one as.
         self.hold_image_fetch_until = Some(std::time::Instant::now() + Duration::from_secs(4));
 
-        // Poll the X11 clipboard for local copies (Linux → Windows). A poller
-        // is used instead of X11 selection events because arboard owns no
-        // window here; the echo guard keeps remote-sourced data from being
-        // advertised straight back.
+        // Poll the current session for local copies (Linux → Windows). The
+        // echo guard keeps remote-sourced data from being advertised back.
         let proxy = Arc::clone(&self.proxy);
         let files = Arc::clone(&self.files);
         let outgoing_files = Arc::clone(&self.outgoing_files);
         let files_advertised = Arc::clone(&self.files_advertised);
         let echo_guard = Arc::clone(&self.echo_guard);
-        let start_display = self.display.clone();
-        let start_xauthority = self.xauthority.clone();
         let generation = POLLER_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
 
         let spawned = std::thread::Builder::new()
             .name("linrdp-cliprdr-poll".into())
             .spawn(move || {
-                let mut display = start_display;
-                let mut xauthority = start_xauthority;
-                let mut bound_at = crate::session::gate::generation();
-                // SAFETY: same constants every time; other threads using
-                // arboard set identical values before any access.
-                unsafe {
-                    if !display.is_empty() {
-                        std::env::set_var("DISPLAY", &display);
-                    }
-                    if !xauthority.is_empty() {
-                        std::env::set_var("XAUTHORITY", &xauthority);
-                    }
-                }
+                // No construction-time display snapshot: the router may already
+                // have bound another screen before the channel becomes ready.
+                let mut bound_at = None;
                 let mut last_text: Option<String> = None;
                 let mut last_files: Option<String> = None;
                 loop {
@@ -776,19 +758,13 @@ impl CliprdrBackend for X11CliprdrBackend {
                     // gate, and a poller that kept its original value went on
                     // watching a clipboard the user could no longer see.
                     let now = crate::session::gate::generation();
-                    if now != bound_at {
-                        bound_at = now;
-                        display = crate::session::gate::display_name().unwrap_or_else(|_| display.clone());
-                        xauthority = crate::session::gate::xauthority().unwrap_or_else(|| xauthority.clone());
-                        // SAFETY: as above.
-                        unsafe {
-                            if !display.is_empty() {
-                                std::env::set_var("DISPLAY", &display);
-                            }
-                            if !xauthority.is_empty() {
-                                std::env::set_var("XAUTHORITY", &xauthority);
-                            }
-                        }
+                    let Ok((display, xauthority)) = crate::session::gate::clipboard_target() else {
+                        continue; // An armed, unbound worker has no clipboard.
+                    };
+                    if bound_at != Some(now) {
+                        bound_at = Some(now);
+                        // The gate owns DISPLAY/XAUTHORITY. Never restore stale
+                        // backend values over its environment after a bind.
                         // The previous screen's clipboard says nothing about
                         // this one: start clean rather than treating the first
                         // read as unchanged.
@@ -801,16 +777,13 @@ impl CliprdrBackend for X11CliprdrBackend {
                         tracing::info!(target_display = %now_on, "clipboard: following the session handover");
                     }
 
-                    // File managers put copied files under dedicated targets
-                    // that arboard's text API cannot see — query them first.
-                    let uri_text = x11_selection::read_selection_target(&display, "x-special/gnome-copied-files")
-                        .or_else(|| x11_selection::read_selection_target(&display, "text/uri-list"))
+                    // File managers put copied files under dedicated targets;
+                    // query those before ordinary text.
+                    let uri_text = x11_selection::read_selection_target_with_auth(&display, &xauthority, "x-special/gnome-copied-files")
+                        .or_else(|| x11_selection::read_selection_target_with_auth(&display, &xauthority, "text/uri-list"))
                         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
 
-                    let board_text = arboard::Clipboard::new()
-                        .ok()
-                        .and_then(|mut board| board.get_text().ok())
-                        .filter(|text| !text.is_empty());
+                    let board_text = x11_get_text(&display, &xauthority);
 
                     let guard = echo_guard.lock().expect("poisoned").take();
                     if let Some(text) = uri_text.as_ref() {
@@ -916,8 +889,14 @@ impl CliprdrBackend for X11CliprdrBackend {
                     }
                 }
             });
-        if spawned.is_err() {
-            tracing::warn!("clipboard: failed to spawn X11 poller thread");
+        match spawned {
+            Ok(handle) => {
+                #[cfg(test)]
+                { self.poller_thread = Some(handle); }
+                #[cfg(not(test))]
+                { drop(handle); }
+            }
+            Err(error) => tracing::warn!(%error, "clipboard: cannot start poller"),
         }
     }
 
@@ -1253,6 +1232,8 @@ impl CliprdrBackend for X11CliprdrBackend {
         };
 
         let mut pending = VecDeque::new();
+        let mut expected = Vec::new();
+        let mut done = Vec::new();
         for (i, file) in files.iter().enumerate() {
             let is_dir = file
                 .attributes
@@ -1266,19 +1247,18 @@ impl CliprdrBackend for X11CliprdrBackend {
                 tracing::warn!(name = %file.name, "clipboard: skipping file with unsafe name");
                 continue;
             };
+            let path = transfer.path.join(relative.strip_prefix(&transfer.name).unwrap_or(&relative));
+            expected.push(path.clone());
             if is_dir {
-                if let Err(error) = Self::with_files(&self.files, |agent| agent.make_dir(&relative)) {
-                    tracing::warn!(
-                        dir = %relative.display(),
-                        error = format!("{error:#}"),
-                        "clipboard: cannot create pasted directory"
-                    );
+                match Self::with_files(&self.files, |agent| agent.make_dir(&relative)) {
+                    Ok(()) => done.push(path),
+                    Err(error) => tracing::warn!(dir = %relative.display(), error = format!("{error:#}"), "clipboard: cannot create pasted directory"),
                 }
                 continue;
             }
             pending.push_back(DownloadTarget {
                 index: i as i32,
-                path: transfer.path.join(relative.strip_prefix(&transfer.name).unwrap_or(&relative)),
+                path,
                 relative,
                 size: file.file_size,
             });
@@ -1293,7 +1273,8 @@ impl CliprdrBackend for X11CliprdrBackend {
             files: Arc::clone(&self.files),
             pending,
             current: None,
-            done: Vec::new(),
+            done,
+            expected,
             total_budget: MAX_TOTAL_SIZE,
         };
         let request = download.advance();
@@ -1307,6 +1288,21 @@ impl CliprdrBackend for X11CliprdrBackend {
     fn on_lock(&mut self, _id: LockDataId) {}
 
     fn on_unlock(&mut self, _id: LockDataId) {}
+}
+
+/// Publish complete top-level selections, never their flattened leaves.
+/// A failed entry suppresses its entire root; unrelated selections survive.
+fn publication_roots(base: &Path, expected: &[PathBuf], done: &[PathBuf]) -> Vec<PathBuf> {
+    let complete: std::collections::HashSet<_> = done.iter().collect();
+    let mut roots = Vec::new();
+    let mut status = HashMap::new();
+    for path in expected {
+        let Some(first) = path.strip_prefix(base).ok().and_then(|p| p.components().next()) else { continue };
+        let root = base.join(first.as_os_str());
+        let ready = status.entry(root.clone()).or_insert_with(|| { roots.push(root); true });
+        *ready &= complete.contains(path);
+    }
+    roots.into_iter().filter(|root| status[root]).collect()
 }
 
 /// How many bytes a RANGE request may actually be answered with.
@@ -1432,6 +1428,114 @@ impl ironrdp_server::CliprdrServerFactory for X11CliprdrServerFactory {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn poller_does_not_restore_the_screen_captured_before_binding() {
+        const CHILD: &str = "LINRDP_TEST_POLLER_BINDING";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "clipboard::tests::poller_does_not_restore_the_screen_captured_before_binding", "--nocapture"])
+                .env(CHILD, "1")
+                .output().unwrap();
+            assert!(result.status.success(), "{} {}",
+                String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+            return;
+        }
+        use std::io::{BufRead as _, BufReader};
+        use std::process::{Command, Stdio};
+        struct Server(std::process::Child);
+        impl Drop for Server { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+        fn server() -> (Server, u16) {
+            let mut child = Command::new("Xvfb").args(["-displayfd", "1", "-screen", "0", "800x600x24", "-nolisten", "tcp", "-ac"])
+                .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().expect("Xvfb is required for this regression");
+            let mut line = String::new();
+            BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+            (Server(child), line.trim().parse().unwrap())
+        }
+        let (_first, first) = server();
+        let (_second, second) = server();
+        let runtime = std::env::temp_dir().join(format!("linrdp-poller-test-{}", std::process::id()));
+        std::fs::create_dir(&runtime).unwrap();
+        let owner = crate::session::privilege::lookup_user(&current_account()).unwrap();
+        let cookie1 = crate::session::xauth::write_cookie(runtime.to_str().unwrap(), first, &owner).unwrap();
+        let cookie2 = crate::session::xauth::write_cookie(runtime.to_str().unwrap(), second, &owner).unwrap();
+        let (mut backend, proxy) = backend_with_proxy();
+        backend.display = format!(":{second}"); // stale construction snapshot
+        crate::session::gate::arm();
+        crate::session::gate::bind_greeter(first, cookie1.to_str().unwrap(), runtime.to_str().unwrap(), (800, 600)).unwrap();
+        set_x11_text_selection(&format!(":{first}"), "first-screen");
+        std::thread::sleep(Duration::from_millis(100));
+        backend.on_ready();
+        proxy.0.lock().unwrap().clear();
+        let wait_copy = || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if proxy.0.lock().unwrap().iter().any(|(kind, _)| *kind == "copy") { break; }
+                assert!(std::time::Instant::now() < deadline, "poller did not advertise the current screen");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        wait_copy();
+        assert_eq!(backend.read_x11_text().as_deref(), Some("first-screen"));
+        proxy.0.lock().unwrap().clear();
+        crate::session::gate::bind(&current_account(), second, cookie2.to_str().unwrap(), runtime.to_str().unwrap(), (800, 600)).unwrap();
+        set_x11_text_selection(&format!(":{second}"), "second-screen");
+        wait_copy();
+        assert_eq!(backend.read_x11_text().as_deref(), Some("second-screen"));
+        // A request paused before handover must not restore its old environment.
+        assert_eq!(x11_get_text(&format!(":{first}"), cookie1.to_str().unwrap()).as_deref(), Some("first-screen"));
+        assert_eq!(std::env::var("DISPLAY").unwrap(), format!(":{second}"));
+        assert_eq!(std::env::var("XAUTHORITY").unwrap(), cookie2.to_str().unwrap());
+        // arboard's owner uses INCR for large selections; preserve that support
+        // when reading through our explicit X connection instead of arboard.
+        let mut board = arboard::Clipboard::new().unwrap();
+        let large = "long-text-".repeat(100_000);
+        board.set_text(large.clone()).unwrap();
+        assert_eq!(x11_get_text(&format!(":{second}"), cookie2.to_str().unwrap()).as_deref(), Some(large.as_str()));
+        POLLER_GENERATION.fetch_add(1, Ordering::Relaxed);
+        backend.poller_thread.take().unwrap().join().expect("poller must not panic");
+        std::fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn pasted_directories_keep_their_structure_and_empty_roots() {
+        let _guard = crate::x11_selection::X11_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (mut backend, _proxy) = backend_with_proxy();
+        let owner = current_account();
+        crate::session::gate::set_console_user(&owner);
+        *backend.files.lock().unwrap() = Some(SessionFiles {
+            owner,
+            agent: crate::session::fileagent::FileAgent::in_process_for_test().unwrap(),
+        });
+        let directory = |name: &str| FileDescriptor::new(name).with_attributes(ClipboardFileAttributes::DIRECTORY);
+        backend.on_remote_file_list(&[
+            directory("empty"), directory("A"), directory("sub").with_relative_path("A"),
+            FileDescriptor::new("same.txt").with_relative_path("A/sub").with_file_size(0),
+            directory("B"), FileDescriptor::new("same.txt").with_relative_path("B").with_file_size(0),
+            FileDescriptor::new("single.txt").with_file_size(0),
+        ], None);
+        let published = backend.echo_guard.lock().unwrap().clone().expect("published roots");
+        let roots = parse_uri_list(&published);
+        assert_eq!(roots.iter().map(|p| p.file_name().unwrap().to_str().unwrap()).collect::<Vec<_>>(),
+            ["empty", "A", "B", "single.txt"]);
+        assert!(roots[0].is_dir());
+        assert!(roots[1].join("sub/same.txt").is_file());
+        assert!(roots[2].join("same.txt").is_file());
+        let session_root = roots[0].parent().unwrap().parent().unwrap().to_path_buf();
+        backend.on_remote_file_list(&[
+            directory("failed"),
+            FileDescriptor::new("missing.txt").with_relative_path("failed").with_file_size(4),
+            FileDescriptor::new("independent.txt").with_file_size(0),
+        ], None);
+        let stream = backend.download.as_ref().unwrap().stream_id;
+        backend.on_file_contents_response(FileContentsResponse::new_error(stream));
+        let published = backend.echo_guard.lock().unwrap().clone().unwrap();
+        let survivors = parse_uri_list(&published);
+        assert_eq!(survivors.len(), 1, "failed folder must not be advertised as complete");
+        assert_eq!(survivors[0].file_name().unwrap(), "independent.txt");
+        std::fs::remove_dir_all(session_root).unwrap();
+        crate::session::gate::clear_console_user_for_test();
+    }
+
     /// The client addresses offered files by their position in the list it was
     /// sent. Keying the map on the position in the *selection* meant that one
     /// skipped entry desynchronised everything after it.
@@ -1779,7 +1883,7 @@ mod tests {
     }
 
     #[test]
-    fn text_selection_is_readable_by_arboard() {
+    fn text_selection_is_readable_on_an_explicit_connection() {
         let _guard = crate::x11_selection::X11_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let display = std::env::var("DISPLAY").unwrap_or_default();
         if !display.contains(':') {

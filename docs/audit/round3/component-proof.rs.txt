@@ -1,0 +1,77 @@
+#![allow(dead_code, unused_mut)]
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
+#[path="__REPO__/linrdp/src/session/privilege.rs"] mod privilege;
+#[path="__REPO__/linrdp/src/session/xauth.rs"] mod xauth;
+#[path="__REPO__/linrdp/src/session/display_alloc.rs"] mod display_alloc;
+#[path="__REPO__/linrdp/src/session/registry.rs"] mod registry;
+#[path="__REPO__/linrdp/src/session/keeper.rs"] mod keeper;
+#[path="__REPO__/linrdp/src/session/fileagent.rs"] mod fileagent;
+mod session { pub(crate) use crate::privilege; }
+fn main() -> anyhow::Result<()> {
+ let args:Vec<_>=std::env::args().collect();
+ if args.get(1).map(String::as_str)==Some("--file-agent") {
+  return fileagent::agent_main(&args[3]);
+ }
+ anyhow::ensure!(unsafe{libc::geteuid()}==0,"Run this temporary-fixture proof through sudo");
+ let ids=privilege::lookup_user(&args[1])?;
+ anyhow::ensure!(ids.uid!=0,"Test user must be unprivileged");
+ let base=std::env::temp_dir().join(format!("linrdp-audit3-{}",std::process::id()));
+ std::fs::create_dir(&base)?;
+ std::fs::set_permissions(&base,std::fs::Permissions::from_mode(0o755))?;
+ let root=privilege::lookup_user("root")?;
+ let absent=base.join("greeter-10");
+ std::fs::create_dir_all(&absent)?;
+ xauth::write_cookie(absent.to_str().unwrap(),10,&root)?;
+ println!("PASS R01: cookie succeeds after greeter runtime creation");
+ let lease=display_alloc::allocate(&base,11..=11)?;
+ let original=lease.into_handoff_fd();
+ assert!(unsafe{libc::dup2(original,100)}>=0);
+ unsafe{libc::close(original);libc::fcntl(100,libc::F_SETFD,0);}
+ let held=display_alloc::DisplayLease::adopt(&base,11,100)?;
+ let cmd=keeper::DesktopCommand{program:"/usr/bin/python3".into(),args:vec!["-c".into(),"import os,fcntl; assert os.geteuid()!=0; assert not os.path.exists('/proc/self/fd/100'); print('UNPRIVILEGED_CHILD_HAS_NO_LEASE_FD',flush=True)".into()]};
+ let log=base.join("child.log");
+ let pid=keeper::spawn_child(&cmd,&[],&ids,&log)?;
+ let mut status=0; unsafe{libc::waitpid(pid,&mut status,0);}
+ assert_eq!(status,0);
+ assert!(display_alloc::allocate(&base,11..=11).is_err());
+ println!("PASS R02: {}",std::fs::read_to_string(&log)?.trim());
+ drop(held);
+ let runtime=base.join("runtime");std::fs::create_dir(&runtime)?;
+ let c=std::ffi::CString::new(runtime.as_os_str().as_encoded_bytes())?;
+ assert_eq!(unsafe{libc::chown(c.as_ptr(),ids.uid,ids.gid)},0);
+ let cookie=xauth::write_cookie(runtime.to_str().unwrap(),21,&ids)?;
+ assert!(xauth::cookie_for(&cookie,21).is_ok());
+ xauth::write_cookie(runtime.to_str().unwrap(),22,&ids)?;
+ assert!(xauth::cookie_for(&cookie,21).is_ok());
+ println!("PASS R03: second display preserves first cookie");
+ let secret=base.join("root-sentinel");std::fs::write(&secret,b"test-only")?;
+ std::fs::set_permissions(&secret,std::fs::Permissions::from_mode(0o600))?;
+ let mut agent=fileagent::FileAgent::start(&ids.name)?;
+ assert!(agent.open_read(&secret).is_err());
+ let other=privilege::lookup_user("nobody")?;
+ let otherfile=base.join("other-user-sentinel");std::fs::write(&otherfile,b"test-only")?;
+ std::fs::set_permissions(&otherfile,std::fs::Permissions::from_mode(0o600))?;
+ let c=std::ffi::CString::new(otherfile.as_os_str().as_encoded_bytes())?;
+ assert_eq!(unsafe{libc::chown(c.as_ptr(),other.uid,other.gid)},0);
+ assert!(agent.open_read(&otherfile).is_err());
+ println!("PASS F03: helper refuses second unprivileged UID's mode-0600 sentinel");
+ let transfer=agent.new_transfer()?; let paste=transfer.path.clone();
+ let mut file=agent.create_file(&transfer.name.join("fixture"))?;
+ use std::io::Write; file.write_all(b"fixture")?;drop(file);
+ let read=agent.open_read(&paste.join("fixture"))?;
+ assert_eq!(read.metadata()?.len(),7);
+ println!("PASS F03/F04: actual exec helper reads its user's file and refuses root-owned mode-0600 sentinel");
+ let flags=unsafe{libc::fcntl(read.as_raw_fd(),libc::F_GETFD)};
+ assert_ne!(flags & libc::FD_CLOEXEC,0); println!("PASS: received SCM_RIGHTS descriptor is CLOEXEC");
+ drop(read);
+ let old_path=paste.join("fixture");
+ let again=agent.new_transfer()?; assert_ne!(again.path,paste);
+ let mut replacement=agent.create_file(&again.name.join("fixture"))?;
+ replacement.write_all(b"replacement")?;drop(replacement);
+ assert_eq!(std::fs::read(&old_path)?,b"fixture");
+ println!("PASS R07: repeated paste preserves original URI content");
+ drop(agent);
+ std::fs::remove_dir_all(paste.parent().unwrap())?;std::fs::remove_dir_all(base)?;
+ Ok(())
+}

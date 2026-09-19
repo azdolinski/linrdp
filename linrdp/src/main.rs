@@ -151,11 +151,8 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Serving one connection means a worker the supervisor forked
-    // (`--serve-fd`); serving one address in this very process means somebody
-    // working on linrdp (`--listener` alone). Everything else — which is to
-    // say the systemd unit, whose ExecStart carries no arguments at all — is
-    // the supervisor.
+    // Workers carry both --listener and --serve-fd. Legacy --listener-only
+    // invocations reach serve() so it can explain why direct mode is disabled.
     let serves_a_connection = std::env::args().any(|arg| arg == "--serve-fd" || arg == "--listener");
     if !serves_a_connection {
         return supervisor_main(pico_args::Arguments::from_env());
@@ -219,6 +216,7 @@ fn keeper_main() -> anyhow::Result<()> {
     // without it the keeper would have to re-claim the number, which is the
     // window two logins used to race through.
     let lock_fd: std::os::fd::RawFd = args.value_from_str("--keeper-lock-fd")?;
+    let account_fd: std::os::fd::RawFd = args.value_from_str("--keeper-account-fd")?;
     if let Some(path) = args.opt_value_from_str::<_, PathBuf>("--config")? {
         config::set_path(path);
     }
@@ -276,6 +274,7 @@ fn keeper_main() -> anyhow::Result<()> {
         size,
         session_exec,
         lock_fd,
+        account_fd,
     };
     let user_for_log = args.user.clone();
     // Log the failure before returning it. The worker spawns this process
@@ -478,20 +477,11 @@ async fn serve() -> anyhow::Result<()> {
     }
     refuse_leftovers(args)?;
 
-    // A worker is answering "what did the operator ask for on this port?", and
-    // there is no safe guess at that: it loads strictly, and refuses the
-    // connection rather than serving one it invented. Without `--serve-fd`
-    // this process is somebody running linrdp by hand on a machine that may
-    // never have been configured, which is what the defaults are for.
-    let config = if serve_fd.is_some() {
-        config::load_strict(config::path())?
-    } else {
-        let loaded = config::load_or_default(config::path())?;
-        if loaded.from_defaults {
-            eprintln!("linrdp: no {} — using the built-in defaults", config::path().display());
-        }
-        loaded.config
-    };
+    anyhow::ensure!(
+        serve_fd.is_some(),
+        "direct --listener mode is disabled, including console: run `linrdp` or `linrdp debug` through the supervisor"
+    );
+    let config = config::load_strict(config::path())?;
 
     // The log block is service-wide and cannot be overridden, so it is
     // readable before we know which listener this is — which matters, because
@@ -536,36 +526,6 @@ async fn serve() -> anyhow::Result<()> {
         .parse()
         .with_context(|| format!("listener `{}` is not an address and port", effective.bind))?;
 
-    // `--listener` without `--serve-fd`: one process binds the address and
-    // serves every connection itself, instead of the supervisor forking a
-    // worker per connection.
-    //
-    // That mode cannot serve per-user sessions, and the reason is structural
-    // rather than missing work. The session gate is process-global and binds
-    // once: the first login points this process at its own desktop, and a
-    // second login by anyone else has nowhere to go. It also has no per-
-    // connection process to end, which is where a session's teardown lives.
-    //
-    // It used to accept those connections anyway, with no session router
-    // installed at all — so nothing drew the logon screen, nothing checked
-    // account policy, and a process that happened to have a usable X display
-    // could hand a desktop to a client that had proved nothing. Calling it a
-    // developer mode in a comment did not make it one: it took real
-    // connections with the real listener configuration. Console mode is the
-    // one shape that genuinely works in a single process, because every
-    // connection shows the same screen, so that is the one this allows.
-    if serve_fd.is_none() && !console_mode {
-        anyhow::bail!(
-            "`--listener {}` serves every connection in this one process, which cannot route \
-             per-user sessions: the session gate binds once, so the second person to connect \
-             would have nowhere to go. Run the supervisor instead — `linrdp` with no arguments, \
-             or `linrdp debug` for the same thing with a louder log — which forks a worker per \
-             connection. This mode is available for `session.console.enabled`, where every \
-             connection serves the same screen.",
-            effective.bind
-        );
-    }
-
     // Console mode serves one screen that already exists. Which screen is a
     // configuration answer and deliberately not an environment one: the unit
     // carries no Environment=, and the fallback an absent $DISPLAY used to
@@ -577,14 +537,6 @@ async fn serve() -> anyhow::Result<()> {
              desktop to whoever connects",
         )?;
         session::gate::set_console(display, effective.session.console.xauthority.clone());
-    }
-
-    // Seal a legacy cleartext store, once. In the supervisor the migration
-    // already ran there before any worker forked (see `supervisor_main`); only
-    // the direct, single-process path needs it here. Guarding on `serve_fd`
-    // keeps per-connection workers from re-reading the file on every login.
-    if serve_fd.is_none() {
-        sam::migrate_plaintext();
     }
 
     // Matched on the enum, not on a string with a catch-all: a mode added
@@ -618,13 +570,8 @@ async fn serve() -> anyhow::Result<()> {
     // (CredSSP's SAM lookup) and turned into a session in
     // `on_connection_info`, which only runs once CredSSP has succeeded.
     let multi_session = serve_fd.is_some() && !console_mode;
-    // The router is installed for every connection this process serves, in
-    // every mode — console included, and the direct single-process mode
-    // included. Console creates no per-user session and binds no display, but
-    // it still has to ask whether the account that just authenticated is
-    // allowed in, and it is the only place that can: nothing downstream of it
-    // opens a PAM session. Leaving it out is why console, and then the direct
-    // mode above, were routes to a desktop with no policy check on them.
+    // Every worker, including console, must recheck current account policy.
+    // Console opens no new PAM session downstream, so its router check is essential.
     let route_connections = true;
     let pending_identity = Arc::new(session::router::PendingIdentity::default());
 
@@ -968,7 +915,7 @@ async fn serve() -> anyhow::Result<()> {
         // descriptor immediately before exec, and nothing else in this
         // process touches it.
         let std_stream = unsafe { <std::net::TcpStream as std::os::fd::FromRawFd>::from_raw_fd(fd) };
-        std_stream.set_nonblocking(true).context("set the handed-over socket non-blocking")?;
+        let std_stream = prepare_worker_socket(std_stream)?;
         // The supervisor accepted this connection, so it is the only place the
         // peer address exists; without it the disconnect handler has nothing to
         // report and the log says 0.0.0.0:0.
@@ -978,9 +925,7 @@ async fn serve() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    tracing::info!("listening — connect with any RDP client");
-    server.run().await?;
-    Ok(())
+    unreachable!("workers require --serve-fd before loading configuration")
 }
 
 
@@ -1129,3 +1074,55 @@ fn setup_helper_logging(log: &config::Log) {
         .try_init();
 }
 
+/// The supervisor clears CLOEXEC for its exec into this worker. Restore it
+/// before serving the connection, whose callbacks can exec session helpers.
+fn prepare_worker_socket(stream: std::net::TcpStream) -> anyhow::Result<std::net::TcpStream> {
+    use std::os::fd::AsRawFd as _;
+
+    // SAFETY: stream owns this descriptor and keeps it alive throughout fcntl.
+    if unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error()).context("set the handed-over socket close-on-exec");
+    }
+    stream.set_nonblocking(true).context("set the handed-over socket non-blocking")?;
+    Ok(stream)
+}
+
+#[cfg(test)]
+mod worker_socket_tests {
+    use std::io::{Read as _, Write as _};
+    use std::net::{TcpListener, TcpStream};
+    use std::os::fd::AsRawFd as _;
+    use std::process::Command;
+
+    #[test]
+    fn handed_over_socket_stays_usable_but_does_not_survive_exec() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listen");
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).expect("connect");
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let (stream, _) = listener.accept().expect("accept");
+        let fd = stream.as_raw_fd();
+        // Model the supervisor's handoff: this socket must survive one exec.
+        // SAFETY: stream owns fd.
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, 0);
+        let child_sees_socket = || {
+            Command::new("/bin/sh")
+                .args(["-c", &format!("test -S /proc/self/fd/{fd}")])
+                .status()
+                .expect("exec child")
+                .success()
+        };
+        assert!(child_sees_socket(), "control: inherited socket must be visible before adoption");
+
+        let mut stream = super::prepare_worker_socket(stream).expect("prepare worker socket");
+        assert!(!child_sees_socket(), "session helpers must not inherit the client's socket");
+        // SAFETY: stream still owns fd.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(flags >= 0 && flags & libc::O_NONBLOCK != 0);
+        stream.write_all(b"rdp").expect("worker can still write");
+        let mut bytes = [0; 3];
+        peer.read_exact(&mut bytes).expect("peer receives worker data");
+        assert_eq!(&bytes, b"rdp");
+        drop(stream);
+        assert_eq!(peer.read(&mut bytes).expect("connection closes"), 0);
+    }
+}
