@@ -39,6 +39,25 @@ pub trait GfxServerFactory: ServerEventSender + Send {
     fn build_server_with_handle(&self) -> Option<(GfxDvcBridge, GfxServerHandle)> {
         None
     }
+
+    /// Whether this client advertised support for the graphics pipeline.
+    ///
+    /// [MS-RDPEGFX] 1.5 makes this the protocol's own answer to "does this
+    /// client do EGFX": a client implementing the extension MUST set
+    /// `RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL` (0x0100) in the
+    /// `earlyCapabilityFlags` field of its Client Core Data ([MS-RDPBCGR]
+    /// 2.2.1.3.2). The flag arrives in the GCC Conference Create Request,
+    /// long before any dynamic channel exists.
+    ///
+    /// Called once per connection, after the acceptor sequence completes and
+    /// before any display update is produced. The EGFX channel is attached
+    /// either way — the static channel set is consumed before this flag is
+    /// known — so `false` does not mean no Create Request was sent; it means
+    /// nothing should ever *wait* on that channel opening.
+    ///
+    /// [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+    fn on_client_graphics_support(&self, _supported: bool) {}
 }
 
 /// DVC bridge wrapping a shared `GraphicsPipelineServer`.

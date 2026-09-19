@@ -482,6 +482,14 @@ impl SvcProcessor for DrdynvcServer {
                     let status = create_resp.creation_status();
                     warn!(channel_id = ?id, %name, ?status, "DVC channel creation failed");
                     c.state = ChannelState::CreationFailed(status.into());
+                    // MS-RDPEDYC 3.3.3.2: a failure here is terminal for this
+                    // channel — no retry, no renegotiation, and the ID goes
+                    // back into the pool. Tell the processor, or a higher
+                    // layer that gates on the channel opening (the EGFX
+                    // pipeline does) cannot tell "declined" from "still
+                    // negotiating" and waits for a readiness that will never
+                    // come.
+                    c.processor.close(id);
                     return Ok(resp);
                 }
                 c.state = ChannelState::Opened;
@@ -542,6 +550,66 @@ mod tests {
     }
 
     impl DvcServerProcessor for TestDvc {}
+
+    /// Records whether `close` was called, so a test can assert the failure
+    /// path notifies the processor.
+    struct ClosableDvc {
+        closed: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
+    }
+
+    impl_as_any!(ClosableDvc);
+
+    impl DvcProcessor for ClosableDvc {
+        fn channel_name(&self) -> &str {
+            "closable"
+        }
+
+        fn start(&mut self, _channel_id: u32) -> PduResult<Vec<crate::DvcMessage>> {
+            Ok(Vec::new())
+        }
+
+        fn process(&mut self, _channel_id: u32, _payload: &[u8]) -> PduResult<Vec<crate::DvcMessage>> {
+            Ok(Vec::new())
+        }
+
+        fn close(&mut self, _channel_id: u32) {
+            self.closed.store(true, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    impl DvcServerProcessor for ClosableDvc {}
+
+    /// MS-RDPEDYC 3.3.3.2: a negative CreationStatus means the channel was not
+    /// created — there is no retry and no renegotiation, the ID simply goes
+    /// back into the pool. A processor that is never told cannot distinguish
+    /// "declined" from "still negotiating", and a higher layer waiting on the
+    /// channel (the EGFX display pipeline) waits forever.
+    #[test]
+    fn a_refused_channel_tells_its_processor_it_will_never_open() {
+        let closed = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let mut server = DrdynvcServer::new();
+        let channel_id = server.dynamic_channels.insert_channel(
+            ClosableDvc {
+                closed: alloc::sync::Arc::clone(&closed),
+            },
+            ChannelState::Creation,
+        );
+
+        // 0xC0000001 (NO_LISTENER) — what a client sends for a channel name it
+        // has no handler registered for.
+        let refusal = ironrdp_core::encode_vec(&DrdynvcClientPdu::Create(crate::pdu::CreateResponsePdu::new(
+            channel_id,
+            CreationStatus::NO_LISTENER,
+        )))
+        .unwrap();
+
+        server.process(&refusal).unwrap();
+
+        assert!(
+            closed.load(core::sync::atomic::Ordering::Relaxed),
+            "the processor must be told the channel was refused"
+        );
+    }
 
     #[test]
     fn soft_sync_rejects_tunnel_data_until_the_client_responds() {

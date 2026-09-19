@@ -4045,6 +4045,25 @@ impl RdpServer {
             .client_early_capability_flags
             .contains(ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU);
 
+        // MS-RDPEGFX 1.5: a client implementing the graphics pipeline MUST
+        // advertise RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL here. This is the
+        // only signal that exists before the EGFX dynamic channel is created,
+        // and it is the one a display backend needs: a client that never
+        // advertised it will refuse the channel (NO_LISTENER), and nothing
+        // must sit waiting for a readiness that cannot arrive. Reported
+        // before `client_loop` opens the display updates stream, so the
+        // backend has it in hand before its first frame.
+        #[cfg(feature = "egfx")]
+        if let Some(gfx_factory) = self.gfx_factory.as_deref() {
+            let supported = result
+                .client_early_capability_flags
+                .contains(ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL);
+            if !supported {
+                debug!("client did not advertise RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL; EGFX will not be awaited");
+            }
+            gfx_factory.on_client_graphics_support(supported);
+        }
+
         let state = self
             .client_loop(
                 reader,

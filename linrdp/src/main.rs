@@ -833,11 +833,32 @@ async fn serve() -> anyhow::Result<()> {
                     },
                 ),
             },
-            // RemoteFX image mode (MS-RDPRFX): what a Windows server
-            // negotiates with mstsc-class clients. The encoder priority in
-            // ironrdp-server picks it over NSCodec whenever the client
-            // offers it; NSCodec stays as the fallback for NSCodec-only
-            // clients (macOS Microsoft Remote Desktop / Windows App).
+            // RemoteFX, both GUIDs. MS-RDPBCGR 2.2.7.2.10.1.1 gives image
+            // mode (CODEC_GUID_IMAGE_REMOTEFX, 2744CCD4-...) and video mode
+            // (CODEC_GUID_REMOTEFX, 76772F12-...) separate GUIDs, and a
+            // client only offers back what the server advertised. mstsc
+            // offers both; IronRDP and FreeRDP offer *only* the video-mode
+            // GUID. Advertising image mode alone therefore left those
+            // clients with an empty intersection: `has_remote_fx()` in
+            // ironrdp-server gates the client's RemoteFX offer on the
+            // server's own list, so the offer was dropped and the session
+            // fell back to uncompressed 32bpp surface bits — ~4.4 MB per
+            // frame at 1408x775, which looks like a dead session.
+            //
+            // The encoder speaks image mode on either GUID (a header per
+            // frame; see the FIXME on video mode in ironrdp-server's
+            // capability handling), so advertising both costs nothing and is
+            // what `server_codecs_capabilities()` upstream does. When a
+            // client offers both GUIDs, ironrdp-server keeps whichever comes
+            // last in the client's Confirm Active; either way the bitstream
+            // it sends is the same image-mode RemoteFX, and mstsc-class
+            // clients reach this path only when they fail to open EGFX.
+            ironrdp_pdu::rdp::capability_sets::Codec {
+                id: 3,
+                property: ironrdp_pdu::rdp::capability_sets::CodecProperty::RemoteFx(
+                    ironrdp_pdu::rdp::capability_sets::RemoteFxContainer::ServerContainer(4),
+                ),
+            },
             ironrdp_pdu::rdp::capability_sets::Codec {
                 id: 5,
                 property: ironrdp_pdu::rdp::capability_sets::CodecProperty::ImageRemoteFx(

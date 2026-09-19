@@ -83,6 +83,125 @@ const CAPS_SETTLE: Duration = Duration::from_millis(250);
 /// lifetime its composition (the "first connection is black" bug).
 const LEGACY_GRACE: Duration = Duration::from_millis(1500);
 
+/// How long a client that DID advertise the graphics pipeline may keep the
+/// display loop waiting for EGFX capability negotiation before the session
+/// gives up and starts legacy bitmap updates.
+///
+/// MS-RDPEDYC 3.3.3.1.4 sets the protocol's own precedent for a deadline here
+/// — ten seconds for the DVC Capabilities Response, after which the server
+/// stops trying — but ten seconds of black screen reads as a hung session.
+/// Three seconds is comfortably longer than a real client needs to open the
+/// channel and send CapsAdvertise (measured well under one), and short enough
+/// that a client which never will is not mistaken for one that is slow.
+const EGFX_READY_DEADLINE: Duration = Duration::from_secs(3);
+
+/// What the display loop should do with the frame it is holding.
+///
+/// Extracted from the loop so the three ways EGFX can fail to arrive — the
+/// client never advertised it (MS-RDPEGFX 1.5), the client refused the channel
+/// (MS-RDPEDYC 3.3.3.2), or negotiation stalled — are one table of cases
+/// rather than a chain of `continue`s that cannot be tested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EgfxDecision {
+    /// Send this frame over the graphics pipeline.
+    Egfx,
+    /// Send it as a legacy bitmap update.
+    Legacy,
+    /// Drop it: EGFX is still expected, and mixing update streams while a
+    /// graphics client negotiates makes it stop composing entirely.
+    Hold,
+}
+
+/// Inputs the loop has in hand when it must route a frame.
+#[derive(Debug, Clone, Copy)]
+struct EgfxState {
+    /// Capability negotiation completed — frames can flow.
+    ready: bool,
+    /// This session has already sent EGFX frames.
+    latched: bool,
+    /// The channel was refused or closed; no negotiation will follow.
+    unavailable: bool,
+    /// The client advertised `RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL`.
+    client_supports: bool,
+    /// Elapsed since the pipeline server was published; `None` means no
+    /// pipeline server exists yet for this connection.
+    waited: Option<Duration>,
+    /// Elapsed since the updates stream started, for the no-handle grace.
+    since_start: Duration,
+}
+
+impl EgfxState {
+    /// Why this session is not on the graphics pipeline, in one phrase — so an
+    /// operator reading the log does not have to reconstruct it from a DVC
+    /// warning three seconds earlier, which is exactly what this cost last
+    /// time.
+    fn legacy_reason(&self) -> &'static str {
+        if !self.client_supports {
+            "client did not advertise the graphics pipeline (MS-RDPEGFX 1.5)"
+        } else if self.unavailable {
+            "client refused or closed the graphics channel"
+        } else if self.waited.is_some() {
+            "EGFX capability negotiation did not complete in time"
+        } else {
+            "no graphics channel opened"
+        }
+    }
+}
+
+fn egfx_decision(state: EgfxState) -> EgfxDecision {
+    if state.ready {
+        return EgfxDecision::Egfx;
+    }
+
+    // A session already on the pipeline rides out a handle swap (the client
+    // re-advertising after a decoder reset) rather than interleaving legacy
+    // updates into it, which mstsc rejects as a protocol error. Only the
+    // channel actually going away releases the latch.
+    if state.latched {
+        return if state.unavailable {
+            EgfxDecision::Legacy
+        } else {
+            EgfxDecision::Hold
+        };
+    }
+
+    // MS-RDPEGFX 1.5: a client implementing the graphics pipeline MUST
+    // advertise it in its Client Core Data. One that did not will refuse the
+    // channel, so there is nothing to wait for — not for the grace window
+    // either.
+    if !state.client_supports {
+        return EgfxDecision::Legacy;
+    }
+
+    // MS-RDPEDYC 3.3.3.2: creation failure is terminal for the channel.
+    if state.unavailable {
+        return EgfxDecision::Legacy;
+    }
+
+    match state.waited {
+        // The channel is open and the client is graphics-capable: hold, but
+        // not forever — a client that stalls before CapsAdvertise would
+        // otherwise take the whole session down with it in silence.
+        Some(waited) => {
+            if waited >= EGFX_READY_DEADLINE {
+                EgfxDecision::Legacy
+            } else {
+                EgfxDecision::Hold
+            }
+        }
+        // No pipeline server yet. A graphics client opens its channel a few
+        // hundred milliseconds in; emitting legacy updates into that window
+        // costs the first session of every process its composition.
+        None => {
+            if state.since_start >= LEGACY_GRACE {
+                EgfxDecision::Legacy
+            } else {
+                EgfxDecision::Hold
+            }
+        }
+    }
+}
+
 /// H.264 encoder ceiling. The adaptive target below stays at or under the
 /// resolution anchor (7.5 Mbit/s at 4K); this only bounds pathological frames.
 /// (Kept as an absolute last-resort clamp for the rate controller.)
@@ -421,7 +540,8 @@ impl RdpServerDisplay for EgfxDisplay {
             motion_until: Instant::now(),
             caps_reset_until: Instant::now(),
             egfx_latched: false,
-            legacy_grace_until: Instant::now() + LEGACY_GRACE,
+            handle_first_seen: None,
+            legacy_reason_logged: false,
             settle_until,
             last_attach_attempt: Instant::now() - Duration::from_secs(1),
             hb_polls: 0,
@@ -522,10 +642,14 @@ struct EgfxUpdates {
     /// Once a session has used EGFX, never fall back to legacy bitmap
     /// updates (a client decoder reset briefly clears `ready`).
     egfx_latched: bool,
-    /// Legacy bitmap updates are allowed only after this much session time
-    /// with no graphics channel ever opened — see the comment at the
-    /// handle check in `next_update`.
-    legacy_grace_until: Instant,
+    /// When a pipeline server first appeared for this connection. Starts the
+    /// clock on [`EGFX_READY_DEADLINE`]: a client that opened the graphics
+    /// channel but never finished capability negotiation must not hold the
+    /// display loop for the rest of the session.
+    handle_first_seen: Option<Instant>,
+    /// The legacy-fallback reason is logged once per session, not once per
+    /// frame.
+    legacy_reason_logged: bool,
     /// Throttle for (re)attaching a missing source.
     last_attach_attempt: Instant,
     /// Heartbeat counters: make a stalled loop (no damage, wedged grab,
@@ -724,59 +848,56 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
                 }
             }
 
-            // First-session hole: a graphics-capable client opens its EGFX
-            // channel a few hundred milliseconds into the session, and the
-            // process-global GfxSession still holds NO handle until then (on
-            // every later session the previous handle is already present).
-            // Emitting legacy bitmap updates into that window mixes update
-            // streams while mstsc negotiates the graphics pipeline — it stops
-            // composing (black screen) although every EGFX frame decodes
-            // fine. Hold everything for a short grace; if no channel ever
-            // opens, the client genuinely cannot do EGFX and legacy starts.
-            let legacy_allowed = self.session.handle().is_none()
-                && Instant::now() >= self.legacy_grace_until;
-
-            let Some(handle) = self.session.handle() else {
-                // Grace passed and still no graphics channel: legacy path.
-                debug_assert!(legacy_allowed);
-                if let Some(update) = grab.legacy_display_update() {
-                    return Ok(Some(update));
-                }
-                if let Some(update) = self.pending_cursor.take() {
-                    return Ok(Some(update));
-                }
-                continue;
-            };
-
-            let egfx_active = {
-                let server = Self::lock_handle(&handle);
-                self.session.ready() && server.is_ready()
-            };
-            if egfx_active {
-                // This session is on the graphics pipeline. Latch it: when
-                // the client re-opens the graphics channel (decoder reset),
-                // the factory briefly clears `ready` and swaps the handle —
-                // falling back to legacy bitmap updates in that window mixes
-                // two update streams in one session, which mstsc rejects
-                // outright (protocol error). The EGFX path rides out the
-                // swap via the generation check instead.
-                self.egfx_latched = true;
-            } else if self.egfx_latched {
-                if let Some(update) = self.pending_cursor.take() {
-                    return Ok(Some(update));
-                }
-                continue;
-            } else {
-                // The graphics channel exists but caps have not landed yet:
-                // this client IS graphics-capable, so never send legacy
-                // bitmap updates — hold until negotiation completes (the
-                // same stream-mixing hazard as above, in the first session's
-                // pre-ready window).
-                if let Some(update) = self.pending_cursor.take() {
-                    return Ok(Some(update));
-                }
-                continue;
+            // Route this frame: graphics pipeline, legacy bitmaps, or drop it
+            // and keep waiting. `egfx_decision` holds the whole table (and its
+            // reasoning); everything here is gathering its inputs.
+            let handle = self.session.handle();
+            let now = Instant::now();
+            if handle.is_some() && self.handle_first_seen.is_none() {
+                self.handle_first_seen = Some(now);
             }
+            let ready = handle.as_ref().is_some_and(|handle| {
+                let server = Self::lock_handle(handle);
+                self.session.ready() && server.is_ready()
+            });
+            let state = EgfxState {
+                ready,
+                latched: self.egfx_latched,
+                unavailable: self.session.unavailable(),
+                client_supports: self.session.client_supports_egfx(),
+                waited: self.handle_first_seen.map(|seen| now.saturating_duration_since(seen)),
+                since_start: now.saturating_duration_since(self.started),
+            };
+
+            let handle = match egfx_decision(state) {
+                EgfxDecision::Egfx => {
+                    // This session is on the graphics pipeline. Latch it: when
+                    // the client re-opens the graphics channel (decoder reset),
+                    // the factory briefly clears `ready` and swaps the handle —
+                    // falling back to legacy bitmap updates in that window mixes
+                    // two update streams in one session, which mstsc rejects
+                    // outright (protocol error). The EGFX path rides out the
+                    // swap via the generation check instead.
+                    self.egfx_latched = true;
+                    handle.expect("EGFX decision implies a pipeline server")
+                }
+                EgfxDecision::Legacy => {
+                    self.log_legacy_fallback(&state);
+                    if let Some(update) = grab.legacy_display_update() {
+                        return Ok(Some(update));
+                    }
+                    if let Some(update) = self.pending_cursor.take() {
+                        return Ok(Some(update));
+                    }
+                    continue;
+                }
+                EgfxDecision::Hold => {
+                    if let Some(update) = self.pending_cursor.take() {
+                        return Ok(Some(update));
+                    }
+                    continue;
+                }
+            };
 
             // Bounded processing: a wedged encoder or a lock held across a
             // stuck writer must not freeze the whole display pipeline — the
@@ -900,6 +1021,16 @@ impl EgfxUpdates {
                 self.source = Some(source);
             }
         }
+    }
+
+    /// Say once, at the point of the decision, why this session is drawing
+    /// with legacy bitmap updates instead of EGFX.
+    fn log_legacy_fallback(&mut self, state: &EgfxState) {
+        if self.legacy_reason_logged {
+            return;
+        }
+        self.legacy_reason_logged = true;
+        tracing::info!(reason = state.legacy_reason(), "display is using legacy bitmap updates");
     }
 
     /// Lock the pipeline server, surviving a poisoned mutex: a panic on
@@ -2563,6 +2694,133 @@ fn crop_bgra(data: &[u8], width: u16, x: u16, y: u16, w: u16, h: u16) -> Vec<u8>
         }
     }
     out
+}
+
+#[cfg(test)]
+mod egfx_routing_tests {
+    use super::{EGFX_READY_DEADLINE, EgfxDecision, EgfxState, LEGACY_GRACE, egfx_decision};
+
+    /// The default: nothing has happened yet, no handle, client silent.
+    fn state() -> EgfxState {
+        EgfxState {
+            ready: false,
+            latched: false,
+            unavailable: false,
+            client_supports: false,
+            waited: None,
+            since_start: std::time::Duration::ZERO,
+        }
+    }
+
+    /// MS-RDPEGFX 1.5: a client that did not advertise the graphics pipeline
+    /// will refuse the channel, so there is nothing to wait for — not even
+    /// through the grace window. This is the case that hung every IronRDP
+    /// session: handle published, readiness impossible, frames held forever.
+    #[test]
+    fn a_client_that_never_advertised_egfx_goes_straight_to_legacy() {
+        let s = EgfxState {
+            client_supports: false,
+            waited: Some(std::time::Duration::ZERO),
+            ..state()
+        };
+        assert_eq!(egfx_decision(s), EgfxDecision::Legacy);
+
+        // Not even before a pipeline server exists, where the grace window
+        // would otherwise hold the frame.
+        assert_eq!(egfx_decision(EgfxState { waited: None, ..s }), EgfxDecision::Legacy);
+    }
+
+    /// MS-RDPEDYC 3.3.3.2: creation failure is terminal — no retry, no
+    /// renegotiation. Even a client that advertised support gets legacy once
+    /// it has refused.
+    #[test]
+    fn a_refused_channel_releases_the_hold() {
+        let s = EgfxState {
+            client_supports: true,
+            waited: Some(std::time::Duration::ZERO),
+            ..state()
+        };
+        assert_eq!(egfx_decision(s), EgfxDecision::Hold);
+        assert_eq!(
+            egfx_decision(EgfxState { unavailable: true, ..s }),
+            EgfxDecision::Legacy
+        );
+    }
+
+    /// A graphics-capable client gets its negotiation window — but a bounded
+    /// one. Past the deadline a stalled client no longer takes the session
+    /// down in silence.
+    #[test]
+    fn waiting_for_capability_negotiation_expires() {
+        let s = EgfxState {
+            client_supports: true,
+            waited: Some(EGFX_READY_DEADLINE - std::time::Duration::from_millis(1)),
+            ..state()
+        };
+        assert_eq!(egfx_decision(s), EgfxDecision::Hold);
+        assert_eq!(
+            egfx_decision(EgfxState {
+                waited: Some(EGFX_READY_DEADLINE),
+                ..s
+            }),
+            EgfxDecision::Legacy
+        );
+    }
+
+    /// The pre-handle grace has to actually gate something. It used to be
+    /// computed into a `debug_assert!` and nothing else, so the window existed
+    /// only in the comment.
+    #[test]
+    fn the_pre_handle_grace_holds_then_releases() {
+        let s = EgfxState {
+            client_supports: true,
+            since_start: std::time::Duration::ZERO,
+            ..state()
+        };
+        assert_eq!(egfx_decision(s), EgfxDecision::Hold);
+        assert_eq!(
+            egfx_decision(EgfxState {
+                since_start: LEGACY_GRACE,
+                ..s
+            }),
+            EgfxDecision::Legacy
+        );
+    }
+
+    /// Regression: a session already on the pipeline must not interleave
+    /// legacy updates while the client re-advertises after a decoder reset.
+    /// mstsc treats a mixed stream as a protocol error.
+    #[test]
+    fn a_latched_session_rides_out_a_handle_swap() {
+        let s = EgfxState {
+            latched: true,
+            client_supports: true,
+            waited: Some(EGFX_READY_DEADLINE * 10),
+            ..state()
+        };
+        assert_eq!(egfx_decision(s), EgfxDecision::Hold);
+
+        // But a latched session whose channel actually went away must still
+        // fall back rather than hold for the rest of its life.
+        assert_eq!(
+            egfx_decision(EgfxState { unavailable: true, ..s }),
+            EgfxDecision::Legacy
+        );
+    }
+
+    /// Readiness wins over everything, including a lapsed deadline.
+    #[test]
+    fn readiness_routes_to_the_pipeline() {
+        assert_eq!(
+            egfx_decision(EgfxState {
+                ready: true,
+                client_supports: true,
+                waited: Some(EGFX_READY_DEADLINE * 10),
+                ..state()
+            }),
+            EgfxDecision::Egfx
+        );
+    }
 }
 
 #[cfg(test)]
