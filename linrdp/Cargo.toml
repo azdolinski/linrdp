@@ -82,3 +82,27 @@ workspace = true
 # Tests only: the clipboard tests publish a large selection through arboard to
 # check our own X11 reader follows the INCR protocol its owner uses.
 arboard = "3.6"
+
+# `cargo deb -p linrdp` — see .github/workflows/release-packages.yml. postinst
+# runs `linrdp service install` (idempotent, writes config only if missing);
+# prerm on removal (not upgrade) runs `linrdp service uninstall`, which is the
+# same "unwire but leave config/cert/state/log" the binary does by hand.
+[package.metadata.deb]
+maintainer = "LinRDP contributors"
+copyright = "2026, LinRDP contributors and the vendored IronRDP authors"
+extended-description = """\
+RDP server for Linux — connect to a Linux desktop from any Windows/macOS RDP \
+client (mstsc), exactly like connecting to a Windows machine. Single static \
+binary: protocol stack, screen capture, input injection, audio and USB \
+redirection are all compiled in."""
+depends = "libc6, libpam0g, libpulse0"
+section = "net"
+priority = "optional"
+maintainer-scripts = "debian"
+assets = [
+    ["target/release/linrdp", "usr/bin/linrdp", "755"],
+    ["../README.md", "usr/share/doc/linrdp/README.md", "644"],
+    ["../CHANGELOG.md", "usr/share/doc/linrdp/CHANGELOG.md", "644"],
+    ["../LICENSE-MIT", "usr/share/doc/linrdp/LICENSE-MIT", "644"],
+    ["../LICENSE-APACHE", "usr/share/doc/linrdp/LICENSE-APACHE", "644"],
+]

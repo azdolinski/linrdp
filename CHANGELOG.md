@@ -1,0 +1,63 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+Releasing is driven by this file: a push to `main` that adds a new
+`## [X.Y.Z]` section here creates the matching Git tag, GitHub Release and
+`.deb`/`.tar.gz` packages automatically — see
+`.github/workflows/detect-release.yml` and
+`.github/workflows/release-packages.yml`.
+
+## [Unreleased]
+
+### Added
+-
+
+### Fixed
+-
+
+### Changed
+-
+
+---
+
+## [0.1.0] - 2026-09-22
+
+### Added
+- Full RDP server for Linux: X.224/TLS/CredSSP negotiation, capability
+  exchange and virtual channels per MS-RDPBCGR and friends, on a vendored
+  pure-Rust IronRDP core.
+- Login with the account's own system password, verified against
+  `/etc/shadow` (YESCRYPT / SHA-512 / MD5-crypt) and the system PAM stack —
+  nothing to provision.
+- Real desktop streaming: X11 root window capture with damage tracking,
+  keyboard/mouse/wheel input via XTEST, RandR-based resize so one desktop can
+  be reattached from a different monitor.
+- Software H.264 encoding for EGFX-capable clients (vendored x264, High
+  4:4:4 profile) with a bitmap fallback for clients that cannot do EGFX.
+- Audio in both directions: MS-RDPSND output and MS-RDPEAI microphone input.
+- USB redirection channel (MS-RDPEUSB/URBDRC) compiled in.
+- Multi-session support: one `Xvfb`, cookie and PAM session per connection,
+  sessions outlive the connection and lock on disconnect.
+- `linrdp service install`/`uninstall` — writes the systemd unit,
+  `/etc/linrdp/config.yaml`, the PAM capture line and the required
+  directories in one command, and takes back exactly that.
+- `linrdp doctor` / `linrdp doctor <account>` — machine- and account-level
+  diagnostics for PAM, logind, screen lockers and audio.
+- `linrdp config` — a browsable settings tree with every key documented in
+  place.
+- `linrdp debug` / `linrdp daemon` — foreground and non-systemd operation.
+
+### Security
+- Captured passwords are sealed at rest with a machine-bound key (HKDF-SHA256
+  over the DMI product UUID and `/etc/machine-id`) rather than stored in the
+  clear.
+- A budget for unauthenticated clients, a login-policy check applied
+  consistently to console mode, and clipboard file transfers that open under
+  the session's own user rather than root.
+
+[Unreleased]: https://github.com/azdolinski/linrdp/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/azdolinski/linrdp/releases/tag/v0.1.0

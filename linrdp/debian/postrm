@@ -1,0 +1,11 @@
+#!/bin/sh
+# Only on "purge": remove what `service uninstall` (see prerm) deliberately
+# leaves behind — the configuration, the TLS identity, the captured
+# passwords and the logs.
+set -e
+
+if [ "$1" = "purge" ]; then
+    rm -rf /etc/linrdp /var/lib/linrdp /var/log/linrdp
+fi
+
+exit 0

@@ -38,6 +38,19 @@ cargo build --release -p linrdp
 
 ## Install
 
+Prebuilt `.deb` and `.tar.gz` packages for linux/amd64 are attached to each
+[GitHub Release](https://github.com/azdolinski/linrdp/releases) — built and
+published automatically from `CHANGELOG.md` (see
+`.github/workflows/detect-release.yml` and
+`.github/workflows/release-packages.yml`).
+
+```sh
+sudo apt install ./linrdp_<version>_amd64.deb   # installs the unit, PAM
+                                                 # capture line and config
+```
+
+From source:
+
 ```sh
 sudo install -m755 target/release/linrdp /usr/local/bin/linrdp
 sudo linrdp service install

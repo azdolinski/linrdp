@@ -1,0 +1,131 @@
+name: Build Linux Packages
+
+on:
+  workflow_run:
+    workflows: ["Detect Release from CHANGELOG"]
+    types:
+      - completed
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Get tag to build
+        id: get_tag
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_run" ]; then
+            TAG=$(git -c 'versionsort.suffix=-alpha' -c 'versionsort.suffix=-beta' \
+              ls-remote --tags --sort=-v:refname \
+              https://github.com/${{ github.repository }} \
+              | grep 'refs/tags/v' \
+              | head -1 \
+              | awk '{print $2}' \
+              | sed 's#refs/tags/##' \
+              | tr -d '{}^')
+          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          echo "Building tag: $TAG"
+          echo "TAG=$TAG" >> "$GITHUB_OUTPUT"
+          echo "VERSION=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Determine if stable release
+        id: stable
+        run: |
+          TAG="${{ steps.get_tag.outputs.TAG }}"
+          if [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "IS_STABLE=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "IS_STABLE=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.get_tag.outputs.TAG }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config nasm \
+            libpulse-dev libclang-dev
+
+      - name: Set package version
+        run: |
+          sed -i "0,/^version = \".*\"/s//version = \"${{ steps.get_tag.outputs.VERSION }}\"/" linrdp/Cargo.toml
+
+      - name: Build release binary
+        run: cargo build --release -p linrdp
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build .deb package
+        run: cargo deb -p linrdp --no-build --output target/debian/linrdp_${{ steps.get_tag.outputs.VERSION }}_amd64.deb
+
+      - name: Build .tar.gz archive
+        run: |
+          STAGE=$(mktemp -d)
+          DIR="linrdp-${{ steps.get_tag.outputs.VERSION }}-linux-amd64"
+          mkdir -p "$STAGE/$DIR"
+          install -m755 target/release/linrdp "$STAGE/$DIR/linrdp"
+          install -m644 README.md LICENSE-MIT LICENSE-APACHE "$STAGE/$DIR/"
+          tar -C "$STAGE" -czf "$DIR.tar.gz" "$DIR"
+          sha256sum "$DIR.tar.gz" > "$DIR.tar.gz.sha256"
+
+      - name: Checksum the .deb
+        run: |
+          DEB=target/debian/linrdp_${{ steps.get_tag.outputs.VERSION }}_amd64.deb
+          sha256sum "$DEB" > "$DEB.sha256"
+
+      - name: Upload packages to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.get_tag.outputs.TAG }}
+          prerelease: ${{ steps.stable.outputs.IS_STABLE == 'false' }}
+          files: |
+            linrdp-${{ steps.get_tag.outputs.VERSION }}-linux-amd64.tar.gz
+            linrdp-${{ steps.get_tag.outputs.VERSION }}-linux-amd64.tar.gz.sha256
+            target/debian/linrdp_${{ steps.get_tag.outputs.VERSION }}_amd64.deb
+            target/debian/linrdp_${{ steps.get_tag.outputs.VERSION }}_amd64.deb.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Job Summary
+        run: |
+          {
+            echo "## Package Build Summary"
+            echo
+            echo "Built \`${{ steps.get_tag.outputs.TAG }}\` for linux/amd64:"
+            echo
+            echo "- \`linrdp-${{ steps.get_tag.outputs.VERSION }}-linux-amd64.tar.gz\`"
+            echo "- \`linrdp_${{ steps.get_tag.outputs.VERSION }}_amd64.deb\`"
+            echo
+            echo "### Install (Debian/Ubuntu)"
+            echo '```bash'
+            echo "sudo apt install ./linrdp_${{ steps.get_tag.outputs.VERSION }}_amd64.deb"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

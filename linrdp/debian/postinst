@@ -1,0 +1,13 @@
+#!/bin/sh
+# Runs on install and on upgrade (dpkg passes "configure" both times).
+#
+# `linrdp service install` is idempotent: it only writes
+# /etc/linrdp/config.yaml when there is none, and re-running it against an
+# already-installed unit is exactly how an upgrade takes effect (see README).
+set -e
+
+if [ "$1" = "configure" ] && command -v systemctl >/dev/null 2>&1; then
+    /usr/bin/linrdp service install
+fi
+
+exit 0

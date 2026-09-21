@@ -1,0 +1,17 @@
+#!/bin/sh
+# Runs before the binary is removed. Only on a real removal ("remove"), not
+# on an upgrade ("upgrade")/deconfigure — an upgrade's postinst reruns
+# `service install` right after, and stripping the PAM line in between would
+# briefly break NLA logins for no reason.
+#
+# `linrdp service uninstall` disables and removes the systemd unit and the
+# PAM capture line, but deliberately leaves /etc/linrdp, /etc/linrdp/cert,
+# /var/lib/linrdp and /var/log/linrdp — see README's Authentication section.
+# `postrm purge` removes those.
+set -e
+
+if [ "$1" = "remove" ] && [ -x /usr/bin/linrdp ]; then
+    /usr/bin/linrdp service uninstall || true
+fi
+
+exit 0

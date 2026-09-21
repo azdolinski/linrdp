@@ -1,0 +1,126 @@
+name: Detect Release from CHANGELOG
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'CHANGELOG.md'
+
+permissions:
+  contents: write
+
+jobs:
+  detect-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version from CHANGELOG
+        id: version
+        run: |
+          # First ## [X.Y.Z] or ## [X.Y.Z-*] line (ignores ## [Unreleased]).
+          VERSION=$(grep -oP '## \[\K[0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.]+)?(?=\])' CHANGELOG.md | head -1)
+
+          if [ -z "$VERSION" ]; then
+            echo "Could not find a version in CHANGELOG.md"
+            echo "Format should be: ## [X.Y.Z] or ## [X.Y.Z-preX]"
+            exit 1
+          fi
+
+          echo "Found version: $VERSION"
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "TAG=v$VERSION" >> "$GITHUB_OUTPUT"
+
+          if [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release type: stable"
+            echo "IS_PRERELEASE=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release type: pre-release"
+            echo "IS_PRERELEASE=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check if tag already exists
+        id: check_tag
+        run: |
+          TAG="v${{ steps.version.outputs.VERSION }}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag already exists: $TAG"
+            echo "TAG_EXISTS=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag does not exist, will create: $TAG"
+            echo "TAG_EXISTS=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract changelog for this version
+        if: steps.check_tag.outputs.TAG_EXISTS == 'false'
+        id: changelog
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+
+          CHANGELOG=$(awk 'found{ if(/^## \[|^---$/) exit; print } /## \['"$VERSION"'\]/{found=1}' CHANGELOG.md)
+
+          if [ -z "$CHANGELOG" ]; then
+            CHANGELOG="See CHANGELOG.md for details."
+          fi
+
+          echo "$CHANGELOG" > /tmp/changelog.txt
+          cat /tmp/changelog.txt
+
+      - name: Create Git Tag
+        if: steps.check_tag.outputs.TAG_EXISTS == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          TAG="${{ steps.version.outputs.TAG }}"
+          echo "Creating tag: $TAG"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+          echo "Tag pushed: $TAG"
+
+      - name: Create GitHub Release (Stable)
+        if: steps.check_tag.outputs.TAG_EXISTS == 'false' && steps.version.outputs.IS_PRERELEASE == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.TAG }}
+          name: Release ${{ steps.version.outputs.VERSION }}
+          body_path: /tmp/changelog.txt
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create GitHub Release (Pre-Release)
+        if: steps.check_tag.outputs.TAG_EXISTS == 'false' && steps.version.outputs.IS_PRERELEASE == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.TAG }}
+          name: Pre-Release ${{ steps.version.outputs.VERSION }}
+          body_path: /tmp/changelog.txt
+          draft: false
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Job Summary
+        if: always()
+        run: |
+          {
+            echo "## Release Detection Summary"
+            echo
+            if [ "${{ steps.check_tag.outputs.TAG_EXISTS }}" == "false" ]; then
+              if [ "${{ steps.version.outputs.IS_PRERELEASE }}" == "true" ]; then
+                echo "**Pre-Release created:** ${{ steps.version.outputs.TAG }}"
+              else
+                echo "**Stable release created:** ${{ steps.version.outputs.TAG }}"
+              fi
+              echo
+              echo "Package build will be triggered automatically."
+            else
+              echo "**Tag already exists:** ${{ steps.version.outputs.TAG }}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
