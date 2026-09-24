@@ -17,7 +17,15 @@ Releasing is driven by this file: a push to `main` that adds a new
 -
 
 ### Fixed
--
+- PipeWire capture (`features.wayland`) never worked: `pw_init` was never
+  called, `spa_hook` was one pointer short (heap corruption), four SPA
+  constants were hand-counted wrong (`pw_stream_connect` → `-EPROTO`),
+  `Choice`-wrapped format values were not parsed, the stream error state was
+  compared against the wrong value, a format without a frame yet produced an
+  empty grab, and a padded stride was not honoured. Every constant is now the
+  value the C headers give (#1).
+- PipeWire capture on machines without a system `client.conf` (a container
+  with only the library installed): linrdp brings a minimal one (#1).
 
 ### Changed
 -

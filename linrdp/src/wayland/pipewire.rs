@@ -21,12 +21,18 @@ use ironrdp_connector::DesktopSize;
 use crate::capture::{compute_tile_damage, Grab};
 use crate::gfx_display::{DisplaySourceFactory, FrameSource};
 
-// ---- constants (SPA/pipewire ABI, verified against spa-0.2 headers) --------
+// ---- constants (SPA/pipewire ABI) -------------------------------------------
+//
+// Every value here was printed by a C compiler from the pipewire 1.6.9 and
+// spa-0.2 headers, not counted by hand: the hand-counted ones were wrong
+// (Id, Int and both video keys), and a wrong key is not an error PipeWire
+// reports helpfully — pw_stream_connect just answers -EPROTO.
 
-const SPA_TYPE_ID: u32 = 2;
-const SPA_TYPE_INT: u32 = 3;
+const SPA_TYPE_ID: u32 = 3;
+const SPA_TYPE_INT: u32 = 4;
 const SPA_TYPE_RECTANGLE: u32 = 10;
 const SPA_TYPE_OBJECT: u32 = 15;
+const SPA_TYPE_CHOICE: u32 = 0x13;
 
 const SPA_TYPE_OBJECT_FORMAT: u32 = 0x40003;
 const SPA_TYPE_OBJECT_PARAM_BUFFERS: u32 = 0x40004;
@@ -38,8 +44,12 @@ const SPA_VIDEO_FORMAT_BGRX: u32 = 8;
 
 const SPA_FORMAT_MEDIA_TYPE: u32 = 1;
 const SPA_FORMAT_MEDIA_SUBTYPE: u32 = 2;
-const SPA_FORMAT_VIDEO_FORMAT: u32 = 16;
-const SPA_FORMAT_VIDEO_SIZE: u32 = 18;
+// SPA_FORMAT_START_Video (0x20000) + 1 and + 3: the video keys live in their
+// own range, not after the generic ones.
+const SPA_FORMAT_VIDEO_FORMAT: u32 = 0x20001;
+const SPA_FORMAT_VIDEO_SIZE: u32 = 0x20003;
+const SPA_FORMAT_VIDEO_FRAMERATE: u32 = 0x20004;
+const SPA_TYPE_FRACTION: u32 = 11;
 
 const SPA_PARAM_ENUM_FORMAT: u32 = 3;
 const SPA_PARAM_FORMAT: u32 = 4;
@@ -52,6 +62,7 @@ const SPA_PARAM_BUFFERS_STRIDE: u32 = 4;
 const SPA_PARAM_BUFFERS_ALIGN: u32 = 5;
 
 const PW_DIRECTION_INPUT: i32 = 0;
+const PW_STREAM_STATE_ERROR: i32 = -1;
 const PW_ID_ANY: u32 = 0xffff_ffff;
 
 const PW_STREAM_FLAG_AUTOCONNECT: u32 = 1 << 0;
@@ -84,12 +95,17 @@ struct SpaList {
     prev: *mut SpaList,
 }
 
-/// `struct spa_hook` — 5 pointers.
+/// `struct spa_hook` — 6 pointers (spa/utils/hook.h).
+///
+/// `priv` is written by the hook-list implementation. It was missing here, so
+/// `pw_stream_add_listener` wrote one pointer past the end of this allocation
+/// and glibc aborted with "corrupted top size" on the next malloc.
 #[repr(C)]
 struct SpaHook {
     link: SpaList,
     cb: SpaCallbacks,
     removed: Option<unsafe extern "C" fn(hook: *mut SpaHook)>,
+    priv_: *mut c_void,
 }
 
 /// `struct pw_stream_events` — version field + 11 callbacks, padded like C.
@@ -111,11 +127,13 @@ struct PwStreamEvents {
     trigger_done: Option<unsafe extern "C" fn(data: *mut c_void)>,
 }
 
+/// `struct spa_chunk` (spa/buffer/buffer.h).
 #[repr(C)]
 struct SpaChunk {
     offset: u32,
     size: u32,
-    flags: u32,
+    stride: i32,
+    flags: i32,
 }
 
 #[repr(C)]
@@ -245,6 +263,13 @@ fn load_pw() -> Result<PwApi, &'static str> {
             }};
         }
 
+        // Nothing in libpipewire works before `pw_init`: it loads the support
+        // plugins (the loop and system implementations), so without it the
+        // very first call — `pw_thread_loop_new` — returns NULL. Calling it
+        // again is harmless, and this runs once per process.
+        let pw_init: unsafe extern "C" fn(argc: *mut c_int, argv: *mut *mut *mut c_char) = sym!("pw_init");
+        pw_init(std::ptr::null_mut(), std::ptr::null_mut());
+
         Ok(PwApi {
             _lib: lib,
             pw_thread_loop_new: sym!("pw_thread_loop_new"),
@@ -266,6 +291,66 @@ fn load_pw() -> Result<PwApi, &'static str> {
             pw_context_destroy: sym!("pw_context_destroy"),
         })
     }
+}
+
+/// The client configuration linrdp falls back to when the system has none.
+///
+/// `pw_context_new` refuses to start without a `client.conf`, and that file
+/// ships in a different package on every distribution — and in none of them
+/// inside a container that installed only the library. This is the subset a
+/// video capture stream needs: the native protocol to reach the daemon, the
+/// client-node and adapter a `pw_stream` is built from, and the SPA support
+/// plugins. The module files themselves must still be installed.
+const FALLBACK_CLIENT_CONF: &str = r"
+context.properties = {
+    log.level = 0
+}
+context.spa-libs = {
+    audio.convert.* = audioconvert/libspa-audioconvert
+    video.convert.* = videoconvert/libspa-videoconvert
+    support.*       = support/libspa-support
+}
+context.modules = [
+    { name = libpipewire-module-protocol-native }
+    { name = libpipewire-module-client-node }
+    { name = libpipewire-module-client-device }
+    { name = libpipewire-module-adapter }
+    { name = libpipewire-module-metadata }
+]
+";
+
+/// Properties pointing `pw_context_new` at [`FALLBACK_CLIENT_CONF`].
+///
+/// PipeWire reads configuration only from files, so the text is written to a
+/// directory only this process can reach — a fresh one, created with mode 0700
+/// and a name nobody could have planted a link at — and named by absolute
+/// path, which `config.name` accepts.
+fn fallback_config_props(api: &PwApi) -> Option<*mut PwProperties> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+
+    static PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    let path = PATH.get_or_init(|| {
+        let mut nonce = [0u8; 8];
+        getrandom::fill(&mut nonce).ok()?;
+        let suffix: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+        let dir = std::env::temp_dir().join(format!("linrdp-pipewire-{}-{suffix}", std::process::id()));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).ok()?;
+        let path = dir.join("client.conf");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .ok()?;
+        file.write_all(FALLBACK_CLIENT_CONF.as_bytes()).ok()?;
+        Some(path)
+    });
+    let path = path.as_ref()?;
+    let props = CString::new(format!("config.name={}", path.display())).ok()?;
+    // SAFETY: a valid NUL-terminated property string.
+    let props = unsafe { (api.pw_properties_new_string)(props.as_ptr()) };
+    (!props.is_null()).then_some(props)
 }
 
 // ---- POD writer/parser (SPA wire format, 8-byte prop alignment) -------------
@@ -299,7 +384,14 @@ fn build_object_pod(object_type: u32, id: u32, props: &mut dyn FnMut(&mut Vec<u8
     pod
 }
 
-fn enum_format_pod() -> Vec<u8> {
+/// The formats this consumer takes: BGRx, at `size` when given.
+///
+/// A monitor stream has a size of its own and needs none. A virtual monitor
+/// (`RecordVirtual`) is the opposite: Mutter creates the monitor at whatever
+/// size the consumer fixes here — which is how a remote session gets exactly
+/// the client's resolution. The framerate is 0/1, "variable": Mutter records on
+/// damage anyway.
+fn enum_format_pod(size: Option<(u32, u32)>) -> Vec<u8> {
     build_object_pod(SPA_TYPE_OBJECT_FORMAT, SPA_PARAM_ENUM_FORMAT, &mut |body| {
         push_prop(body, SPA_FORMAT_MEDIA_TYPE, SPA_TYPE_ID, &SPA_MEDIA_TYPE_VIDEO.to_ne_bytes());
         push_prop(
@@ -309,6 +401,20 @@ fn enum_format_pod() -> Vec<u8> {
             &SPA_MEDIA_SUBTYPE_RAW.to_ne_bytes(),
         );
         push_prop(body, SPA_FORMAT_VIDEO_FORMAT, SPA_TYPE_ID, &SPA_VIDEO_FORMAT_BGRX.to_ne_bytes());
+        if let Some((width, height)) = size {
+            push_prop(
+                body,
+                SPA_FORMAT_VIDEO_SIZE,
+                SPA_TYPE_RECTANGLE,
+                &[width.to_ne_bytes(), height.to_ne_bytes()].concat(),
+            );
+            push_prop(
+                body,
+                SPA_FORMAT_VIDEO_FRAMERATE,
+                SPA_TYPE_FRACTION,
+                &[0u32.to_ne_bytes(), 1u32.to_ne_bytes()].concat(),
+            );
+        }
     })
 }
 
@@ -355,11 +461,22 @@ fn parse_raw_format(pod: *const SpaPod) -> Option<RawVideoFormat> {
         let mut offset = 8usize; // skip object body type/id
         while offset + 16 <= body_size {
             let key = u32::from_ne_bytes(read4(body, offset)?);
-            let value_size = u32::from_ne_bytes(read4(body, offset + 8)?) as usize;
-            let value_type = u32::from_ne_bytes(read4(body, offset + 12)?);
-            let value_at = offset + 16;
+            let prop_value_size = u32::from_ne_bytes(read4(body, offset + 8)?) as usize;
+            let mut value_size = prop_value_size;
+            let mut value_type = u32::from_ne_bytes(read4(body, offset + 12)?);
+            let mut value_at = offset + 16;
             if value_at + value_size > body_size {
                 break;
+            }
+            // A fixated format still arrives with its values wrapped in a
+            // Choice of kind None (Mutter sends every key that way): body is
+            // `u32 kind, u32 flags, spa_pod child`, then the values, the
+            // first of which is the value itself.
+            if value_type == SPA_TYPE_CHOICE && value_size >= 16 {
+                let child_size = u32::from_ne_bytes(read4(body, value_at + 8)?) as usize;
+                value_type = u32::from_ne_bytes(read4(body, value_at + 12)?);
+                value_at += 16;
+                value_size = child_size.min(prop_value_size - 16);
             }
             match (key, value_type) {
                 (SPA_FORMAT_VIDEO_FORMAT, SPA_TYPE_ID) if value_size >= 4 => {
@@ -374,7 +491,7 @@ fn parse_raw_format(pod: *const SpaPod) -> Option<RawVideoFormat> {
                 _ => {}
             }
             // struct spa_pod_prop total size, rounded up to 8.
-            let prop_size = 16 + value_size;
+            let prop_size = 16 + prop_value_size;
             offset += prop_size.div_ceil(8) * 8;
         }
         (out.format != 0 && out.width != 0).then_some(out)
@@ -444,6 +561,7 @@ impl PwCapture {
         fd: std::os::fd::OwnedFd,
         node_id: u32,
         node_serial: Option<u64>,
+        size: Option<(u32, u32)>,
     ) -> anyhow::Result<Self> {
         let api = match PW.get_or_init(load_pw) {
             Ok(api) => api,
@@ -480,18 +598,32 @@ impl PwCapture {
             (api.pw_thread_loop_lock)(thread_loop);
             let loop_ok = (api.pw_thread_loop_start)(thread_loop);
             let context = if loop_ok == 0 {
-                (api.pw_context_new)(
-                    (api.pw_thread_loop_get_loop)(thread_loop),
-                    std::ptr::null_mut(),
-                    0,
-                )
+                let pw_loop = (api.pw_thread_loop_get_loop)(thread_loop);
+                let system = (api.pw_context_new)(pw_loop, std::ptr::null_mut(), 0);
+                if system.is_null() {
+                    // No usable client.conf on this machine (a container with
+                    // only the library, a minimal distribution): bring our own.
+                    match fallback_config_props(api) {
+                        Some(props) => {
+                            tracing::info!("no system PipeWire client configuration — using linrdp's own");
+                            (api.pw_context_new)(pw_loop, props, 0)
+                        }
+                        None => system,
+                    }
+                } else {
+                    system
+                }
             } else {
                 std::ptr::null_mut()
             };
             if context.is_null() {
                 (api.pw_thread_loop_unlock)(thread_loop);
                 (api.pw_thread_loop_destroy)(thread_loop);
-                anyhow::bail!("pipewire context setup failed");
+                anyhow::bail!(
+                    "pipewire context setup failed — is the PipeWire client module package installed \
+                     (libpipewire-module-protocol-native.so; Debian/Ubuntu: libpipewire-0.3-modules, \
+                     Arch: libpipewire, Fedora: pipewire-libs)?"
+                );
             }
             let core = (api.pw_context_connect_fd)(context, std::os::fd::IntoRawFd::into_raw_fd(fd), std::ptr::null_mut(), 0);
             if core.is_null() {
@@ -543,10 +675,11 @@ impl PwCapture {
                     data: std::ptr::null_mut(),
                 },
                 removed: None,
+                priv_: std::ptr::null_mut(),
             });
             (api.pw_stream_add_listener)(stream, &mut *hook, &*events, events_data);
 
-            let enum_pod = enum_format_pod();
+            let enum_pod = enum_format_pod(size);
             let params = [enum_pod.as_ptr() as *const SpaPod];
             let rc = (api.pw_stream_connect)(
                 stream,
@@ -581,6 +714,19 @@ impl PwCapture {
         Ok(Self { shared })
     }
 
+    /// Wait until the stream's format is negotiated — for a virtual monitor,
+    /// the moment Mutter has created it.
+    pub(crate) fn wait_negotiated(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.shared.stream_ready.load(Ordering::Relaxed) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
     pub(crate) fn shared(&self) -> Arc<PwShared> {
         Arc::clone(&self.shared)
     }
@@ -608,8 +754,9 @@ impl Drop for PwCapture {
 unsafe extern "C" fn on_state_changed(data: *mut c_void, _old: i32, state: i32, error: *const c_char) {
     // SAFETY: data is the leaked Arc<PwShared>.
     let shared = unsafe { &*(data as *const PwShared) };
-    // PW_STREAM_STATE_ERROR == 4 (pipewire stream.h enum order).
-    if state == 4 {
+    // PW_STREAM_STATE_ERROR is -1 (pipewire/stream.h); 4 is no state at all,
+    // which is how stream errors used to go unnoticed.
+    if state == PW_STREAM_STATE_ERROR {
         let message = if error.is_null() {
             "unknown".to_owned()
         } else {
@@ -708,9 +855,16 @@ unsafe fn copy_frame(shared: &PwShared, buffer: &PwBuffer) {
         if valid < expected {
             return; // torn frame — wait for the next
         }
-        // Chunk size is stride * height; the portal always negotiates our
-        // tightly-packed stride, but honor a larger one just in case.
-        let stride = valid / height as usize;
+        // The producer says what stride it used; Mutter pads rows to its own
+        // alignment whatever the consumer asked for. Only a producer that
+        // leaves it unset gets the stride derived from the chunk size.
+        let stride = usize::try_from(chunk.stride)
+            .ok()
+            .filter(|&s| s >= tight)
+            .unwrap_or(valid / height as usize);
+        if stride < tight || stride.saturating_mul(height as usize - 1) + tight > valid {
+            return; // torn or foreign layout — wait for the next
+        }
 
         let seq = shared.frame_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let mut slot = shared.frame.lock().expect("frame lock");
@@ -749,6 +903,13 @@ impl FrameSource for PwFrameSource {
         let slot = self.shared.frame.lock().ok()?;
         if slot.width == 0 || slot.height == 0 {
             return None; // no usable frame yet
+        }
+        // The format is known before the first buffer arrives, and after a
+        // resize the slot still holds the old size's pixels. Neither is a
+        // frame: a Grab whose data does not match its geometry would reach
+        // the encoder as garbage (or, empty, as a zero-length frame).
+        if slot.seq == 0 || slot.data.len() != slot.width as usize * slot.height as usize * 4 {
+            return None;
         }
         // A stale sequence normally means "nothing to do". While the display
         // owes pixels it must still get them: the diff below then reports
@@ -846,5 +1007,68 @@ impl DisplaySourceFactory for PwDisplayFactory {
             prev_frame: None,
             last_seq: 0,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rectangle(width: u32, height: u32) -> Vec<u8> {
+        [width.to_ne_bytes(), height.to_ne_bytes()].concat()
+    }
+
+    /// `Choice{None}` around one value, the way Mutter sends a fixated key.
+    fn choice_none(child_type: u32, value: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_ne_bytes()); // SPA_CHOICE_None
+        body.extend_from_slice(&0u32.to_ne_bytes()); // flags
+        body.extend_from_slice(&(value.len() as u32).to_ne_bytes()); // child size
+        body.extend_from_slice(&child_type.to_ne_bytes());
+        body.extend_from_slice(value);
+        body
+    }
+
+    fn parse(pod: &[u8]) -> Option<RawVideoFormat> {
+        // The parser reads through a pointer, as it does from PipeWire; copy
+        // into u64s so the header is aligned the way SPA aligns pods.
+        let mut aligned = vec![0u64; pod.len().div_ceil(8)];
+        // SAFETY: the destination holds at least pod.len() bytes.
+        unsafe { std::ptr::copy_nonoverlapping(pod.as_ptr(), aligned.as_mut_ptr().cast::<u8>(), pod.len()) };
+        parse_raw_format(aligned.as_ptr().cast::<SpaPod>())
+    }
+
+    #[test]
+    fn a_plain_format_is_parsed() {
+        let pod = build_object_pod(SPA_TYPE_OBJECT_FORMAT, SPA_PARAM_FORMAT, &mut |body| {
+            push_prop(body, SPA_FORMAT_VIDEO_FORMAT, SPA_TYPE_ID, &SPA_VIDEO_FORMAT_BGRX.to_ne_bytes());
+            push_prop(body, SPA_FORMAT_VIDEO_SIZE, SPA_TYPE_RECTANGLE, &rectangle(1280, 800));
+        });
+        let format = parse(&pod).expect("parsed");
+        assert_eq!((format.format, format.width, format.height), (SPA_VIDEO_FORMAT_BGRX, 1280, 800));
+    }
+
+    /// What Mutter actually sends: every value wrapped in a Choice of kind
+    /// None. Not reading through it left the stream negotiated, streaming,
+    /// and never producing a frame.
+    #[test]
+    fn a_format_wrapped_in_choices_is_parsed() {
+        let pod = build_object_pod(SPA_TYPE_OBJECT_FORMAT, SPA_PARAM_FORMAT, &mut |body| {
+            push_prop(body, SPA_FORMAT_MEDIA_TYPE, SPA_TYPE_ID, &SPA_MEDIA_TYPE_VIDEO.to_ne_bytes());
+            push_prop(
+                body,
+                SPA_FORMAT_VIDEO_FORMAT,
+                SPA_TYPE_CHOICE,
+                &choice_none(SPA_TYPE_ID, &SPA_VIDEO_FORMAT_BGRX.to_ne_bytes()),
+            );
+            push_prop(
+                body,
+                SPA_FORMAT_VIDEO_SIZE,
+                SPA_TYPE_CHOICE,
+                &choice_none(SPA_TYPE_RECTANGLE, &rectangle(2560, 1440)),
+            );
+        });
+        let format = parse(&pod).expect("parsed");
+        assert_eq!((format.format, format.width, format.height), (SPA_VIDEO_FORMAT_BGRX, 2560, 1440));
     }
 }

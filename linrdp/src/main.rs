@@ -661,7 +661,7 @@ async fn serve() -> anyhow::Result<()> {
                 .await
                 .expect("portal session failed");
             let capture =
-                wayland::pipewire::PwCapture::start(handles.pipewire_fd, handles.stream.node_id, None)
+                wayland::pipewire::PwCapture::start(handles.pipewire_fd, handles.stream.node_id, None, None)
                     .expect("pipewire capture failed");
             let input = match handles.eis_fd {
                 Some(fd) => wayland::ei::EiInputHandler::new(
