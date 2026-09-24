@@ -206,6 +206,7 @@ pub(crate) struct Listener {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub(crate) struct Session {
+    pub(crate) backend: crate::session::backends::BackendChoice,
     pub(crate) display_range: DisplayRange,
     pub(crate) fixed_size: Option<Size>,
     pub(crate) lock_on_disconnect: bool,
@@ -284,6 +285,7 @@ pub(crate) struct Log {
 impl Default for Session {
     fn default() -> Self {
         Self {
+            backend: crate::session::backends::BackendChoice::Auto,
             display_range: DisplayRange(10..=99),
             fixed_size: None,
             lock_on_disconnect: false,
@@ -350,6 +352,8 @@ where
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub(crate) struct SessionOverride {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) backend: Option<crate::session::backends::BackendChoice>,
     /// Accepted by the parser only so that [`validate`] can refuse it with the
     /// reason; see `meta::RANGE_IS_GLOBAL`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -474,6 +478,9 @@ impl Config {
 
         if let Some(session) = &overrides.session {
             // display_range is refused by `validate`, so it cannot arrive here.
+            if let Some(backend) = session.backend {
+                effective.session.backend = backend;
+            }
             if let Some(fixed_size) = session.fixed_size {
                 effective.session.fixed_size = fixed_size;
             }

@@ -129,6 +129,101 @@ fn set_x11_text_selection(display: &str, text: &str) {
     x11_selection::take_ownership(display.to_owned(), targets);
 }
 
+/// Where this connection's clipboard lives: an X server's selections, or the
+/// clipboard of a desktop served through its compositor (GNOME's, reached
+/// through Mutter).
+///
+/// Everything below speaks to the session's clipboard through this, so the
+/// RDP half — formats, file descriptors, echo guards — is one piece of code
+/// whichever desktop is on the other side.
+enum Board {
+    X11 { display: String, xauthority: String },
+    #[cfg(feature = "wayland")]
+    Compositor(std::sync::Arc<dyn crate::wayland::compositor::CompositorDesktop>),
+}
+
+/// The text MIME types a Wayland clipboard is read in, best first.
+#[cfg(feature = "wayland")]
+const WAYLAND_TEXT: [&str; 3] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
+
+impl Board {
+    /// This worker's clipboard now: the desktop it serves through its
+    /// compositor if it serves one, else the X display the gate names. `None`
+    /// for an armed worker with nothing bound yet.
+    fn current() -> Option<Self> {
+        #[cfg(feature = "wayland")]
+        if let Some(desktop) = crate::wayland::compositor::active() {
+            return Some(Self::Compositor(desktop));
+        }
+        let (display, xauthority) = crate::session::gate::clipboard_target().ok()?;
+        Some(Self::X11 { display, xauthority })
+    }
+
+    /// A name for the log and for noticing a handover.
+    fn name(&self) -> String {
+        match self {
+            Self::X11 { display, .. } => display.clone(),
+            #[cfg(feature = "wayland")]
+            Self::Compositor(desktop) => desktop.label(),
+        }
+    }
+
+    /// Moves when the session's clipboard may have changed. X has no cheap
+    /// way to say so and is polled; a compositor that can says so with a
+    /// signal (GNOME does).
+    fn generation(&self) -> Option<u64> {
+        match self {
+            Self::X11 { .. } => None,
+            #[cfg(feature = "wayland")]
+            Self::Compositor(desktop) => desktop.clipboard_generation(),
+        }
+    }
+
+    fn text(&self) -> Option<String> {
+        match self {
+            Self::X11 { display, xauthority } => x11_get_text(display, xauthority),
+            #[cfg(feature = "wayland")]
+            Self::Compositor(desktop) => {
+                let mimes = desktop.clipboard_mimes();
+                let mime = WAYLAND_TEXT.into_iter().find(|t| mimes.iter().any(|m| m == t))?;
+                let bytes = desktop.read_clipboard(mime)?;
+                String::from_utf8(bytes).ok().filter(|text| !text.is_empty())
+            }
+        }
+    }
+
+    fn target(&self, target: &str) -> Option<Vec<u8>> {
+        match self {
+            Self::X11 { display, xauthority } => {
+                x11_selection::read_selection_target_with_auth(display, xauthority, target)
+            }
+            #[cfg(feature = "wayland")]
+            Self::Compositor(desktop) => desktop.read_clipboard(target),
+        }
+    }
+
+    fn publish(&self, targets: Vec<(String, Vec<u8>)>) {
+        match self {
+            Self::X11 { display, .. } => x11_selection::take_ownership(display.clone(), targets),
+            #[cfg(feature = "wayland")]
+            Self::Compositor(desktop) => desktop.publish_clipboard(targets),
+        }
+    }
+
+    fn publish_text(&self, text: &str) {
+        match self {
+            Self::X11 { display, .. } => set_x11_text_selection(display, text),
+            #[cfg(feature = "wayland")]
+            Self::Compositor(desktop) => {
+                let data = text.as_bytes().to_vec();
+                desktop.publish_clipboard(
+                    WAYLAND_TEXT.into_iter().map(|mime| (mime.to_owned(), data.clone())).collect(),
+                );
+            }
+        }
+    }
+}
+
 /// One file of an in-flight Windows → Linux download.
 #[derive(Debug)]
 struct DownloadTarget {
@@ -581,14 +676,16 @@ impl X11CliprdrBackend {
     /// Falls back to what was captured at construction, which is what an
     /// unarmed worker (single session, or console mode) has and is correct
     /// there.
-    fn target(&self) -> (String, String) {
-        crate::session::gate::clipboard_target().unwrap_or_else(|_| (self.display.clone(), self.xauthority.clone()))
+    fn board(&self) -> Board {
+        Board::current().unwrap_or_else(|| Board::X11 {
+            display: self.display.clone(),
+            xauthority: self.xauthority.clone(),
+        })
     }
 
-    /// Read the current X11 clipboard text (best-effort).
+    /// Read the session's clipboard text (best-effort).
     fn read_x11_text(&self) -> Option<String> {
-        let (display, xauthority) = self.target();
-        x11_get_text(&display, &xauthority)
+        self.board().text()
     }
 
     fn send_msg(&self, msg: ClipboardMessage) {
@@ -622,8 +719,8 @@ impl X11CliprdrBackend {
         }
         let bytes = fetch.targets.iter().map(|(_, data)| data.len()).sum::<usize>();
         let names: Vec<&str> = fetch.targets.iter().map(|(name, _)| name.as_str()).collect();
-        tracing::info!(formats = ?names, bytes, "clipboard: client image → X11");
-        x11_selection::take_ownership(self.target().0, fetch.targets);
+        tracing::info!(formats = ?names, bytes, "clipboard: client image → session");
+        self.board().publish(fetch.targets);
     }
 
     /// Finish a Windows → Linux download: publish the files as a uri-list.
@@ -646,13 +743,10 @@ impl X11CliprdrBackend {
         // Prime the echo guard with the exact payload we are about to serve,
         // so the poller does not advertise the client's own files back to it.
         *self.echo_guard.lock().expect("poisoned") = Some(gnome_copied.clone());
-        x11_selection::take_ownership(
-            self.target().0,
-            vec![
-                ("x-special/gnome-copied-files".to_owned(), gnome_copied.into_bytes()),
-                ("text/uri-list".to_owned(), uri_list),
-            ],
-        );
+        self.board().publish(vec![
+            ("x-special/gnome-copied-files".to_owned(), gnome_copied.into_bytes()),
+            ("text/uri-list".to_owned(), uri_list),
+        ]);
     }
 
     /// Run `f` against this session's file helper, starting one if the
@@ -744,6 +838,7 @@ impl CliprdrBackend for X11CliprdrBackend {
                 let mut bound_at = None;
                 let mut last_text: Option<String> = None;
                 let mut last_files: Option<String> = None;
+                let mut seen_generation: Option<u64> = None;
                 loop {
                     std::thread::sleep(Duration::from_millis(700));
                     if POLLER_GENERATION.load(Ordering::Relaxed) != generation {
@@ -758,9 +853,10 @@ impl CliprdrBackend for X11CliprdrBackend {
                     // gate, and a poller that kept its original value went on
                     // watching a clipboard the user could no longer see.
                     let now = crate::session::gate::generation();
-                    let Ok((display, xauthority)) = crate::session::gate::clipboard_target() else {
+                    let Some(board) = Board::current() else {
                         continue; // An armed, unbound worker has no clipboard.
                     };
+                    let display = board.name();
                     if bound_at != Some(now) {
                         bound_at = Some(now);
                         // The gate owns DISPLAY/XAUTHORITY. Never restore stale
@@ -770,6 +866,7 @@ impl CliprdrBackend for X11CliprdrBackend {
                         // read as unchanged.
                         last_text = None;
                         last_files = None;
+                        seen_generation = None;
                         // A binding with another name: tracing's `%` shorthand
                         // pulls `display` into scope as a function and would
                         // shadow the variable.
@@ -777,13 +874,25 @@ impl CliprdrBackend for X11CliprdrBackend {
                         tracing::info!(target_display = %now_on, "clipboard: following the session handover");
                     }
 
+                    // A board that says when it changed is read only then:
+                    // reading a Wayland clipboard makes the copying app write
+                    // it out, and doing that every 700 ms is not polling but
+                    // pestering.
+                    if let Some(generation) = board.generation() {
+                        if seen_generation == Some(generation) {
+                            continue;
+                        }
+                        seen_generation = Some(generation);
+                    }
+
                     // File managers put copied files under dedicated targets;
                     // query those before ordinary text.
-                    let uri_text = x11_selection::read_selection_target_with_auth(&display, &xauthority, "x-special/gnome-copied-files")
-                        .or_else(|| x11_selection::read_selection_target_with_auth(&display, &xauthority, "text/uri-list"))
+                    let uri_text = board
+                        .target("x-special/gnome-copied-files")
+                        .or_else(|| board.target("text/uri-list"))
                         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
 
-                    let board_text = x11_get_text(&display, &xauthority);
+                    let board_text = board.text();
 
                     let guard = echo_guard.lock().expect("poisoned").take();
                     if let Some(text) = uri_text.as_ref() {
@@ -1052,9 +1161,9 @@ impl CliprdrBackend for X11CliprdrBackend {
                 if text.is_empty() {
                     return;
                 }
-                tracing::info!(bytes = text.len(), "clipboard: client text → X11");
+                tracing::info!(bytes = text.len(), "clipboard: client text → session");
                 *self.echo_guard.lock().expect("poisoned") = Some(text.clone());
-                set_x11_text_selection(&self.target().0, &text);
+                self.board().publish_text(&text);
             }
             IncomingKind::Png => {
                 if let Some(data) = data {

@@ -34,6 +34,16 @@ pub(crate) struct SessionRecord {
     /// long as its PAM session is open, so the record is where it has to
     /// live.
     pub(crate) logind_id: Option<String>,
+    /// The private session bus of a session served through its compositor (a
+    /// headless GNOME one), as this process reaches it. An X session has a
+    /// display and no bus of its own; a GNOME session has a bus and no
+    /// display — `display` is then only the slot number the session is filed
+    /// under.
+    pub(crate) bus: Option<String>,
+    /// The case serving it (`DesktopBackend::id`). A reconnect is served the
+    /// same way, and a login that would be served another way is refused
+    /// rather than given a second desktop.
+    pub(crate) backend: String,
 }
 
 pub(crate) fn record_path(base: &Path, display: u16) -> PathBuf {
@@ -49,6 +59,10 @@ pub(crate) fn write_record(base: &Path, rec: &SessionRecord) -> anyhow::Result<(
     if let Some(id) = &rec.logind_id {
         body.push_str(&format!("logind_id={id}\n"));
     }
+    if let Some(bus) = &rec.bus {
+        body.push_str(&format!("bus={bus}\n"));
+    }
+    body.push_str(&format!("backend={}\n", rec.backend));
     fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod {}", path.display()))?;
@@ -61,6 +75,17 @@ fn read_record(base: &Path, display: u16) -> Option<SessionRecord> {
         let prefix = format!("{key}=");
         body.lines().find_map(|line| line.strip_prefix(&prefix)).map(str::to_owned)
     };
+    let bus = field("bus").filter(|bus| !bus.is_empty());
+    // A record without the field predates it, and then the bus said which:
+    // the GNOME sessions were the ones with a bus of their own.
+    let backend = field("backend").filter(|b| !b.is_empty()).unwrap_or_else(|| {
+        let legacy = if bus.is_some() {
+            super::backends::gnome_headless::ID
+        } else {
+            super::backends::x11::ID
+        };
+        legacy.to_owned()
+    });
     Some(SessionRecord {
         user: field("user")?,
         display: field("display")?.parse().ok()?,
@@ -70,6 +95,8 @@ fn read_record(base: &Path, display: u16) -> Option<SessionRecord> {
         // assuming unlocked is the unsafe direction.
         locked: field("locked").is_none_or(|v| v == "true"),
         logind_id: field("logind_id").filter(|id| !id.is_empty()),
+        bus,
+        backend,
     })
 }
 
@@ -145,6 +172,8 @@ mod tests {
             xauthority: format!("/run/user/{}/linrdp/Xauthority", 1000 + u32::from(display)),
             locked: false,
             logind_id: Some(format!("{display}")),
+            bus: None,
+            backend: super::super::backends::x11::ID.to_owned(),
         }
     }
 
@@ -235,6 +264,31 @@ mod tests {
             found.logind_id, rec.logind_id,
             "without the logind id there is no session to point `loginctl lock-session` at"
         );
+        assert_eq!(found.backend, rec.backend, "a reconnect must be served the way the session was started");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Sessions started before records named their case are still told
+    /// apart: a record with a bus of its own was a GNOME session.
+    #[test]
+    fn a_record_without_its_case_is_read_by_its_bus() {
+        use super::super::backends::{gnome_headless, x11};
+
+        let base = temp_base("legacycase");
+        fs::write(
+            record_path(&base, 14),
+            "user=dave\ndisplay=14\nruntime_dir=/run/user/1014\nxauthority=/x\nlocked=true\n",
+        )
+        .expect("legacy X record");
+        fs::write(
+            record_path(&base, 15),
+            "user=erin\ndisplay=15\nruntime_dir=/run/user/1015\nxauthority=\nlocked=true\n\
+             bus=/run/user/1015/linrdp-session-15.bus\n",
+        )
+        .expect("legacy GNOME record");
+
+        assert_eq!(find(&base, "dave", 10..=20).expect("dave").backend, x11::ID);
+        assert_eq!(find(&base, "erin", 10..=20).expect("erin").backend, gnome_headless::ID);
+        let _ = fs::remove_dir_all(&base);
     }
 }

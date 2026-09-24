@@ -70,8 +70,12 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 crossterm = "0.29"
 
 [features]
-# Wayland capture path: xdg-desktop-portal + PipeWire + libei (see src/wayland).
-# Off by default until it has been exercised on a real Wayland session.
+default = ["wayland"]
+# Wayland desktops (see src/wayland): Mutter's remote-desktop API for GNOME
+# (`session.backend`), and the xdg-desktop-portal path behind
+# `features.wayland`. PipeWire and libei are dlopen'ed at runtime, so this adds
+# no build-time or package dependency — a machine without them simply has no
+# Wayland case to offer.
 wayland = ["dep:futures-util"]
 
 
@@ -96,6 +100,9 @@ client (mstsc), exactly like connecting to a Windows machine. Single static \
 binary: protocol stack, screen capture, input injection, audio and USB \
 redirection are all compiled in."""
 depends = "libc6, libpam0g, libpulse0"
+# The GNOME case captures through PipeWire; its client modules are a separate
+# package on Debian/Ubuntu, and a GNOME desktop already has them.
+recommends = "libpipewire-0.3-modules"
 section = "net"
 priority = "optional"
 maintainer-scripts = "debian"

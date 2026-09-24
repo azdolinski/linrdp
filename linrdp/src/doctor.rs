@@ -175,7 +175,32 @@ fn build(
 
     let system = vec![
         Fact { key: "distribution", value: caps.distro.clone() },
+        Fact {
+            key: "container",
+            value: caps.container.clone().unwrap_or_else(|| "no".to_owned()),
+        },
         Fact { key: "X servers", value: list(&caps.x_servers) },
+        Fact {
+            key: "GNOME",
+            value: match (caps.gnome_supported, caps.gnome_launcher) {
+                (false, _) => "not supported by this build (no `wayland` feature)".to_owned(),
+                (true, None) => "no GNOME Shell to start".to_owned(),
+                (true, Some("host")) => "sessions started on the container's host".to_owned(),
+                (true, Some(_)) => "sessions started natively".to_owned(),
+            },
+        },
+        Fact {
+            key: "at the console",
+            value: if !caps.gnome_supported || caps.gnome_sessions.is_empty() {
+                "nobody (in GNOME)".to_owned()
+            } else {
+                caps.gnome_sessions
+                    .iter()
+                    .map(|g| format!("{} ({})", g.user, g.runtime_dir))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+        },
         Fact { key: "logind", value: if caps.logind { "yes" } else { "no" }.to_owned() },
         Fact {
             key: "PAM service",
@@ -1080,6 +1105,10 @@ mod tests {
     fn healthy(sessions: Vec<DesktopSession>) -> Capabilities {
         Capabilities {
             distro: "Debian GNU/Linux 13 (trixie)".to_owned(),
+            container: None,
+            gnome_supported: false,
+            gnome_sessions: Vec::new(),
+            gnome_launcher: None,
             logind: true,
             pam_service: true,
             x_servers: vec!["Xvfb".to_owned(), "Xorg".to_owned()],

@@ -60,6 +60,7 @@ pub(crate) fn render(config: &Config) -> String {
 
     block(&mut out, "session", 0);
     out.push_str("session:\n");
+    leaf(&mut out, "session.backend", config.session.backend.as_str(), 2);
     leaf(
         &mut out,
         "session.display_range",
@@ -184,6 +185,9 @@ fn render_listener(out: &mut String, listener: &Listener, described: bool) {
 fn render_overrides(out: &mut String, overrides: &Overrides) {
     if let Some(session) = &overrides.session {
         out.push_str("      session:\n");
+        if let Some(backend) = session.backend {
+            let _ = writeln!(out, "        backend: {backend}");
+        }
         if let Some(fixed_size) = session.fixed_size {
             let _ = writeln!(out, "        fixed_size: {}", opt(fixed_size.map(|s| s.to_string())));
         }
