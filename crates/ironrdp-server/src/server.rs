@@ -137,6 +137,8 @@ pub struct ConnectionInfo {
     pub ime_file_name: String,
     /// See [`ironrdp_acceptor::AcceptorResult::desktop_size`].
     pub desktop_size: ironrdp_connector::DesktopSize,
+    /// See [`ironrdp_acceptor::AcceptorResult::client_cluster`].
+    pub client_cluster: Option<ironrdp_pdu::gcc::ClientClusterData>,
 }
 
 impl ConnectionInfo {
@@ -155,7 +157,66 @@ impl ConnectionInfo {
             keyboard_type,
             ime_file_name,
             desktop_size,
+            client_cluster: None,
         }
+    }
+
+    /// The same, with Client Cluster Data — for tests of console routing.
+    #[must_use]
+    pub fn with_client_cluster(mut self, cluster: Option<ironrdp_pdu::gcc::ClientClusterData>) -> Self {
+        self.client_cluster = cluster;
+        self
+    }
+
+    /// Whether the client asked for the console session (`mstsc /admin`):
+    /// Client Cluster Data with `REDIRECTED_SESSIONID_FIELD_VALID` naming
+    /// session 0, the console's.
+    pub fn requests_console(&self) -> bool {
+        self.client_cluster.as_ref().is_some_and(|cluster| {
+            cluster
+                .flags
+                .contains(ironrdp_pdu::gcc::RedirectionFlags::REDIRECTED_SESSION_FIELD_VALID)
+                && cluster.redirected_session_id == 0
+        })
+    }
+}
+
+#[cfg(test)]
+mod connection_info_tests {
+    use ironrdp_pdu::gcc::{ClientClusterData, RedirectionFlags, RedirectionVersion};
+
+    use super::ConnectionInfo;
+
+    fn info(flags: RedirectionFlags, session: u32) -> ConnectionInfo {
+        ConnectionInfo::new(
+            0,
+            ironrdp_pdu::gcc::KeyboardType(0),
+            String::new(),
+            ironrdp_connector::DesktopSize { width: 1, height: 1 },
+        )
+        .with_client_cluster(Some(ClientClusterData {
+            flags,
+            redirection_version: RedirectionVersion::V4,
+            redirected_session_id: session,
+        }))
+    }
+
+    /// What mstsc sends with and without `/admin`, as logged live:
+    /// flags 0x3 (`/admin`) and 0x1.
+    #[test]
+    fn admin_is_a_request_for_session_zero() {
+        let admin = RedirectionFlags::REDIRECTION_SUPPORTED | RedirectionFlags::REDIRECTED_SESSION_FIELD_VALID;
+        assert!(info(admin, 0).requests_console());
+        assert!(!info(RedirectionFlags::REDIRECTION_SUPPORTED, 0).requests_console());
+        // A redirect to some other session is not the console.
+        assert!(!info(admin, 7).requests_console());
+        let none = ConnectionInfo::new(
+            0,
+            ironrdp_pdu::gcc::KeyboardType(0),
+            String::new(),
+            ironrdp_connector::DesktopSize { width: 1, height: 1 },
+        );
+        assert!(!none.requests_console());
     }
 }
 
@@ -3865,6 +3926,7 @@ impl RdpServer {
                 keyboard_type: result.keyboard_type,
                 ime_file_name: result.ime_file_name.clone(),
                 desktop_size: result.desktop_size,
+                client_cluster: result.client_cluster.clone(),
             });
         }
 
