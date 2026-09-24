@@ -82,6 +82,25 @@ const AUTH_VALUES: &[Value] = &[
     },
 ];
 
+const BACKEND_VALUES: &[Value] = &[
+    Value {
+        name: "auto",
+        gloss: "a GNOME session of the account's own where GNOME Shell can be started, a \
+                per-user X session otherwise. What almost every machine wants.",
+    },
+    Value {
+        name: "x11",
+        gloss: "always a per-user X session linrdp starts itself (Xvfb, or Xorg). Needs an \
+                X server and a desktop in /usr/share/xsessions.",
+    },
+    Value {
+        name: "gnome",
+        gloss: "always a headless GNOME session of the account's own, at the client's \
+                resolution, kept running and locked between connections. The only choice on \
+                GNOME 49 and later, which have no X11 session.",
+    },
+];
+
 const LEVEL_VALUES: &[Value] = &[
     Value {
         name: "error",
@@ -157,6 +176,16 @@ pub(crate) static FIELDS: &[Field] = &[
                       every listener unless a listener overrides a key.",
         kind: Kind::Block,
         default: None,
+        default_means: None,
+        overridable: Overridable::Yes,
+    },
+    Field {
+        path: "session.backend",
+        description: "Which kind of session of its own a login is served. The console is \
+                      never served this way: a client reaches it only by asking (`mstsc \
+                      /admin`), and only as the account logged in at it.",
+        kind: Kind::Enum(BACKEND_VALUES),
+        default: Some("auto"),
         default_means: None,
         overridable: Overridable::Yes,
     },

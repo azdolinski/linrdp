@@ -139,6 +139,14 @@ impl Drop for FileAgent {
     }
 }
 
+/// Where this helper makes paste directories: `LINRDP_PASTE_BASE` when the
+/// worker set one (see `gate::paste_base`), the temporary directory otherwise.
+fn paste_base() -> PathBuf {
+    std::env::var_os("LINRDP_PASTE_BASE")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 impl FileAgent {
     /// Start a helper running as `user`.
     ///
@@ -180,7 +188,12 @@ impl FileAgent {
         // and exec; this one calls only dup2 and fcntl, both async-signal-safe,
         // and allocates nothing.
         let spawned = unsafe {
-            std::process::Command::new(exe)
+            let mut command = std::process::Command::new(exe);
+            match crate::session::gate::paste_base() {
+                Some(base) => command.env("LINRDP_PASTE_BASE", base),
+                None => command.env_remove("LINRDP_PASTE_BASE"),
+            };
+            command
                 .arg("--file-agent")
                 .arg("--file-agent-user")
                 .arg(user)
@@ -581,7 +594,15 @@ impl AgentState {
     /// 022 left pasted files readable by every account on the machine.
     fn ensure_paste_dir(&mut self) -> anyhow::Result<&PathBuf> {
         if self.paste_dir.is_none() {
-            let base = std::env::temp_dir();
+            let base = paste_base();
+            if base != std::env::temp_dir() {
+                // Ours to make, in the user's own home, as the user.
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(&base)
+                    .with_context(|| format!("create {}", base.display()))?;
+            }
             let mut last = None;
             for _ in 0..8 {
                 let candidate = base.join(format!("{}{}", self.prefix, random_suffix()?));
@@ -610,7 +631,7 @@ impl AgentState {
     /// runs as the user, so it has no power over anybody else's leftovers and
     /// cannot be steered into removing them.
     fn sweep_old_paste_dirs(&self) {
-        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        let Ok(entries) = std::fs::read_dir(paste_base()) else {
             return;
         };
         let cutoff = std::time::SystemTime::now() - core::time::Duration::from_secs(24 * 60 * 60);

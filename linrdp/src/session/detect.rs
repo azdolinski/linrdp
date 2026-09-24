@@ -92,10 +92,32 @@ pub(crate) fn choose_session<'a>(
         .find(|s| s.runnable && s.kind == SessionKind::X11)
 }
 
+/// A running GNOME session linrdp can reach — what the `gnome-console` case
+/// of `session::backends` serves, found on this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GnomeFound {
+    pub(crate) user: String,
+    /// Where its bus was found: `/run/user/<uid>`, or the host's copy of it
+    /// when linrdp runs in a container.
+    pub(crate) runtime_dir: String,
+}
+
 /// Everything linrdp probed about this machine.
 #[derive(Debug, Clone)]
 pub(crate) struct Capabilities {
     pub(crate) distro: String,
+    /// The container linrdp runs in, when it runs in one (distrobox, toolbox,
+    /// Vanilla OS apx, podman, docker). Its accounts, passwords and PAM are
+    /// the container's, not the host's — which is the first thing to know
+    /// when a login that works on the desktop is refused here.
+    pub(crate) container: Option<String>,
+    /// Whether this binary can serve GNOME sessions at all.
+    pub(crate) gnome_supported: bool,
+    /// Accounts logged in to GNOME at the console — what `/admin` reaches.
+    pub(crate) gnome_sessions: Vec<GnomeFound>,
+    /// How a GNOME session of its own is started for a login here, if it can
+    /// be: `native`, or `host` from a container.
+    pub(crate) gnome_launcher: Option<&'static str>,
     pub(crate) logind: bool,
     pub(crate) pam_service: bool,
     pub(crate) x_servers: Vec<String>,
@@ -119,15 +141,42 @@ pub(crate) enum Verdict {
 pub(crate) fn verdicts(caps: &Capabilities) -> Vec<Verdict> {
     let mut out = Vec::new();
 
-    if caps.x_servers.is_empty() {
+    // The cases `session::backends` can pick from. Missing X is only a
+    // blocker when nothing else can serve a login either: on a GNOME-only
+    // machine (GNOME 49+ has no X11 session) it is simply not the case that
+    // applies.
+    let x_case = !caps.x_servers.is_empty();
+    let gnome_case = caps.gnome_supported && caps.gnome_launcher.is_some();
+    if gnome_case {
+        out.push(Verdict::Ok("GNOME sessions of their own can be started".to_owned()));
+        if caps.gnome_launcher == Some("host") {
+            out.push(Verdict::Warning(
+                "GNOME sessions are started on the host of this container, where linrdp cannot \
+                 open a logind session: they work, but polkit prompts (\"authentication \
+                 required\") do not reach them. Installing linrdp on the host lifts this"
+                    .to_owned(),
+            ));
+        }
+    }
+    if x_case {
+        out.push(Verdict::Ok(format!("X server: {}", caps.x_servers.join(", "))));
+    } else if gnome_case {
+        // Nothing to say: GNOME serves every login here.
+    } else if caps.gnome_supported {
+        out.push(Verdict::Blocker(
+            "no X server (Xvfb or Xorg), and no GNOME Shell to start — nothing can serve a login: \
+             install Xvfb and a desktop, or GNOME"
+                .to_owned(),
+        ));
+    } else {
         out.push(Verdict::Blocker(
             "no X server found (Xvfb or Xorg) — a per-user session cannot be started".to_owned(),
         ));
-    } else {
-        out.push(Verdict::Ok(format!("X server: {}", caps.x_servers.join(", "))));
     }
 
+    // The X11 desktop only matters where the X11 case can happen at all.
     match choose_session(&caps.sessions, None) {
+        _ if !x_case && gnome_case => {}
         Some(session) => out.push(Verdict::Ok(format!(
             "desktop session: {} ({})",
             session.name, session.id
@@ -165,7 +214,9 @@ pub(crate) fn verdicts(caps: &Capabilities) -> Vec<Verdict> {
         ));
     }
 
-    if caps.lockers.is_empty() {
+    // gnome-shell draws its own lock screen, so a missing X locker only
+    // matters where X sessions can be started.
+    if caps.lockers.is_empty() && x_case {
         out.push(Verdict::Warning(
             "no screen locker found — a disconnected session can be marked locked, but nothing will draw a lock screen".to_owned(),
         ));
@@ -188,7 +239,79 @@ pub(crate) fn verdicts(caps: &Capabilities) -> Vec<Verdict> {
         )));
     }
 
+    if let Some(container) = &caps.container {
+        out.push(Verdict::Warning(format!(
+            "linrdp runs inside a container ({container}): accounts, passwords and PAM are the \
+             container's, not the host's. A login is checked against the container's \
+             /etc/shadow, so give the account a password there (`sudo passwd <account>` inside \
+             the container)"
+        )));
+    }
+
     out
+}
+
+/// The container this process runs in, if any, by the markers container
+/// engines leave: podman's `/run/.containerenv` (which names it — distrobox,
+/// toolbox and apx are podman underneath), docker's `/.dockerenv`, and the
+/// `container=` variable systemd-nspawn and podman put in PID 1's environment.
+fn container() -> Option<String> {
+    if let Ok(env) = std::fs::read_to_string("/run/.containerenv") {
+        let field = |key: &str| {
+            env.lines()
+                .find_map(|l| l.strip_prefix(&format!("{key}=")))
+                .map(|v| v.trim_matches('"').to_owned())
+                .filter(|v| !v.is_empty())
+        };
+        let engine = field("engine").unwrap_or_else(|| "podman".to_owned());
+        let rootless = field("rootless").is_some_and(|v| v == "1");
+        return Some(match field("name") {
+            Some(name) => format!("{name}, {engine}{}", if rootless { " rootless" } else { "" }),
+            None => engine,
+        });
+    }
+    if Path::new("/.dockerenv").exists() {
+        return Some("docker".to_owned());
+    }
+    std::fs::read("/proc/1/environ").ok().and_then(|env| {
+        env.split(|b| *b == 0)
+            .find_map(|var| var.strip_prefix(b"container="))
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+    })
+}
+
+/// Running GNOME sessions this process can reach: every uid with a runtime
+/// dir, asked whether Mutter's remote desktop answers on its bus.
+fn gnome_sessions() -> Vec<GnomeFound> {
+    #[cfg(feature = "wayland")]
+    {
+        let mut uids: Vec<u32> = ["/run/user", "/run/host/run/user"]
+            .iter()
+            .filter_map(|dir| std::fs::read_dir(dir).ok())
+            .flat_map(|entries| entries.flatten())
+            .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+            .collect();
+        uids.sort_unstable();
+        uids.dedup();
+        uids.into_iter()
+            .filter_map(|uid| {
+                // SAFETY: getpwuid returns static storage, read immediately.
+                let (name, gid) = unsafe {
+                    let pw = libc::getpwuid(uid);
+                    if pw.is_null() {
+                        return None;
+                    }
+                    (std::ffi::CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned(), (*pw).pw_gid)
+                };
+                let found = crate::wayland::mutter::find(uid, gid)?;
+                Some(GnomeFound { user: name, runtime_dir: found.runtime_dir.display().to_string() })
+            })
+            .collect()
+    }
+    #[cfg(not(feature = "wayland"))]
+    {
+        Vec::new()
+    }
 }
 
 /// Read the session entries under `dir`.
@@ -227,10 +350,22 @@ pub(crate) fn program_exists(program: &str) -> bool {
         .any(|dir| PathBuf::from(dir).join(program).is_file())
 }
 
+/// The desktop sessions this machine declares, X11 and Wayland, each marked
+/// runnable or not. Only reads `/usr/share`, so a session start can ask it
+/// without probing anything else.
+pub(crate) fn desktop_sessions() -> Vec<DesktopSession> {
+    let exists: &dyn Fn(&str) -> bool = &program_exists;
+    let mut sessions = read_sessions(Path::new("/usr/share/xsessions"), SessionKind::X11, exists);
+    sessions.extend(read_sessions(
+        Path::new("/usr/share/wayland-sessions"),
+        SessionKind::Wayland,
+        exists,
+    ));
+    sessions
+}
+
 /// Probe this machine.
 pub(crate) fn probe() -> Capabilities {
-    let exists: &dyn Fn(&str) -> bool = &program_exists;
-
     let distro = std::fs::read_to_string("/etc/os-release")
         .ok()
         .and_then(|body| {
@@ -240,15 +375,15 @@ pub(crate) fn probe() -> Capabilities {
         })
         .unwrap_or_else(|| "unknown".to_owned());
 
-    let mut sessions = read_sessions(Path::new("/usr/share/xsessions"), SessionKind::X11, exists);
-    sessions.extend(read_sessions(
-        Path::new("/usr/share/wayland-sessions"),
-        SessionKind::Wayland,
-        exists,
-    ));
+    let sessions = desktop_sessions();
 
     Capabilities {
         distro,
+        container: container(),
+        gnome_supported: cfg!(feature = "wayland"),
+        gnome_sessions: gnome_sessions(),
+        gnome_launcher: super::backends::gnome_headless::launcher()
+            .map(super::backends::gnome_headless::Launcher::as_str),
         // The seat directory exists exactly when logind is running.
         logind: Path::new("/run/systemd/seats").exists() || Path::new("/run/systemd/sessions").exists(),
         pam_service: Path::new("/etc/pam.d/linrdp").is_file(),
@@ -367,6 +502,10 @@ mod tests {
     fn caps(sessions: Vec<DesktopSession>, x: &[&str], lockers: &[&str], pam: bool) -> Capabilities {
         Capabilities {
             distro: "Test Linux".to_owned(),
+            container: None,
+            gnome_supported: false,
+            gnome_sessions: Vec::new(),
+            gnome_launcher: None,
             logind: true,
             pam_service: pam,
             x_servers: x.iter().map(|s| (*s).to_owned()).collect(),
@@ -427,6 +566,61 @@ mod tests {
         ));
         assert!(
             v.iter().any(|x| matches!(x, Verdict::Warning(m) if m.contains("nothing will draw a lock screen"))),
+            "got {v:?}"
+        );
+    }
+
+    fn gnome_only(sessions: &[&str]) -> Capabilities {
+        let mut c = caps(vec![session("gnome", SessionKind::Wayland, true)], &[], &[], true);
+        c.gnome_supported = true;
+        c.gnome_launcher = Some("native");
+        c.gnome_sessions = sessions
+            .iter()
+            .map(|user| GnomeFound { user: (*user).to_owned(), runtime_dir: "/run/user/1000".to_owned() })
+            .collect();
+        c
+    }
+
+    /// GNOME 49+ (Vanilla OS, Fedora 43, Ubuntu 26.04 GNOME): no X at all,
+    /// and nothing missing — every login gets a GNOME session of its own,
+    /// whether or not anyone is at the console.
+    #[test]
+    fn a_gnome_only_machine_is_not_blocked() {
+        for console in [&["artur"][..], &[][..]] {
+            let v = verdicts(&gnome_only(console));
+            assert!(!v.iter().any(|x| matches!(x, Verdict::Blocker(_))), "got {v:?}");
+        }
+    }
+
+    #[test]
+    fn a_machine_with_neither_x_nor_gnome_shell_is_blocked() {
+        let mut c = gnome_only(&[]);
+        c.gnome_launcher = None;
+        let v = verdicts(&c);
+        assert!(
+            v.iter().any(|x| matches!(x, Verdict::Blocker(m) if m.contains("no GNOME Shell"))),
+            "got {v:?}"
+        );
+    }
+
+    #[test]
+    fn sessions_started_on_a_containers_host_warn_about_polkit() {
+        let mut c = gnome_only(&[]);
+        c.gnome_launcher = Some("host");
+        let v = verdicts(&c);
+        assert!(
+            v.iter().any(|x| matches!(x, Verdict::Warning(m) if m.contains("polkit"))),
+            "got {v:?}"
+        );
+    }
+
+    #[test]
+    fn a_container_is_named_with_what_it_means_for_passwords() {
+        let mut c = gnome_only(&["artur"]);
+        c.container = Some("apx-vso-native, podman rootless".to_owned());
+        let v = verdicts(&c);
+        assert!(
+            v.iter().any(|x| matches!(x, Verdict::Warning(m) if m.contains("apx-vso-native") && m.contains("passwd"))),
             "got {v:?}"
         );
     }

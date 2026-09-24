@@ -70,6 +70,11 @@ pub(crate) enum Binding {
     Greeter,
     /// A user's own desktop, after authentication.
     Session,
+    /// A user's own desktop served through its compositor (GNOME's, through
+    /// Mutter) rather than an X display. There is no display to name, so every
+    /// X path is refused — which is the point: the ambient display is still
+    /// somebody else's.
+    Compositor,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +92,8 @@ struct Bound {
     /// Which PulseAudio this worker may capture. `None` for the logon screen,
     /// which has no audio of its own and nothing to play.
     audio: Option<AudioTarget>,
+    /// The session's runtime dir as this process reaches it.
+    runtime_dir: String,
 }
 
 /// Which PulseAudio this worker may capture, and how to authenticate to it.
@@ -262,6 +269,47 @@ fn audio_for(user: &str, runtime_dir: &str) -> Option<AudioTarget> {
     }
 }
 
+/// Bind this worker to `user`'s desktop served through its compositor, after
+/// authentication. `desktop` names the kind (`gnome`) for the log and for the
+/// rebinding check.
+///
+/// No X display is involved and none may be reached: `display_name` refuses
+/// for this binding exactly as it does for an unbound worker. `runtime_dir`
+/// is where the session's bus was found — the host's, when linrdp runs in a
+/// container — and is where its audio lives too.
+pub(crate) fn bind_compositor(
+    desktop: &str,
+    user: &str,
+    runtime_dir: &str,
+    client_size: (u16, u16),
+) -> anyhow::Result<()> {
+    let audio = audio_for(user, runtime_dir);
+    let wanted = Bound {
+        kind: Binding::Compositor,
+        user: Some(user.to_owned()),
+        display: format!("{desktop}:{user}"),
+        xauthority: String::new(),
+        client_size,
+        audio,
+        runtime_dir: runtime_dir.to_owned(),
+    };
+    // Only the environment the audio path reads: a DISPLAY here would invite
+    // exactly the X connection this binding exists to rule out.
+    //
+    // SAFETY: as in `bind_kind`.
+    unsafe {
+        std::env::remove_var("DISPLAY");
+        std::env::set_var("XDG_RUNTIME_DIR", runtime_dir);
+        if let Some(audio) = &wanted.audio {
+            std::env::set_var("PULSE_COOKIE", &audio.cookie);
+        }
+    }
+    let mut cell = BOUND.lock().unwrap_or_else(|p| p.into_inner());
+    bind_into(&mut cell, wanted)?;
+    GENERATION.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
 /// Point this worker at the logon screen, before anyone has authenticated.
 pub(crate) fn bind_greeter(
     display: u16,
@@ -291,6 +339,7 @@ fn bind_kind(
         xauthority: xauthority.to_owned(),
         client_size,
         audio,
+        runtime_dir: runtime_dir.to_owned(),
     };
     // The subsystems that start later (clipboard, selection owner) read the
     // environment, so set it too — but the gate, not the environment, is what
@@ -345,7 +394,8 @@ fn bind_into(cell: &mut Option<Bound>, wanted: Bound) -> anyhow::Result<()> {
         Some(existing) if existing.display == wanted.display && existing.kind == wanted.kind => {}
         // The greeter is not anybody's desktop, so leaving it for the session
         // the login just proved is not a switch between users.
-        Some(existing) if existing.kind == Binding::Greeter && wanted.kind == Binding::Session => {}
+        Some(existing)
+            if existing.kind == Binding::Greeter && matches!(wanted.kind, Binding::Session | Binding::Compositor) => {}
         Some(existing) => anyhow::bail!(
             "this worker is already bound to {} ({:?}); refusing to rebind to {} ({:?})",
             existing.display,
@@ -371,6 +421,10 @@ pub(crate) fn display_name() -> anyhow::Result<String> {
         return Ok(std::env::var("DISPLAY").unwrap_or_else(|_| ":99".to_owned()));
     }
     match BOUND.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+        Some(bound) if bound.kind == Binding::Compositor => anyhow::bail!(
+            "this connection is served by {} through its compositor — there is no X display to reach",
+            bound.display
+        ),
         Some(bound) => Ok(bound.display.clone()),
         None => anyhow::bail!(
             "no session bound yet — refusing to touch a display, because the only \
@@ -384,6 +438,10 @@ pub(crate) fn clipboard_target() -> anyhow::Result<(String, String)> {
     if is_armed() {
         let bound = BOUND.lock().unwrap_or_else(|p| p.into_inner());
         let bound = bound.as_ref().ok_or_else(|| anyhow::anyhow!("no clipboard session bound"))?;
+        anyhow::ensure!(
+            bound.kind != Binding::Compositor,
+            "the X11 clipboard does not serve a desktop reached through its compositor"
+        );
         return Ok((bound.display.clone(), bound.xauthority.clone()));
     }
     if let Some(console) = console() {
@@ -451,6 +509,24 @@ pub(crate) fn connect() -> anyhow::Result<(x11rb::rust_connection::RustConnectio
         x11rb::rust_connection::RustConnection::connect_to_stream_with_auth_info(stream, screen, auth_name, auth_data)
             .with_context(|| format!("X11 setup for {name}"))?;
     Ok((conn, screen))
+}
+
+/// Where files pasted from the client go, when the default — the helper's
+/// temporary directory — is not somewhere the session can see.
+///
+/// A session started on the host of linrdp's container (a GNOME one, whose
+/// runtime dir is under `/run/host`) runs on the host, where the container's
+/// `/tmp` does not exist; the home directory is the one place both share.
+/// Every other session sees the same `/tmp` linrdp does.
+pub(crate) fn paste_base() -> Option<PathBuf> {
+    let bound = BOUND.lock().unwrap_or_else(|p| p.into_inner());
+    let bound = bound.as_ref()?;
+    if bound.kind != Binding::Compositor || !bound.runtime_dir.starts_with("/run/host/") {
+        return None;
+    }
+    let user = bound.user.as_deref()?;
+    let home = super::privilege::lookup_user(user).ok()?.home;
+    Some(Path::new(&home).join(".cache").join("linrdp"))
 }
 
 /// The desktop size this connection negotiated, once a session is bound.
@@ -527,14 +603,15 @@ mod tests {
             kind,
             user: match kind {
                 Binding::Greeter => None,
-                Binding::Session => Some("rdptest".to_owned()),
+                Binding::Session | Binding::Compositor => Some("rdptest".to_owned()),
             },
             display: display.to_owned(),
             xauthority: format!("/run/user/1000/linrdp/Xauthority{display}"),
             client_size: (1920, 1080),
+            runtime_dir: "/run/user/1002".to_owned(),
             audio: match kind {
                 Binding::Greeter => None,
-                Binding::Session => Some(AudioTarget::new("/run/user/1002", "/home/rdptest")),
+                Binding::Session | Binding::Compositor => Some(AudioTarget::new("/run/user/1002", "/home/rdptest")),
             },
         }
     }
@@ -648,6 +725,19 @@ mod tests {
 
         assert_eq!(cell.as_ref().map(|b| b.kind), Some(Binding::Session));
         assert_eq!(cell.as_ref().map(|b| b.display.as_str()), Some(":11"));
+    }
+
+    /// A login at the logon screen may land on a desktop served through its
+    /// compositor (a GNOME session) as well.
+    #[test]
+    fn the_greeter_may_hand_over_to_a_gnome_session() {
+        let mut cell = None;
+        bind_into(&mut cell, sample(Binding::Greeter, ":90")).expect("greeter binds");
+        bind_into(&mut cell, sample(Binding::Compositor, "gnome:rdptest")).expect("handover to GNOME");
+        assert!(
+            bind_into(&mut cell, sample(Binding::Session, ":12")).is_err(),
+            "a GNOME-bound worker must never move to an X session"
+        );
     }
 
     /// ...and only in that direction. A session must never be swapped for a

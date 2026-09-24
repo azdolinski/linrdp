@@ -14,6 +14,32 @@ Releasing is driven by this file: a push to `main` that adds a new
 ## [Unreleased]
 
 ### Added
+- GNOME on Wayland: every login gets a headless GNOME session of its own
+  (`gnome-shell --headless` on a private bus, a virtual monitor at the
+  client's exact size per connection), kept running and locked between
+  connections — the GNOME counterpart of the per-user X session, and the only
+  way to a desktop on GNOME 49+, which has no X11 session. If the same
+  account is at the console, the console is locked while it is in use
+  remotely. Apps open in the session; the account's keyring is relayed into
+  it (#1).
+- `mstsc /admin` reaches the console's GNOME session — only for the account
+  logged in at the console; anyone else is refused. The console is shown at
+  the client's exact resolution (a virtual monitor replaces the desk's while
+  connected), the desk is kept dark, and afterwards the desk gets its own
+  layout back and the session is locked again (#1).
+- Clipboard (text, images, files) for GNOME sessions, through Mutter's
+  remote-desktop clipboard (#1).
+- `session.backend: auto | x11 | gnome` — which kind of session of its own a
+  login gets. Desktops are cases (`session::backends`) behind one
+  compositor interface (`wayland::compositor`); see `docs/desktop-cases.md`
+  for the cases and the scenario matrix (#1).
+- Containers (distrobox, toolbox, Vanilla OS apx): GNOME sessions are
+  started on the host through `host-spawn`, and the host's buses and PipeWire
+  are reached under `/run/host`; `linrdp doctor` names the container and what
+  it means for passwords and polkit (#1).
+- `linrdp doctor` reports how GNOME sessions are started and who is at the
+  console, and no longer calls a missing X server a blocker where GNOME can
+  serve logins (#1).
 - Client Cluster Data (MS-RDPBCGR 2.2.1.3.5) reaches the connection handler
   (`ConnectionInfo::client_cluster`, `requests_console`), so a request for
   the console session (`mstsc /admin`) can be recognised (#1).
@@ -40,7 +66,9 @@ Releasing is driven by this file: a push to `main` that adds a new
   with only the library installed): linrdp brings a minimal one (#1).
 
 ### Changed
--
+- The `wayland` cargo feature is on by default. It adds no build-time
+  dependency: PipeWire is loaded at runtime. The `.deb` recommends
+  `libpipewire-0.3-modules` (#1).
 
 ---
 

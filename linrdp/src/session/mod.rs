@@ -2,6 +2,7 @@
 //!
 //! See `docs/superpowers/specs/2026-09-16-multi-session-design.md`.
 
+pub(crate) mod backends;
 pub(crate) mod detect;
 pub(crate) mod fileagent;
 pub(crate) mod display_alloc;
@@ -103,6 +104,19 @@ pub(crate) fn resolve_display(
 }
 
 
+/// What a case that starts sessions of its own asks the keeper for.
+pub(crate) struct KeeperSpec<'a> {
+    /// The case (`DesktopBackend::id`): the keeper runs its `serve_session`.
+    pub(crate) backend: &'static str,
+    /// How long the session may take to come up before the login gives up
+    /// on it.
+    pub(crate) ready_within: core::time::Duration,
+    /// What the case's keeper side needs to start the session, in its own
+    /// terms. Asked only when a session is actually created, never when one
+    /// is reattached.
+    pub(crate) start: &'a dyn Fn() -> String,
+}
+
 /// Start a session for `user` by handing it to a keeper process.
 ///
 /// The keeper, not this function, owns the session: it holds the PAM handle
@@ -118,6 +132,7 @@ fn create(
     password: &str,
     range: RangeInclusive<u16>,
     size: (u16, u16),
+    spec: &KeeperSpec<'_>,
     account: &AccountLock,
 ) -> anyhow::Result<registry::SessionRecord> {
     // Claim a number and KEEP the claim, then hand the descriptor holding it
@@ -128,22 +143,12 @@ fn create(
     // session.
     let lease = display_alloc::allocate(base, range)?;
     let display = lease.number;
-
-    let caps = detect::probe();
-    let session_exec = detect::choose_session(&caps.sessions, None)
-        .map(|s| s.exec.clone())
-        .unwrap_or_default();
-    if session_exec.is_empty() {
-        tracing::warn!(
-            "no runnable desktop session found — the user will get a bare X server. \
-             Run `linrdp doctor` to see why."
-        );
-    }
+    let start = (spec.start)();
 
     // From here the keeper owns the claim. On failure the lease is dropped
     // below, which releases it and frees the number again.
     let lock_fd = lease.into_handoff_fd();
-    let spawned = spawn_keeper(base, user, password, display, size, &session_exec, lock_fd, account)
+    let spawned = spawn_keeper(base, user, password, display, size, spec.backend, &start, lock_fd, account)
         .with_context(|| format!("start the session keeper for {user}"));
     // This process's copy of the descriptor has done its job: `flock` belongs
     // to the open file description, which the keeper inherited, so closing
@@ -157,7 +162,7 @@ fn create(
         return Err(error);
     }
 
-    keeper_main::wait_for_record(base, display, user, core::time::Duration::from_secs(20))
+    keeper_main::wait_for_record(base, display, user, spec.ready_within)
         .with_context(|| format!("session for {user} on :{display}"))
 }
 
@@ -168,7 +173,8 @@ fn spawn_keeper(
     password: &str,
     display: u16,
     size: (u16, u16),
-    session_exec: &str,
+    backend: &str,
+    start: &str,
     lock_fd: std::os::fd::RawFd,
     account: &AccountLock,
 ) -> anyhow::Result<()> {
@@ -202,8 +208,10 @@ fn spawn_keeper(
         .arg(base)
         .arg("--keeper-size")
         .arg(format!("{}x{}", size.0, size.1))
-        .arg("--keeper-exec")
-        .arg(session_exec)
+        .arg("--keeper-backend")
+        .arg(backend)
+        .arg("--keeper-start")
+        .arg(start)
         .arg("--keeper-account-fd")
         .arg("5")
         .arg("--keeper-lock-fd")
@@ -320,13 +328,30 @@ pub(crate) fn attach_or_create(
     password: &str,
     range: RangeInclusive<u16>,
     size: (u16, u16),
+    spec: &KeeperSpec<'_>,
 ) -> anyhow::Result<registry::SessionRecord> {
     let account = AccountLock::acquire(base, user)?;
     if let Some(existing) = attach_live(base, user, range.clone()) {
+        // One account, one session. Switching `session.backend` while a
+        // session runs must not quietly start a second desktop of the other
+        // kind, nor serve this one through the wrong path.
+        anyhow::ensure!(
+            existing.backend == spec.backend,
+            "{user} already has a running {} (slot {}), and this login would be served a {} \
+             — log out of it first, or set session.backend back",
+            described(&existing.backend),
+            existing.display,
+            described(spec.backend),
+        );
         tracing::info!(user, display = existing.display, "attached to the existing session");
         return Ok(existing);
     }
-    create(base, user, password, range, size, &account)
+    create(base, user, password, range, size, spec, &account)
+}
+
+/// A case's name as an operator reads it, for messages about sessions.
+fn described(backend: &str) -> &str {
+    backends::by_id(backend).map_or(backend, |case| case.describe())
 }
 
 
@@ -409,6 +434,8 @@ mod tests {
                 xauthority: "/run/user/1001/linrdp/Xauthority".to_owned(),
                 locked: false,
                 logind_id: None,
+                bus: None,
+                backend: backends::x11::ID.to_owned(),
             },
         )
         .expect("seed");
@@ -480,7 +507,8 @@ mod tests {
             std::io::stdin().read_to_end(&mut input).unwrap();
             let user = std::env::var("LINRDP_TEST_ACCOUNT_USER").unwrap();
             registry::write_record(&base, &registry::SessionRecord {
-                user, display: 51000, runtime_dir: "fixture".into(), xauthority: "fixture".into(), locked: false, logind_id: None,
+                user, display: 51000, runtime_dir: "fixture".into(), xauthority: "fixture".into(), locked: false, logind_id: None, bus: None,
+                backend: backends::x11::ID.to_owned(),
             }).unwrap();
             drop(account);
             return;

@@ -62,6 +62,11 @@ pub(crate) struct SessionRouter {
     /// `auth: greeter`: the client sends no credentials, so the server draws
     /// a logon screen and collects them there.
     greeter: bool,
+    /// `session.backend`: which kind of desktop a login is served.
+    backend: crate::session::backends::BackendChoice,
+    /// The client asked for the console session (`mstsc /admin`), as its
+    /// Client Cluster Data said. Set in `on_connection_info`.
+    console_requested: bool,
     /// The display this worker bound, so the disconnect path can lock it.
     ///
     /// Shared rather than a `Cell`: the logon screen binds from a thread of
@@ -93,6 +98,7 @@ impl SessionRouter {
         console: bool,
         fixed_size: Option<(u16, u16)>,
         greeter: bool,
+        backend: crate::session::backends::BackendChoice,
     ) -> Self {
         Self {
             inner,
@@ -102,6 +108,8 @@ impl SessionRouter {
             console,
             fixed_size,
             greeter,
+            backend,
+            console_requested: false,
             bound_display: Arc::new(Mutex::new(None)),
         }
     }
@@ -124,6 +132,8 @@ impl SessionRouter {
         let state_dir = self.state_dir.clone();
         let range = self.range.clone();
         let fixed_size = self.fixed_size;
+        let backend = self.backend;
+        let console_requested = self.console_requested;
         let bound_display = Arc::clone(&self.bound_display);
         std::thread::Builder::new()
             .name("linrdp-greeter".to_owned())
@@ -160,6 +170,8 @@ impl SessionRouter {
                                 state_dir,
                                 range,
                                 fixed_size,
+                                backend,
+                                console_requested,
                                 bound_display,
                             },
                             &user,
@@ -194,6 +206,8 @@ impl SessionRouter {
                 state_dir: self.state_dir.clone(),
                 range: self.range.clone(),
                 fixed_size: self.fixed_size,
+                backend: self.backend,
+                console_requested: self.console_requested,
                 bound_display: Arc::clone(&self.bound_display),
             },
             user,
@@ -208,6 +222,8 @@ struct Binding {
     state_dir: PathBuf,
     range: RangeInclusive<u16>,
     fixed_size: Option<(u16, u16)>,
+    backend: crate::session::backends::BackendChoice,
+    console_requested: bool,
     bound_display: Arc<Mutex<Option<BoundSession>>>,
 }
 
@@ -229,50 +245,28 @@ fn bind_to_desktop(
     // taken still got its desktop back with the old password.
     crate::auth::authorize_for_desktop(user, password)?;
 
-    // A session's X server is created at the LARGEST desktop we serve, not at
-    // this client's size: `-screen 0 WxH` is also Xvfb's RandR maximum and
-    // cannot grow afterwards, so a session born at one client's size could
-    // never fit the next one. The capture path scales the screen down to
-    // `client_size` when it connects. `session.fixed_size` still wins when the
-    // operator pinned a geometry.
-    let size = binding.fixed_size.unwrap_or(crate::session::SESSION_SCREEN_MAX);
-    let rec = crate::session::attach_or_create(
-        &binding.state_dir,
+    // Which kind of desktop this account gets. Decided per login, not per
+    // process: on one machine one account may be logged in to GNOME and the
+    // next one not, and each gets the case that fits it.
+    let login = crate::session::backends::Login {
         user,
         password,
-        binding.range.clone(),
-        size,
-    )?;
-
-    // The record must name the account that just authenticated. Session
-    // creation races used to make this untrue: two logins could probe the
-    // same display number, and the loser then read the winner's record and
-    // bound to a desktop that was not its own.
-    anyhow::ensure!(
-        rec.user == user,
-        "the session on :{} belongs to {}, not to {user} — refusing to bind",
-        rec.display,
-        rec.user
-    );
-
-    // The gate, not the environment, is what the capture and input paths
-    // trust. Binding also sets the environment for the subsystems that start
-    // later and read it (clipboard, selection owner).
-    crate::session::gate::bind(&rec.user, rec.display, &rec.xauthority, &rec.runtime_dir, client_size)?;
-    // The user just proved who they are, so the desktop is theirs to see.
-    // Unlocking is recorded rather than assumed, so a later disconnect — or a
-    // supervisor restart — can put it back.
-    if rec.locked {
-        crate::session::unlock(&binding.state_dir, &rec)?;
-    }
-    *binding.bound_display.lock().unwrap_or_else(|p| p.into_inner()) = Some(BoundSession {
-        display: rec.display,
-        logind_id: rec.logind_id.clone(),
-    });
-    tracing::info!(user, display = rec.display, "routed to the user's desktop");
-    Ok(())
+        client_size,
+        fixed_size: binding.fixed_size,
+        state_dir: &binding.state_dir,
+        range: binding.range.clone(),
+        bound: &binding.bound_display,
+    };
+    let (case, bind) = crate::session::backends::choose(
+        crate::session::backends::REGISTRY,
+        binding.backend,
+        binding.console_requested,
+        |case| case.probe(&login),
+    )
+    .map_err(|reason| anyhow::anyhow!("no desktop for {user}: {reason}"))?;
+    tracing::info!(user, backend = case.describe(), case = case.id(), "desktop case chosen");
+    bind(&login)
 }
-
 
 impl ironrdp_server::ConnectionHandler for SessionRouter {
     fn on_accept(&mut self, peer: core::net::SocketAddr) -> bool {
@@ -280,6 +274,15 @@ impl ironrdp_server::ConnectionHandler for SessionRouter {
     }
 
     fn on_connection_info(&mut self, info: &ironrdp_server::ConnectionInfo) {
+        self.console_requested = info.requests_console();
+        if let Some(cluster) = &info.client_cluster {
+            tracing::info!(
+                flags = format!("{:#x}", cluster.flags.bits()),
+                redirected_session_id = cluster.redirected_session_id,
+                console_requested = self.console_requested,
+                "client cluster data"
+            );
+        }
         if self.console {
             // Console mode opens no PAM session and creates no desktop of its
             // own, so nothing downstream would ever ask whether this account
@@ -342,6 +345,12 @@ impl ironrdp_server::ConnectionHandler for SessionRouter {
         // Lock on the way out. A desktop whose client is gone must not be
         // walked into by the next connection, which is the whole point of
         // sessions that outlive their connections.
+        // A desktop served through its compositor goes back behind its own
+        // lock screen, if linrdp took it down for this login.
+        #[cfg(feature = "wayland")]
+        if let Some(desktop) = crate::wayland::compositor::active() {
+            desktop.relock();
+        }
         let bound = self.bound_display.lock().unwrap_or_else(|p| p.into_inner()).clone();
         if let Some(bound) = bound {
             if let Err(error) =

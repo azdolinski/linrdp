@@ -21,6 +21,8 @@ mod input;
 mod mic;
 mod pam;
 mod sam;
+#[cfg(feature = "wayland")]
+mod secrets_bridge;
 mod cli;
 mod daemon;
 mod logging;
@@ -141,6 +143,20 @@ fn main() -> anyhow::Result<()> {
         return file_agent_main();
     }
 
+    // The Secret Service relay of a headless GNOME session: started by its
+    // keeper, as the session's user, for as long as the session's bus lives.
+    #[cfg(feature = "wayland")]
+    if std::env::args().any(|arg| arg == "--secrets-bridge") {
+        let mut args = pico_args::Arguments::from_env();
+        let _ = args.contains("--secrets-bridge");
+        let from: PathBuf = args.value_from_str("--from")?;
+        let to: PathBuf = args.value_from_str("--to")?;
+        if let Ok(config) = config::load_strict(config::path()) {
+            setup_helper_logging(&config.log);
+        }
+        return secrets_bridge::run(&from, &to);
+    }
+
     // Credential capture, invoked by `pam_exec` from the system PAM stack on
     // every authentication this machine performs. Handled here, before any
     // runtime is built: a `su` at the console should not be paying for a
@@ -210,7 +226,13 @@ fn keeper_main() -> anyhow::Result<()> {
     let display_number: u16 = args.value_from_str("--keeper-display")?;
     let state_dir = session::keeper_main::state_dir_from(args.opt_value_from_str("--keeper-state-dir")?);
     let size_spec: String = args.opt_value_from_str("--keeper-size")?.unwrap_or_else(|| "1920x1080".to_owned());
-    let session_exec: String = args.opt_value_from_str("--keeper-exec")?.unwrap_or_default();
+    // The case that runs this session, and what it needs to start it. The
+    // case is resolved here, before the fork below, so a worker asking for one
+    // this build cannot run hears so at once instead of at its timeout.
+    let backend_id: String = args.value_from_str("--keeper-backend")?;
+    let backend = session::backends::by_id(&backend_id)
+        .with_context(|| format!("--keeper-backend: this build has no desktop backend called {backend_id}"))?;
+    let start: String = args.opt_value_from_str("--keeper-start")?.unwrap_or_default();
     // The descriptor the worker placed this display's claim on. Required:
     // without it the keeper would have to re-claim the number, which is the
     // window two logins used to race through.
@@ -271,7 +293,8 @@ fn keeper_main() -> anyhow::Result<()> {
         display: display_number,
         state_dir,
         size,
-        session_exec,
+        backend,
+        start,
         lock_fd,
         account_fd,
     };
@@ -659,16 +682,16 @@ async fn serve() -> anyhow::Result<()> {
             let restore_token = std::fs::read_to_string("/var/lib/linrdp/portal-restore-token").ok();
             let handles = wayland::portal::PortalSession::connect(restore_token.as_deref())
                 .await
-                .expect("portal session failed");
+                .context("xdg-desktop-portal session failed")?;
             let capture =
                 wayland::pipewire::PwCapture::start(handles.pipewire_fd, handles.stream.node_id, None, None)
-                    .expect("pipewire capture failed");
+                    .context("PipeWire capture of the portal's stream failed")?;
             let input = match handles.eis_fd {
                 Some(fd) => wayland::ei::EiInputHandler::new(
                     fd,
                     (handles.stream.width, handles.stream.height),
                 )
-                .expect("libei setup failed"),
+                .context("libei setup over the portal's EIS descriptor failed")?,
                 None => {
                     anyhow::bail!("portal has no ConnectToEIS - Wayland input unavailable (update xdg-desktop-portal)");
                 }
@@ -696,7 +719,16 @@ async fn serve() -> anyhow::Result<()> {
                 // A worker must not bind to a display before it knows whose
                 // desktop it serves; the factory connects on the first frame,
                 // after the router has set $DISPLAY.
-                Arc::new(capture::X11DisplayFactory::deferred(fixed_size))
+                let x11: Arc<dyn gfx_display::DisplaySourceFactory> =
+                    Arc::new(capture::X11DisplayFactory::deferred(fixed_size));
+                // Which case serves this login is decided by the router after
+                // authentication; until then, and for every X11 login, this is
+                // the X11 factory above. A login served through its compositor
+                // moves it to that desktop's stream.
+                #[cfg(feature = "wayland")]
+                let x11: Arc<dyn gfx_display::DisplaySourceFactory> =
+                    Arc::new(wayland::compositor::SessionDisplayFactory::new(x11));
+                x11
             } else {
                 Arc::new(capture::X11DisplayFactory::new(
                     X11Display::connect(fixed_size).expect("X11 display unavailable"),
@@ -828,6 +860,7 @@ async fn serve() -> anyhow::Result<()> {
                     console_mode,
                     fixed_size,
                     greeter_mode,
+                    effective.session.backend,
                 )) as Box<dyn ironrdp_server::ConnectionHandler>
             } else {
                 lifecycle
@@ -942,6 +975,11 @@ enum AnyInput {
     DeferredX11(Option<X11InputHandler>, DeferredInputLog, u64),
     #[cfg(feature = "wayland")]
     Wayland(wayland::ei::EiInputHandler),
+    /// A deferred worker the router attached to a desktop served through its
+    /// compositor (see `wayland::compositor`). Entered from `DeferredX11` on
+    /// the first event after the attach, never before it.
+    #[cfg(feature = "wayland")]
+    Compositor(Box<dyn ironrdp_server::RdpServerInputHandler>),
 }
 
 
@@ -1009,7 +1047,19 @@ impl AnyInput {
                 slot.as_mut()
             }
             #[cfg(feature = "wayland")]
-            Self::Wayland(_) => None,
+            Self::Wayland(_) | Self::Compositor(_) => None,
+        }
+    }
+
+    /// Move a deferred worker onto the desktop the router attached through its
+    /// compositor, if it attached one. Only a deferred worker moves: it is the
+    /// one whose desktop is decided after authentication.
+    #[cfg(feature = "wayland")]
+    fn follow_compositor(&mut self) {
+        if matches!(self, Self::DeferredX11(..)) {
+            if let Some(desktop) = wayland::compositor::active() {
+                *self = Self::Compositor(desktop.input());
+            }
         }
     }
 }
@@ -1017,9 +1067,13 @@ impl AnyInput {
 impl ironrdp_server::RdpServerInputHandler for AnyInput {
     fn keyboard(&mut self, event: ironrdp_server::KeyboardEvent) {
         #[cfg(feature = "wayland")]
-        if let Self::Wayland(handler) = self {
-            handler.keyboard(event);
-            return;
+        {
+            self.follow_compositor();
+            match self {
+                Self::Wayland(handler) => return handler.keyboard(event),
+                Self::Compositor(handler) => return handler.keyboard(event),
+                _ => {}
+            }
         }
         if let Some(handler) = self.x11() {
             handler.keyboard(event);
@@ -1028,9 +1082,13 @@ impl ironrdp_server::RdpServerInputHandler for AnyInput {
 
     fn mouse(&mut self, event: ironrdp_server::MouseEvent) {
         #[cfg(feature = "wayland")]
-        if let Self::Wayland(handler) = self {
-            handler.mouse(event);
-            return;
+        {
+            self.follow_compositor();
+            match self {
+                Self::Wayland(handler) => return handler.mouse(event),
+                Self::Compositor(handler) => return handler.mouse(event),
+                _ => {}
+            }
         }
         if let Some(handler) = self.x11() {
             handler.mouse(event);

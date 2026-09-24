@@ -21,6 +21,7 @@ use crate::config::{Auth, Config, DisplayRange, Listener, Size};
 /// overridden on one listener.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Setting {
+    Backend,
     DisplayRange,
     FixedSize,
     LockOnDisconnect,
@@ -46,6 +47,7 @@ impl Setting {
     /// the documented default.
     pub(crate) fn schema(self) -> &'static str {
         match self {
+            Self::Backend => "session.backend",
             Self::DisplayRange => "session.display_range",
             Self::FixedSize => "session.fixed_size",
             Self::LockOnDisconnect => "session.lock_on_disconnect",
@@ -74,6 +76,7 @@ impl Setting {
 
     fn get(self, config: &Config) -> String {
         match self {
+            Self::Backend => config.session.backend.to_string(),
             Self::DisplayRange => config.session.display_range.to_string(),
             Self::FixedSize => opt(config.session.fixed_size.map(|s| s.to_string())),
             Self::LockOnDisconnect => config.session.lock_on_disconnect.to_string(),
@@ -97,6 +100,7 @@ impl Setting {
 
     fn set(self, config: &mut Config, raw: &str) -> anyhow::Result<()> {
         match self {
+            Self::Backend => config.session.backend = parse_backend(raw)?,
             Self::DisplayRange => config.session.display_range = raw.parse::<DisplayRange>()?,
             Self::FixedSize => config.session.fixed_size = parse_opt::<Size>(raw)?,
             Self::LockOnDisconnect => config.session.lock_on_disconnect = parse_bool(raw)?,
@@ -125,6 +129,7 @@ impl Setting {
     fn override_of(self, config: &Config, listener: usize) -> Option<String> {
         let overrides = config.listeners.get(listener)?.overrides.as_ref()?;
         match self {
+            Self::Backend => overrides.session.as_ref()?.backend.map(|v| v.to_string()),
             Self::FixedSize => overrides
                 .session
                 .as_ref()?
@@ -319,6 +324,7 @@ impl Model {
             &mut rows,
             "session",
             &[
+                Setting::Backend,
                 Setting::DisplayRange,
                 Setting::FixedSize,
                 Setting::LockOnDisconnect,
@@ -512,7 +518,8 @@ impl Model {
 }
 
 /// Every global key, in the order the file writes them.
-pub(crate) const ALL_SETTINGS: [Setting; 15] = [
+pub(crate) const ALL_SETTINGS: [Setting; 16] = [
+    Setting::Backend,
     Setting::DisplayRange,
     Setting::FixedSize,
     Setting::LockOnDisconnect,
@@ -542,6 +549,10 @@ fn set_override(config: &mut Config, index: usize, key: Setting, raw: Option<&st
     let overrides = listener.overrides.get_or_insert_with(Default::default);
 
     match key {
+        Setting::Backend => {
+            let session = overrides.session.get_or_insert_with(Default::default);
+            session.backend = raw.map(parse_backend).transpose()?;
+        }
         Setting::FixedSize => {
             let session = overrides.session.get_or_insert_with(Default::default);
             session.fixed_size = raw.map(parse_opt::<Size>).transpose()?;
@@ -612,7 +623,8 @@ fn set_override(config: &mut Config, index: usize, key: Setting, raw: Option<&st
 
 fn is_empty_override(overrides: &crate::config::Overrides) -> bool {
     let session_empty = overrides.session.as_ref().is_none_or(|session| {
-        session.display_range.is_none()
+        session.backend.is_none()
+            && session.display_range.is_none()
             && session.fixed_size.is_none()
             && session.lock_on_disconnect.is_none()
             && session.switch_to_greeter.is_none()
@@ -912,4 +924,12 @@ mod tests {
 
         assert!(model.selected().is_some(), "the cursor is on a row that exists");
     }
+}
+
+fn parse_backend(raw: &str) -> anyhow::Result<crate::session::backends::BackendChoice> {
+    use crate::session::backends::BackendChoice;
+    BackendChoice::parse(raw).ok_or_else(|| {
+        let names: Vec<&str> = BackendChoice::ALL.iter().map(|c| c.as_str()).collect();
+        anyhow::anyhow!("session.backend is one of {}, not `{}`", names.join(", "), raw.trim())
+    })
 }
