@@ -17,6 +17,11 @@ Releasing is driven by this file: a push to `main` that adds a new
 -
 
 ### Fixed
+- Sound: a microphone source the sound server refuses no longer takes the
+  session's sound with it; the FIFO path is given to a host's sound server in
+  the host's own spelling (linrdp in a distrobox/apx container); a sound
+  server shared with another session gets its default output back on
+  disconnect (#1).
 - PipeWire capture (`features.wayland`) never worked: `pw_init` was never
   called, `spa_hook` was one pointer short (heap corruption), four SPA
   constants were hand-counted wrong (`pw_stream_connect` → `-EPROTO`),
