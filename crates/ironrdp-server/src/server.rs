@@ -744,6 +744,20 @@ pub struct RdpServer {
     /// [`ServerEvent::SoftSyncToUdp`] once the embedder's RDP-UDP accept
     /// completed. `None` = no tunnel (all DVC traffic stays on TCP).
     udp_tunnel_tx: Option<mpsc::Sender<Vec<u8>>>,
+    /// Whether the client has confirmed the multitransport tunnel with a
+    /// successful Initiate Multitransport Response (MS-RDPBCGR 2.2.15.2).
+    ///
+    /// MS-RDPEDYC 3.3.5.3.1: the Soft-Sync Request MUST NOT be sent before
+    /// that response. The RDP-UDP handshake usually completes first, and
+    /// sending Soft-Sync then — which this server did on every connection —
+    /// is mostly tolerated by mstsc, but not when it lands while the EGFX
+    /// channel is being set up: mstsc then resets the TCP connection
+    /// (`write dvc messages: Connection reset by peer`, 0.46 s into the
+    /// session, reproduced against a GNOME session on 2026-09-23).
+    multitransport_confirmed: bool,
+    /// A tunnel that came up before the client confirmed it: Soft-Sync waits
+    /// here until the response arrives.
+    pending_soft_sync: Option<mpsc::Sender<Vec<u8>>>,
     heartbeat: Option<HeartbeatConfig>,
     /// Whether the client set RNS_UD_CS_SUPPORT_ERRINFO_PDU in its Client
     /// Core Data `earlyCapabilityFlags`. MS-RDPBCGR 3.3.5.7.1: the Set Error
@@ -1549,6 +1563,8 @@ impl RdpServer {
             local_addr: None,
             autodetect: None,
             udp_tunnel_tx: None,
+            multitransport_confirmed: false,
+            pending_soft_sync: None,
             heartbeat: None,
             client_supports_errinfo: false,
             client_fastpath_output: true,
@@ -2803,6 +2819,53 @@ impl RdpServer {
     /// Write DVC (DRDYNVC) messages: unframed through the UDP tunnel once the
     /// client's Soft-Sync response confirmed the migration, otherwise framed
     /// on the TCP drdynvc channel.
+    /// Bind the UDP tunnel and ask the client (via TCP DVC Soft-Sync) to move
+    /// every open dynamic channel to it.
+    async fn soft_sync(
+        &mut self,
+        to_tunnel: mpsc::Sender<Vec<u8>>,
+        writer: &mut impl FramedWrite,
+        user_channel_id: u16,
+    ) -> ServerResult<()> {
+        self.udp_tunnel_tx = Some(to_tunnel);
+        let Some(drdynvc) = self.get_svc_processor::<dvc::DrdynvcServer>() else {
+            warn!("Soft-sync requested but DRDYNVC channel is gone; ignoring");
+            return Ok(());
+        };
+        let ids = drdynvc.open_channel_ids();
+        if ids.is_empty() {
+            warn!("Soft-sync requested but no dynamic channel is open; ignoring");
+            return Ok(());
+        }
+        let request = drdynvc
+            .request_reliable_udp(ids.clone())
+            .map_err_kind("request reliable udp", ServerErrorKind::Pdu)?;
+        info!(channels = ?ids, "Sending DVC Soft-Sync request (TCP→UDP migration)");
+        self.write_dvc_messages(vec![request], writer, user_channel_id).await
+    }
+
+    /// Record the client's Initiate Multitransport Response.
+    fn on_multitransport_response(&mut self, hr_response: u32) {
+        if hr_response == 0 {
+            self.multitransport_confirmed = true;
+        } else {
+            // The client could not bring the tunnel up: everything stays on
+            // TCP, and a tunnel we built anyway is not to be used.
+            warn!(hr_response = format!("{hr_response:#010X}"), "client refused the multitransport tunnel");
+            self.pending_soft_sync = None;
+        }
+    }
+
+    /// Send a Soft-Sync that was waiting for the client's confirmation.
+    async fn resume_soft_sync(&mut self, writer: &mut impl FramedWrite, user_channel_id: u16) -> ServerResult<()> {
+        if self.multitransport_confirmed
+            && let Some(to_tunnel) = self.pending_soft_sync.take()
+        {
+            self.soft_sync(to_tunnel, writer, user_channel_id).await?;
+        }
+        Ok(())
+    }
+
     async fn write_dvc_messages(
         &mut self,
         messages: Vec<SvcMessage>,
@@ -3075,23 +3138,12 @@ impl RdpServer {
                         .map_err(|e| ServerError::io("write_all", e))?;
                 }
                 ServerEvent::SoftSyncToUdp { to_tunnel } => {
-                    // Bind the UDP tunnel and ask the client (via TCP DVC
-                    // Soft-Sync) to move every open dynamic channel to it.
-                    self.udp_tunnel_tx = Some(to_tunnel);
-                    let Some(drdynvc) = self.get_svc_processor::<dvc::DrdynvcServer>() else {
-                        warn!("Soft-sync requested but DRDYNVC channel is gone; ignoring");
-                        continue;
-                    };
-                    let ids = drdynvc.open_channel_ids();
-                    if ids.is_empty() {
-                        warn!("Soft-sync requested but no dynamic channel is open; ignoring");
-                        continue;
+                    if self.multitransport_confirmed {
+                        self.soft_sync(to_tunnel, writer, user_channel_id).await?;
+                    } else {
+                        info!("RDP-UDP tunnel ready before the client confirmed it; deferring Soft-Sync");
+                        self.pending_soft_sync = Some(to_tunnel);
                     }
-                    let request = drdynvc
-                        .request_reliable_udp(ids.clone())
-                        .map_err_kind("request reliable udp", ServerErrorKind::Pdu)?;
-                    info!(channels = ?ids, "Sending DVC Soft-Sync request (TCP→UDP migration)");
-                    self.write_dvc_messages(vec![request], writer, user_channel_id).await?;
                 }
                 ServerEvent::UdpTunnelData(frame) => {
                     let Some(drdynvc) = self.get_svc_processor::<dvc::DrdynvcServer>() else {
@@ -3825,6 +3877,8 @@ impl RdpServer {
         }
 
         self.udp_tunnel_tx = None;
+        self.multitransport_confirmed = false;
+        self.pending_soft_sync = None;
         self.static_channels = result.static_channels;
         if !result.reactivation {
             for (_channel_key, channel, channel_id) in self.static_channels.iter_by_key_mut() {
@@ -4171,6 +4225,7 @@ impl RdpServer {
                                         hr_response = format!("{:#010X}", pdu.hr_response),
                                         "Received Multitransport Response"
                                     );
+                                    self.on_multitransport_response(pdu.hr_response);
                                     return Ok(false);
                                 }
                                 Err(e) => {
@@ -4273,6 +4328,7 @@ impl RdpServer {
                                 hr_response = format!("{:#010X}", pdu.hr_response),
                                 "Received Multitransport Response"
                             );
+                            self.on_multitransport_response(pdu.hr_response);
                         }
                         Err(e) => {
                             warn!(error = format!("{e:#}"), "Malformed Multitransport Response; ignoring");
@@ -4350,11 +4406,14 @@ impl RdpServer {
                     "McsMessage::SendDataRequest"
                 );
                 if data.channel_id == io_channel_id {
-                    return self.handle_io_channel_data(data).await;
+                    let result = self.handle_io_channel_data(data).await;
+                    self.resume_soft_sync(writer, user_channel_id).await?;
+                    return result;
                 }
 
                 if message_channel_id == Some(data.channel_id) {
                     self.handle_message_channel_data(data);
+                    self.resume_soft_sync(writer, user_channel_id).await?;
                     return Ok(false);
                 }
 

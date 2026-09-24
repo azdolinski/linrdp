@@ -126,6 +126,9 @@ impl ConnectionHandler for SessionController {
             %peer,
             ?duration,
             had_error = error.is_some(),
+            // The cause, not only that there was one: "had_error=true" on its
+            // own is what a dropped first connection left to go on.
+            error = error.map(|e| format!("{e:#}")).unwrap_or_default(),
             remaining = after,
             "client disconnected"
         );

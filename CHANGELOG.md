@@ -24,6 +24,11 @@ Releasing is driven by this file: a push to `main` that adds a new
   compared against the wrong value, a format without a frame yet produced an
   empty grab, and a padded stride was not honoured. Every constant is now the
   value the C headers give (#1).
+- An occasional disconnect right after login (`Connection reset by peer`
+  from mstsc, under half a second in): the DVC Soft-Sync to the UDP transport
+  was sent before the client's Initiate Multitransport Response, which
+  MS-RDPEDYC 3.3.5.3.1 forbids; it now waits for it. A disconnect's cause is
+  logged with it (#1).
 - PipeWire capture on machines without a system `client.conf` (a container
   with only the library installed): linrdp brings a minimal one (#1).
 
