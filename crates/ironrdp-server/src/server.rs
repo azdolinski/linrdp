@@ -2827,19 +2827,23 @@ impl RdpServer {
         writer: &mut impl FramedWrite,
         user_channel_id: u16,
     ) -> ServerResult<()> {
-        self.udp_tunnel_tx = Some(to_tunnel);
         let Some(drdynvc) = self.get_svc_processor::<dvc::DrdynvcServer>() else {
             warn!("Soft-sync requested but DRDYNVC channel is gone; ignoring");
             return Ok(());
         };
         let ids = drdynvc.open_channel_ids();
         if ids.is_empty() {
-            warn!("Soft-sync requested but no dynamic channel is open; ignoring");
+            // The client can confirm the tunnel before it has opened a single
+            // dynamic channel. Dropping the Soft-Sync then left the whole
+            // connection on TCP; keep it until a channel is open instead.
+            debug!("Soft-sync ready but no dynamic channel is open yet; waiting for one");
+            self.pending_soft_sync = Some(to_tunnel);
             return Ok(());
         }
         let request = drdynvc
             .request_reliable_udp(ids.clone())
             .map_err_kind("request reliable udp", ServerErrorKind::Pdu)?;
+        self.udp_tunnel_tx = Some(to_tunnel);
         info!(channels = ?ids, "Sending DVC Soft-Sync request (TCP→UDP migration)");
         self.write_dvc_messages(vec![request], writer, user_channel_id).await
     }
@@ -4428,6 +4432,9 @@ impl RdpServer {
                         // After Soft-Sync, DVC responses must follow the
                         // client to the UDP tunnel, not the TCP channel.
                         self.write_dvc_messages(response_pdus, writer, user_channel_id).await?;
+                        // A channel the client just confirmed may be the one
+                        // a waiting Soft-Sync needs.
+                        self.resume_soft_sync(writer, user_channel_id).await?;
                     } else {
                         let response = server_encode_svc_messages(response_pdus, data.channel_id, user_channel_id)
                             .map_err(ServerError::encode)?;
