@@ -603,7 +603,7 @@ fn stream_from(
     let fifo = target
         .map(|t| t.mic_fifo())
         .or_else(crate::session::gate::mic_fifo);
-    ensure_objects(&mut mainloop, &mut context, fifo.as_deref())?;
+    let previous = ensure_objects(&mut mainloop, &mut context, fifo.as_deref())?;
 
     let mut map = pulse::channelmap::Map::default();
     map.init_stereo();
@@ -737,6 +737,15 @@ fn stream_from(
     }
 
     stream.disconnect().ok();
+    // A daemon this session shares with another — the account's own, when a
+    // GNOME session runs beside the console — gets its default output back,
+    // so the desk is not left playing into a sink nobody listens to.
+    if let Some(previous) = previous {
+        match set_default(&mut mainloop, &mut context, Object::Sink, &previous) {
+            Ok(()) => tracing::info!(sink = %previous, "[audio-capture] default output given back"),
+            Err(error) => tracing::debug!(%error, "[audio-capture] could not give the default output back"),
+        }
+    }
     context.disconnect();
     tracing::info!("[audio-capture] detached from {}", server.unwrap_or("the default daemon"));
     Ok(())
@@ -754,24 +763,73 @@ fn stream_from(
 /// rate we capture at. Recording "the default source" instead would capture
 /// [`MIC_SOURCE`] the moment it is made default: an echo loop by
 /// construction.
-fn ensure_objects(mainloop: &mut PaMainloop, context: &mut PaContext, fifo: Option<&Path>) -> anyhow::Result<()> {
+///
+/// Returns the default output the daemon had before, when it was another —
+/// to be given back on detach.
+fn ensure_objects(
+    mainloop: &mut PaMainloop,
+    context: &mut PaContext,
+    fifo: Option<&Path>,
+) -> anyhow::Result<Option<String>> {
     if !has_object(mainloop, context, Object::Sink, SINK)? {
         load_module(mainloop, context, "module-null-sink", &null_sink_args())?;
         tracing::info!(sink = SINK, "[audio-capture] created this session's sink");
     }
+    let previous = default_sink(mainloop, context).filter(|name| name != SINK);
     set_default(mainloop, context, Object::Sink, SINK)?;
 
     // No FIFO means no microphone for this attachment, which is a complete
     // answer: the output direction does not depend on it.
     let Some(fifo) = fifo else {
-        return Ok(());
+        return Ok(previous);
     };
+    // Nor does a microphone that cannot be made: losing the client's
+    // microphone must never cost the session its sound, which is what a
+    // refused pipe source used to do.
+    if let Err(error) = ensure_microphone(mainloop, context, fifo) {
+        tracing::warn!(error = format!("{error:#}"), "[audio-capture] no microphone for this session — sound still plays");
+    }
+    Ok(previous)
+}
+
+fn ensure_microphone(mainloop: &mut PaMainloop, context: &mut PaContext, fifo: &Path) -> anyhow::Result<()> {
     if !has_object(mainloop, context, Object::Source, MIC_SOURCE)? {
+        prepare_fifo_dir(fifo);
         load_module(mainloop, context, "module-pipe-source", &pipe_source_args(fifo))?;
         tracing::info!(source = MIC_SOURCE, fifo = %fifo.display(), "[audio-capture] created this session's microphone");
     }
-    set_default(mainloop, context, Object::Source, MIC_SOURCE)?;
-    Ok(())
+    set_default(mainloop, context, Object::Source, MIC_SOURCE)
+}
+
+/// The daemon creates the FIFO but not the directory it goes in. A keeper's
+/// X session has made it already; a GNOME session's runtime dir may not have
+/// it, so make it here, owned by the session's user, who the daemon runs as.
+fn prepare_fifo_dir(fifo: &Path) {
+    let Some(dir) = fifo.parent() else { return };
+    if dir.exists() {
+        return;
+    }
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    if let Some(ids) = crate::session::gate::session_user()
+        .and_then(|user| crate::session::privilege::lookup_user(&user).ok())
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::os::unix::fs::chown(dir, Some(ids.uid), Some(ids.gid));
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+/// The daemon's default output, by name.
+fn default_sink(mainloop: &mut PaMainloop, context: &PaContext) -> Option<String> {
+    let found = Rc::new(RefCell::new(None));
+    let slot = Rc::clone(&found);
+    let op = context.introspect().get_server_info(move |info| {
+        *slot.borrow_mut() = info.default_sink_name.as_ref().map(|n| n.to_string());
+    });
+    pump(mainloop, &op, "read the default output").ok()?;
+    found.take()
 }
 
 /// Arguments for the null sink this session's desktop plays into.
@@ -790,8 +848,21 @@ fn null_sink_args() -> String {
 fn pipe_source_args(fifo: &Path) -> String {
     format!(
         "source_name={MIC_SOURCE} file={} format=s16le rate={SAMPLE_RATE} channels={CHANNELS}",
-        fifo.display()
+        daemon_path(fifo).display()
     )
+}
+
+/// `path` as the daemon sees it.
+///
+/// From a distrobox/toolbox/apx container, the host's runtime dir is under
+/// `/run/host`, but the daemon runs on the host and knows it without the
+/// prefix: handed the container's spelling, it refused to create a file in a
+/// directory that, for it, does not exist.
+fn daemon_path(path: &Path) -> std::path::PathBuf {
+    match path.strip_prefix("/run/host") {
+        Ok(rest) if path.starts_with("/run/host/run/user/") => Path::new("/").join(rest),
+        _ => path.to_path_buf(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -908,6 +979,21 @@ fn iterate(mainloop: &mut PaMainloop, what: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// The daemon of a GNOME session started on a container's host is the
+    /// host's, and would refuse the container's spelling of its own dir.
+    #[test]
+    fn a_host_daemon_is_given_the_hosts_path() {
+        use std::path::Path;
+        assert_eq!(
+            super::daemon_path(Path::new("/run/host/run/user/1000/linrdp/mic.fifo")),
+            Path::new("/run/user/1000/linrdp/mic.fifo")
+        );
+        assert_eq!(
+            super::daemon_path(Path::new("/run/user/1001/linrdp/mic.fifo")),
+            Path::new("/run/user/1001/linrdp/mic.fifo")
+        );
+    }
+
     use super::*;
 
     /// The sink is created at the rate the capture spec asks for, so the
