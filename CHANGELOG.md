@@ -14,7 +14,9 @@ Releasing is driven by this file: a push to `main` that adds a new
 ## [Unreleased]
 
 ### Added
--
+- Client Cluster Data (MS-RDPBCGR 2.2.1.3.5) reaches the connection handler
+  (`ConnectionInfo::client_cluster`, `requests_console`), so a request for
+  the console session (`mstsc /admin`) can be recognised (#1).
 
 ### Fixed
 - Sound: a microphone source the sound server refuses no longer takes the

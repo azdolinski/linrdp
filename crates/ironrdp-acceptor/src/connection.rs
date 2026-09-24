@@ -35,6 +35,7 @@ pub struct Acceptor {
     keyboard_layout: u32,
     keyboard_type: gcc::KeyboardType,
     ime_file_name: String,
+    client_cluster: Option<gcc::ClientClusterData>,
     multitransport_flags: gcc::MultiTransportFlags,
     early_capability_flags: gcc::ClientEarlyCapabilityFlags,
     server_capabilities: Vec<CapabilitySet>,
@@ -131,6 +132,12 @@ pub struct AcceptorResult {
     ///
     /// Populated for East Asian IME-based input locales; empty otherwise.
     pub ime_file_name: String,
+    /// Client Cluster Data (section 2.2.1.3.5), when the client sent it.
+    ///
+    /// `REDIRECTED_SESSIONID_FIELD_VALID` with a `RedirectedSessionID` asks
+    /// for a particular existing session; clients set it for a console
+    /// connection (`mstsc /admin`, FreeRDP `/admin`).
+    pub client_cluster: Option<gcc::ClientClusterData>,
     /// Early capability flags announced by the client in its GCC Client Core
     /// Data (section 2.2.1.3.2, `earlyCapabilityFlags`).
     ///
@@ -193,6 +200,7 @@ impl Acceptor {
             keyboard_layout: 0,
             keyboard_type: gcc::KeyboardType(0),
             ime_file_name: String::new(),
+            client_cluster: None,
             multitransport_flags: gcc::MultiTransportFlags::empty(),
             early_capability_flags: gcc::ClientEarlyCapabilityFlags::empty(),
             server_capabilities: capabilities,
@@ -296,6 +304,7 @@ impl Acceptor {
             keyboard_layout: consumed.keyboard_layout,
             keyboard_type: consumed.keyboard_type,
             ime_file_name: consumed.ime_file_name,
+            client_cluster: consumed.client_cluster,
             multitransport_flags: consumed.multitransport_flags,
             early_capability_flags: consumed.early_capability_flags,
             server_capabilities: consumed.server_capabilities,
@@ -400,6 +409,7 @@ impl Acceptor {
                 keyboard_layout: self.keyboard_layout,
                 keyboard_type: self.keyboard_type,
                 ime_file_name: self.ime_file_name.clone(),
+                client_cluster: self.client_cluster.clone(),
                 multitransport_flags: self.multitransport_flags,
                 client_early_capability_flags: self.early_capability_flags,
                 reactivation: self.reactivation,
@@ -713,6 +723,7 @@ impl Sequence for Acceptor {
                 self.keyboard_layout = gcc_blocks.core.keyboard_layout;
                 self.keyboard_type = gcc_blocks.core.keyboard_type;
                 self.ime_file_name.clone_from(&gcc_blocks.core.ime_file_name);
+                self.client_cluster.clone_from(&gcc_blocks.cluster);
                 self.multitransport_flags = gcc_blocks
                     .multi_transport_channel
                     .as_ref()
