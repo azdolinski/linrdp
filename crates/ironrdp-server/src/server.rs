@@ -5668,46 +5668,6 @@ mod tests {
         );
     }
 
-    /// MS-RDPEGFX 3.2.5.18: output drained before a mid-session
-    /// CapsAdvertise is void once the new CapsConfirm is out, and so is
-    /// output for a closed channel.
-    ///
-    /// Regression: the event loop wrote such batches after the confirm.
-    #[cfg(feature = "egfx")]
-    #[test]
-    fn egfx_output_goes_out_only_in_the_generation_it_was_drained_in() {
-        use ironrdp_dvc::DvcProcessor as _;
-        use ironrdp_egfx::pdu::{CapabilitiesAdvertisePdu, CapabilitySet};
-        use ironrdp_egfx::server::{GraphicsPipelineHandler, GraphicsPipelineServer};
-
-        struct Handler;
-
-        impl GraphicsPipelineHandler for Handler {
-            fn capabilities_advertise(&mut self, _pdu: &CapabilitiesAdvertisePdu) {}
-            fn on_ready(&mut self, _negotiated: &CapabilitySet) {}
-        }
-
-        let mut server = RdpServer::builder()
-            .with_addr(([127, 0, 0, 1], 0))
-            .with_no_security()
-            .with_no_input()
-            .with_no_display()
-            .build();
-
-        let pipeline = Arc::new(std::sync::Mutex::new(GraphicsPipelineServer::new(Box::new(Handler))));
-        let drained_in = pipeline.lock().expect("pipeline").generation();
-        assert!(
-            !server.egfx_output_is_current(drained_in),
-            "no pipeline on this connection"
-        );
-
-        server.gfx_handle = Some(Arc::clone(&pipeline));
-        assert!(server.egfx_output_is_current(drained_in));
-
-        pipeline.lock().expect("pipeline").close(0);
-        assert!(!server.egfx_output_is_current(drained_in));
-    }
-
     /// Counts the teardown an embedder does at the end of a connection.
     #[derive(Debug)]
     struct CountingHandler {
@@ -5768,6 +5728,46 @@ mod tests {
             Some(told),
             "the address the embedder accepted is the one it must be told about"
         );
+    }
+
+    /// MS-RDPEGFX 3.2.5.18: output drained before a mid-session
+    /// CapsAdvertise is void once the new CapsConfirm is out, and so is
+    /// output for a closed channel.
+    ///
+    /// Regression: the event loop wrote such batches after the confirm.
+    #[cfg(feature = "egfx")]
+    #[test]
+    fn egfx_output_goes_out_only_in_the_generation_it_was_drained_in() {
+        use ironrdp_dvc::DvcProcessor as _;
+        use ironrdp_egfx::pdu::{CapabilitiesAdvertisePdu, CapabilitySet};
+        use ironrdp_egfx::server::{GraphicsPipelineHandler, GraphicsPipelineServer};
+
+        struct Handler;
+
+        impl GraphicsPipelineHandler for Handler {
+            fn capabilities_advertise(&mut self, _pdu: &CapabilitiesAdvertisePdu) {}
+            fn on_ready(&mut self, _negotiated: &CapabilitySet) {}
+        }
+
+        let mut server = RdpServer::builder()
+            .with_addr(([127, 0, 0, 1], 0))
+            .with_no_security()
+            .with_no_input()
+            .with_no_display()
+            .build();
+
+        let pipeline = Arc::new(std::sync::Mutex::new(GraphicsPipelineServer::new(Box::new(Handler))));
+        let drained_in = pipeline.lock().expect("pipeline").generation();
+        assert!(
+            !server.egfx_output_is_current(drained_in),
+            "no pipeline on this connection"
+        );
+
+        server.gfx_handle = Some(Arc::clone(&pipeline));
+        assert!(server.egfx_output_is_current(drained_in));
+
+        pipeline.lock().expect("pipeline").close(0);
+        assert!(!server.egfx_output_is_current(drained_in));
     }
 
     /// Without being told, there is no address to invent.
