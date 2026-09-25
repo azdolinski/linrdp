@@ -5659,6 +5659,96 @@ mod tests {
         );
     }
 
+    /// Counts the teardown an embedder does at the end of a connection.
+    #[derive(Debug)]
+    struct CountingHandler {
+        ended: Arc<AtomicUsize>,
+        peer: Arc<std::sync::Mutex<Option<SocketAddr>>>,
+    }
+
+    impl ConnectionHandler for CountingHandler {
+        fn on_disconnected(
+            &mut self,
+            peer: SocketAddr,
+            _duration: Duration,
+            _error: Option<&ServerError>,
+        ) -> PostConnectionAction {
+            self.ended.fetch_add(1, Ordering::Relaxed);
+            *self.peer.lock().unwrap_or_else(|p| p.into_inner()) = Some(peer);
+            PostConnectionAction::Continue
+        }
+    }
+
+    /// An embedder that forks a process per connection calls
+    /// `run_connection`, never `run` — and `on_disconnected` used to fire
+    /// only from `run`'s accept loop.
+    ///
+    /// Regression, and not a cosmetic one: everything such an embedder does at
+    /// the end of a connection lived in that callback, so none of it happened.
+    /// A desktop meant to be locked when its client went away stayed unlocked
+    /// for the next connection.
+    #[tokio::test]
+    async fn run_connection_runs_the_embedders_teardown() {
+        let mut server = RdpServer::builder()
+            .with_addr(([127, 0, 0, 1], 0))
+            .with_no_security()
+            .with_no_input()
+            .with_no_display()
+            .build();
+
+        let ended = Arc::new(AtomicUsize::new(0));
+        let peer = Arc::new(std::sync::Mutex::new(None));
+        server.connection_handler = Some(Box::new(CountingHandler {
+            ended: Arc::clone(&ended),
+            peer: Arc::clone(&peer),
+        }));
+        let told: SocketAddr = "203.0.113.7:51000".parse().expect("an address");
+        server.set_peer_addr(Some(told));
+
+        let (client, server_side) = tokio::io::duplex(64);
+        drop(client);
+        let _ = server.run_connection(server_side).await;
+
+        assert_eq!(
+            ended.load(Ordering::Relaxed),
+            1,
+            "exactly one teardown per connection — none at all was the bug, twice would be a new one"
+        );
+        assert_eq!(
+            *peer.lock().unwrap_or_else(|p| p.into_inner()),
+            Some(told),
+            "the address the embedder accepted is the one it must be told about"
+        );
+    }
+
+    /// Without being told, there is no address to invent.
+    #[tokio::test]
+    async fn an_unknown_peer_is_reported_as_unspecified() {
+        let mut server = RdpServer::builder()
+            .with_addr(([127, 0, 0, 1], 0))
+            .with_no_security()
+            .with_no_input()
+            .with_no_display()
+            .build();
+
+        let ended = Arc::new(AtomicUsize::new(0));
+        let peer = Arc::new(std::sync::Mutex::new(None));
+        server.connection_handler = Some(Box::new(CountingHandler {
+            ended: Arc::clone(&ended),
+            peer: Arc::clone(&peer),
+        }));
+
+        let (client, server_side) = tokio::io::duplex(64);
+        drop(client);
+        let _ = server.run_connection(server_side).await;
+
+        assert_eq!(ended.load(Ordering::Relaxed), 1);
+        assert!(
+            peer.lock().unwrap_or_else(|p| p.into_inner()).is_some_and(|p| p.ip().is_unspecified()),
+            "an unknown peer is unspecified, not a plausible-looking address"
+        );
+    }
+
     /// Records the areas the server asks the display to draw again.
     struct RefreshRecorder(Arc<std::sync::Mutex<Vec<InclusiveRectangle>>>);
 
@@ -5764,95 +5854,5 @@ mod tests {
         .await;
         receive(&mut server, allow()).await;
         assert_eq!(*requested.lock().expect("recorder"), [area, desktop.clone()]);
-    }
-
-    /// Counts the teardown an embedder does at the end of a connection.
-    #[derive(Debug)]
-    struct CountingHandler {
-        ended: Arc<AtomicUsize>,
-        peer: Arc<std::sync::Mutex<Option<SocketAddr>>>,
-    }
-
-    impl ConnectionHandler for CountingHandler {
-        fn on_disconnected(
-            &mut self,
-            peer: SocketAddr,
-            _duration: Duration,
-            _error: Option<&ServerError>,
-        ) -> PostConnectionAction {
-            self.ended.fetch_add(1, Ordering::Relaxed);
-            *self.peer.lock().unwrap_or_else(|p| p.into_inner()) = Some(peer);
-            PostConnectionAction::Continue
-        }
-    }
-
-    /// An embedder that forks a process per connection calls
-    /// `run_connection`, never `run` — and `on_disconnected` used to fire
-    /// only from `run`'s accept loop.
-    ///
-    /// Regression, and not a cosmetic one: everything such an embedder does at
-    /// the end of a connection lived in that callback, so none of it happened.
-    /// A desktop meant to be locked when its client went away stayed unlocked
-    /// for the next connection.
-    #[tokio::test]
-    async fn run_connection_runs_the_embedders_teardown() {
-        let mut server = RdpServer::builder()
-            .with_addr(([127, 0, 0, 1], 0))
-            .with_no_security()
-            .with_no_input()
-            .with_no_display()
-            .build();
-
-        let ended = Arc::new(AtomicUsize::new(0));
-        let peer = Arc::new(std::sync::Mutex::new(None));
-        server.connection_handler = Some(Box::new(CountingHandler {
-            ended: Arc::clone(&ended),
-            peer: Arc::clone(&peer),
-        }));
-        let told: SocketAddr = "203.0.113.7:51000".parse().expect("an address");
-        server.set_peer_addr(Some(told));
-
-        let (client, server_side) = tokio::io::duplex(64);
-        drop(client);
-        let _ = server.run_connection(server_side).await;
-
-        assert_eq!(
-            ended.load(Ordering::Relaxed),
-            1,
-            "exactly one teardown per connection — none at all was the bug, twice would be a new one"
-        );
-        assert_eq!(
-            *peer.lock().unwrap_or_else(|p| p.into_inner()),
-            Some(told),
-            "the address the embedder accepted is the one it must be told about"
-        );
-    }
-
-    /// Without being told, there is no address to invent.
-    #[tokio::test]
-    async fn an_unknown_peer_is_reported_as_unspecified() {
-        let mut server = RdpServer::builder()
-            .with_addr(([127, 0, 0, 1], 0))
-            .with_no_security()
-            .with_no_input()
-            .with_no_display()
-            .build();
-
-        let ended = Arc::new(AtomicUsize::new(0));
-        let peer = Arc::new(std::sync::Mutex::new(None));
-        server.connection_handler = Some(Box::new(CountingHandler {
-            ended: Arc::clone(&ended),
-            peer: Arc::clone(&peer),
-        }));
-
-        let (client, server_side) = tokio::io::duplex(64);
-        drop(client);
-        let _ = server.run_connection(server_side).await;
-
-        assert_eq!(ended.load(Ordering::Relaxed), 1);
-        assert!(
-            peer.lock().unwrap_or_else(|p| p.into_inner()).is_some_and(|p| p.ip().is_unspecified()),
-            "an unknown peer is unspecified, not a plausible-looking address"
-        );
     }
 }
