@@ -1033,6 +1033,23 @@ pub enum ServerEvent {
     /// processor's tunnel path; responses go back through `SoftSyncToUdp`'s
     /// `to_tunnel` sender.
     UdpTunnelData(Vec<u8>),
+    /// Open a dynamic virtual channel from the server side while the session
+    /// runs (MS-RDPEDYC 2.2.2.1).
+    ///
+    /// The Create Request goes out only once the DVC capability exchange has
+    /// finished (2.2.1); a channel opened earlier waits for it. `reply`, if
+    /// given, receives the ID assigned to the channel — the handle for
+    /// [`Self::CloseDynamicChannel`] — or `None` when this connection has no
+    /// DRDYNVC channel to open it on.
+    OpenDynamicChannel {
+        processor: Box<dyn dvc::DvcServerProcessor>,
+        reply: Option<oneshot::Sender<Option<u32>>>,
+    },
+    /// Close a dynamic virtual channel opened with
+    /// [`Self::OpenDynamicChannel`] (MS-RDPEDYC 2.2.4, 3.3.5.2).
+    CloseDynamicChannel {
+        channel_id: u32,
+    },
 }
 
 /// Creates a fresh static-channel processor for each accepted RDP connection.
@@ -1065,6 +1082,14 @@ impl fmt::Debug for ServerEvent {
             Self::SoftSyncToUdp { .. } => f.write_str("SoftSyncToUdp { .. }"),
             Self::UdpTunnelData(data) => f.debug_tuple("UdpTunnelData").field(&data.len()).finish(),
             Self::AutoDetectRttRequest => f.write_str("AutoDetectRttRequest"),
+            Self::OpenDynamicChannel { processor, .. } => f
+                .debug_struct("OpenDynamicChannel")
+                .field("channel_name", &processor.channel_name())
+                .finish_non_exhaustive(),
+            Self::CloseDynamicChannel { channel_id } => f
+                .debug_struct("CloseDynamicChannel")
+                .field("channel_id", channel_id)
+                .finish(),
         }
     }
 }
@@ -3210,6 +3235,38 @@ impl RdpServer {
                         self.pending_soft_sync = Some(to_tunnel);
                     }
                 }
+                ServerEvent::OpenDynamicChannel { processor, reply } => {
+                    let Some(drdynvc) = self.get_svc_processor::<dvc::DrdynvcServer>() else {
+                        warn!(
+                            channel_name = processor.channel_name(),
+                            "no DRDYNVC channel on this connection; cannot open a dynamic channel"
+                        );
+                        if let Some(reply) = reply {
+                            let _ = reply.send(None);
+                        }
+                        continue;
+                    };
+                    let channel_name = processor.channel_name().to_owned();
+                    let (channel_id, request) = drdynvc
+                        .create_channel_boxed(processor)
+                        .map_err_kind("create dynamic channel", ServerErrorKind::Pdu)?;
+                    debug!(%channel_name, channel_id, deferred = request.is_none(), "opening a dynamic channel");
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Some(channel_id));
+                    }
+                    if let Some(request) = request {
+                        self.write_dvc_messages(vec![request], writer, user_channel_id).await?;
+                    }
+                }
+                ServerEvent::CloseDynamicChannel { channel_id } => {
+                    let Some(drdynvc) = self.get_svc_processor::<dvc::DrdynvcServer>() else {
+                        continue;
+                    };
+                    debug!(channel_id, "closing a dynamic channel");
+                    if let Some(close) = drdynvc.close_channel(channel_id) {
+                        self.write_dvc_messages(vec![close], writer, user_channel_id).await?;
+                    }
+                }
                 ServerEvent::UdpTunnelData(frame) => {
                     let Some(drdynvc) = self.get_svc_processor::<dvc::DrdynvcServer>() else {
                         warn!("Tunnel data but DRDYNVC channel is gone; dropping");
@@ -3425,7 +3482,12 @@ impl RdpServer {
                                 .map_err_kind("create URBDRC device channel", ServerErrorKind::Pdu)?
                         };
 
-                        self.write_dvc_messages(vec![create_dvc_msg], writer, user_channel_id).await?;
+                        // `None`: the capability exchange is still running, and
+                        // the request goes out with its answer.
+                        if let Some(create_dvc_msg) = create_dvc_msg {
+                            self.write_dvc_messages(vec![create_dvc_msg], writer, user_channel_id)
+                                .await?;
+                        }
                     }
                     UrbdrcServerMessage::Device { dvc_id, dev_msg } => {
                         let Some(device) = self
