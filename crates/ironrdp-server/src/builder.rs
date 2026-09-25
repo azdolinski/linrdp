@@ -529,7 +529,8 @@ impl RdpServerBuilder<BuilderDone> {
 
     /// Enable UDP multitransport (MS-RDPEMT): after the connection sequence
     /// completes, the server sends an Initiate Multitransport Request carrying
-    /// this `request_id` + `security_cookie`. The embedder must run the
+    /// this `request_id` + `security_cookie` to clients that announce reliable
+    /// UDP and Soft-Sync. The embedder must run the
     /// matching UDP listener (see `ironrdp-rdpeudp-tokio::accept_udp`) or the
     /// client's UDP bootstrap will time out and fall back to TCP-only.
     pub fn with_multitransport(mut self, request: Option<crate::server::MultiTransportRequest>) -> Self {
