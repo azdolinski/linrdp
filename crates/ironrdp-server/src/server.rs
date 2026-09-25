@@ -23,6 +23,7 @@ use ironrdp_error::ResultExt as _;
 #[cfg(feature = "usb")]
 use ironrdp_pdu::PduError;
 use ironrdp_pdu::codecs::rfx::Quant;
+use ironrdp_pdu::geometry::InclusiveRectangle;
 use ironrdp_pdu::input::InputEventPdu;
 use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
 use ironrdp_pdu::mcs::{SendDataIndication, SendDataRequest};
@@ -4335,8 +4336,15 @@ impl RdpServer {
                 // set.
                 rdp::headers::ShareDataPdu::SuppressOutput(pdu) => {
                     let suppress = pdu.desktop_rect.is_none();
-                    self.display_suppressed.store(suppress, Ordering::Relaxed);
+                    let was_suppressed = self.display_suppressed.swap(suppress, Ordering::Relaxed);
                     debug!(suppress, "client suppress-output state changed");
+                    // MS-RDPBCGR 3.3.5.11.2: output resumes. The client still
+                    // shows what it had when output stopped, so the desktop
+                    // rectangle it names is drawn again rather than only
+                    // what changes from now on.
+                    if was_suppressed && let Some(desktop) = pdu.desktop_rect.as_ref() {
+                        self.request_refresh(core::slice::from_ref(desktop)).await;
+                    }
                 }
 
                 // Client asks the server to redraw a rectangle — typical on
@@ -4346,10 +4354,13 @@ impl RdpServer {
                 // `SuppressOutput { Some(rect) }` that usually accompanies
                 // this; clearing here is belt-and-braces against clients
                 // that send only one of the two.)
-                rdp::headers::ShareDataPdu::RefreshRectangle(_) => {
+                rdp::headers::ShareDataPdu::RefreshRectangle(pdu) => {
                     if self.display_suppressed.swap(false, Ordering::Relaxed) {
                         debug!("client RefreshRectangle cleared suppress-output state");
                     }
+                    // MS-RDPBCGR 3.3.5.11.1: "the server MUST send updated
+                    // graphics data for the region specified by the PDU".
+                    self.request_refresh(&pdu.areas_to_refresh).await;
                 }
 
                 // MS-RDPBCGR 2.2.2.3: the client finished presenting the
@@ -4374,6 +4385,15 @@ impl RdpServer {
         }
 
         Ok(false)
+    }
+
+    /// Hand the areas the client wants drawn again to the display handler.
+    async fn request_refresh(&self, areas: &[InclusiveRectangle]) {
+        if areas.is_empty() {
+            return;
+        }
+        debug!(?areas, "client requested a refresh");
+        self.display.lock().await.request_refresh(areas);
     }
 
     fn handle_message_channel_data(&mut self, data: SendDataRequest<'_>) {
@@ -5637,6 +5657,113 @@ mod tests {
             released.load(Ordering::Relaxed),
             "the channel backends of a finished connection must be released, not held until the next client"
         );
+    }
+
+    /// Records the areas the server asks the display to draw again.
+    struct RefreshRecorder(Arc<std::sync::Mutex<Vec<InclusiveRectangle>>>);
+
+    #[async_trait::async_trait]
+    impl RdpServerDisplay for RefreshRecorder {
+        async fn size(&mut self) -> DesktopSize {
+            DesktopSize { width: 64, height: 48 }
+        }
+
+        async fn updates(&mut self) -> ServerResult<Box<dyn crate::RdpServerDisplayUpdates>> {
+            Err(ServerError::reason("refresh recorder", "no updates"))
+        }
+
+        fn request_refresh(&mut self, areas: &[InclusiveRectangle]) {
+            self.0.lock().expect("recorder").extend_from_slice(areas);
+        }
+    }
+
+    /// A client Share Data PDU as it arrives on the I/O channel.
+    fn io_channel_pdu(share_data_pdu: rdp::headers::ShareDataPdu) -> Vec<u8> {
+        encode_vec(&rdp::headers::ShareControlHeader {
+            share_id: 0,
+            pdu_source: 1007,
+            share_control_pdu: ShareControlPdu::Data(rdp::headers::ShareDataHeader {
+                share_data_pdu,
+                stream_priority: rdp::headers::StreamPriority::Medium,
+                compression_flags: rdp::headers::CompressionFlags::empty(),
+                compression_type: rdp::client_info::CompressionType::K8,
+            }),
+        })
+        .expect("encode")
+    }
+
+    async fn receive(server: &mut RdpServer, share_data_pdu: rdp::headers::ShareDataPdu) {
+        let user_data = io_channel_pdu(share_data_pdu);
+        server
+            .handle_io_channel_data(SendDataRequest {
+                initiator_id: 1007,
+                channel_id: 1003,
+                user_data: user_data.as_slice().into(),
+            })
+            .await
+            .expect("handled");
+    }
+
+    /// MS-RDPBCGR 3.3.5.11.1: after a Refresh Rect PDU "the server MUST send
+    /// updated graphics data for the region specified by the PDU", and
+    /// 3.3.5.11.2: output stopped by Suppress Output resumes. Both reach the
+    /// display handler as areas to draw again.
+    ///
+    /// Regression: the server advertised Refresh Rect support but only
+    /// cleared its suppress-output flag.
+    #[tokio::test]
+    async fn refresh_requests_reach_the_display() {
+        use rdp::refresh_rectangle::RefreshRectanglePdu;
+        use rdp::suppress_output::SuppressOutputPdu;
+
+        let requested = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut server = RdpServer::builder()
+            .with_addr(([127, 0, 0, 1], 0))
+            .with_no_security()
+            .with_no_input()
+            .with_display_handler(RefreshRecorder(Arc::clone(&requested)))
+            .build();
+        let area = InclusiveRectangle {
+            left: 8,
+            top: 4,
+            right: 23,
+            bottom: 13,
+        };
+        let desktop = InclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 63,
+            bottom: 47,
+        };
+
+        receive(
+            &mut server,
+            rdp::headers::ShareDataPdu::RefreshRectangle(RefreshRectanglePdu {
+                areas_to_refresh: vec![area.clone()],
+            }),
+        )
+        .await;
+        assert_eq!(
+            requested.lock().expect("recorder").as_slice(),
+            core::slice::from_ref(&area)
+        );
+
+        // Output that was never stopped owes the client nothing.
+        let allow = || {
+            rdp::headers::ShareDataPdu::SuppressOutput(SuppressOutputPdu {
+                desktop_rect: Some(desktop.clone()),
+            })
+        };
+        receive(&mut server, allow()).await;
+        assert_eq!(requested.lock().expect("recorder").len(), 1);
+
+        receive(
+            &mut server,
+            rdp::headers::ShareDataPdu::SuppressOutput(SuppressOutputPdu { desktop_rect: None }),
+        )
+        .await;
+        receive(&mut server, allow()).await;
+        assert_eq!(*requested.lock().expect("recorder"), [area, desktop.clone()]);
     }
 
     /// Counts the teardown an embedder does at the end of a connection.

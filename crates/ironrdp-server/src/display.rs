@@ -3,6 +3,7 @@ use core::num::{NonZeroU16, NonZeroUsize};
 use bytes::{Bytes, BytesMut};
 use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
 use ironrdp_graphics::diff;
+use ironrdp_pdu::geometry::InclusiveRectangle;
 use ironrdp_pdu::pointer::PointerPositionAttribute;
 use tracing::{debug, warn};
 
@@ -334,6 +335,18 @@ pub trait RdpServerDisplay: Send {
     /// Request a new size for the display
     fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
         debug!(?layout, "Requesting layout")
+    }
+
+    /// The client wants these areas of the desktop drawn again.
+    ///
+    /// MS-RDPBCGR 3.3.5.11.1: once a Refresh Rect PDU is processed, "the
+    /// server MUST send updated graphics data for the region specified by the
+    /// PDU". The server also asks for the desktop rectangle when a Suppress
+    /// Output PDU resumes output it had stopped (3.3.5.11.2). The display
+    /// should cover every area in its next updates, whether or not anything
+    /// changed there. The default only logs the request.
+    fn request_refresh(&mut self, areas: &[InclusiveRectangle]) {
+        debug!(?areas, "Refresh requested")
     }
 }
 

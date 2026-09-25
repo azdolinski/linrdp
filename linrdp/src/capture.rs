@@ -377,7 +377,15 @@ impl CursorImage {
 impl Grab {
     /// Crop the damage rectangle into a legacy-path `DisplayUpdate`.
     pub(crate) fn legacy_display_update(&self) -> Option<DisplayUpdate> {
-        let (x, y, w, h) = self.damage?;
+        self.legacy_display_update_of(self.damage?)
+    }
+
+    /// Crop `(x, y, w, h)`, which must lie inside the grab, into a
+    /// legacy-path `DisplayUpdate`. `None` for an empty rectangle.
+    pub(crate) fn legacy_display_update_of(&self, (x, y, w, h): (u16, u16, u16, u16)) -> Option<DisplayUpdate> {
+        if w == 0 || h == 0 {
+            return None;
+        }
         let stride = usize::from(self.width) * 4;
         let mut region = Vec::with_capacity(usize::from(w) * usize::from(h) * 4);
         for row in y..y + h {
