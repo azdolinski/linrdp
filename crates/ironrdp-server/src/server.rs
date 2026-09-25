@@ -784,6 +784,9 @@ pub struct RdpServer {
     credential_validator: Option<Arc<dyn CredentialValidator>>,
     credential_resolver: Option<std::sync::Arc<dyn Fn(&str) -> std::io::Result<Credentials> + Send + Sync>>,
     enable_ainput: bool,
+    /// What the Display Control channel advertises (MS-RDPEDISP 2.2.2.1);
+    /// `None` keeps `DisplayControlServer`'s default.
+    display_control_caps: Option<ironrdp_displaycontrol::pdu::DisplayControlCapabilities>,
     /// Who is on the other end, for embedders that accepted the connection
     /// themselves and then handed the stream to
     /// [`Self::run_connection`](RdpServer::run_connection). `run`'s own loop
@@ -1616,6 +1619,7 @@ impl RdpServer {
             creds: None,
             credential_resolver,
             enable_ainput,
+            display_control_caps: None,
             peer_addr: None,
             // The embedder sets this; the library keeps its previous
             // behaviour (wait forever) unless it does.
@@ -1687,6 +1691,16 @@ impl RdpServer {
     /// Not used for CredSSP/Hybrid connections (those use pre-loaded credentials).
     pub fn set_credential_validator(&mut self, validator: Option<Arc<dyn CredentialValidator>>) {
         self.credential_validator = validator;
+    }
+
+    /// What the Display Control channel tells clients about the layouts they
+    /// may request (MS-RDPEDISP 2.2.2.1): the monitor count and the area the
+    /// display can really take. Layouts beyond them are not applied.
+    pub fn set_display_control_capabilities(
+        &mut self,
+        capabilities: ironrdp_displaycontrol::pdu::DisplayControlCapabilities,
+    ) {
+        self.display_control_caps = Some(capabilities);
     }
 
     /// Set or clear the Server Auto-Reconnect Cookie (MS-RDPBCGR 2.2.4.2
@@ -2112,8 +2126,12 @@ impl RdpServer {
         } else {
             dvc
         };
-        let dvc = dvc
-            .with_dynamic_channel(DisplayControlServer::new(Box::new(dcs_backend)));
+        let display_control = DisplayControlServer::new(Box::new(dcs_backend));
+        let display_control = match self.display_control_caps.clone() {
+            Some(capabilities) => display_control.with_capabilities(capabilities),
+            None => display_control,
+        };
+        let dvc = dvc.with_dynamic_channel(display_control);
 
         let dvc = {
             let echo_handle = self.echo_handle.clone();

@@ -930,6 +930,17 @@ async fn serve() -> anyhow::Result<()> {
     };
     server.set_multitransport(multitransport);
 
+    // MS-RDPEDISP 2.2.2.1: the layouts a client may ask for — one monitor,
+    // no larger than the screen a session can have.
+    server.set_display_control_capabilities(
+        ironrdp_displaycontrol::pdu::DisplayControlCapabilities::new(
+            1,
+            u32::from(session::SESSION_SCREEN_MAX.0),
+            u32::from(session::SESSION_SCREEN_MAX.1),
+        )
+        .context("display control capabilities")?,
+    );
+
     // The deadline for everything before authentication. Without it a client
     // could connect, send nothing, and hold this worker — one process, its
     // memory and its descriptors — for as long as it cared to, which is the

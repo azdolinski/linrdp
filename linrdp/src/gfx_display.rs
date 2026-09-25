@@ -513,6 +513,7 @@ impl RdpServerDisplay for EgfxDisplay {
     async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
         let source = self.factory.updates_source();
         let settle_until = source.settle_until();
+        let desktop = self.factory.size();
         Ok(Box::new(EgfxUpdates {
             factory: Arc::clone(&self.factory),
             source: Some(source),
@@ -532,6 +533,7 @@ impl RdpServerDisplay for EgfxDisplay {
             handle_first_seen: None,
             legacy_reason_logged: false,
             settle_until,
+            legacy_size: Some((desktop.width, desktop.height)),
             last_attach_attempt: Instant::now() - Duration::from_secs(1),
             hb_polls: 0,
             hb_damaged: 0,
@@ -628,6 +630,10 @@ struct EgfxUpdates {
     /// settles, then one full lossless repaint goes out. Resolution-
     /// independent: taken from the display after request_initial_size.
     settle_until: Instant,
+    /// The desktop size the client has while on the legacy path: the size the
+    /// display reported when this stream started, then the size of the last
+    /// resize sent.
+    legacy_size: Option<(u16, u16)>,
     /// Once a session has used EGFX, never fall back to legacy bitmap
     /// updates (a client decoder reset briefly clears `ready`).
     egfx_latched: bool,
@@ -858,7 +864,17 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
                 since_start: now.saturating_duration_since(self.started),
             };
 
-            let handle = match egfx_decision(state) {
+            let decision = egfx_decision(state);
+            // MS-RDPEDISP 1.3: without the graphics pipeline a new desktop
+            // size takes a Deactivation-Reactivation Sequence, which the
+            // server runs on `DisplayUpdate::Resize`. The stream that follows
+            // starts over with a full repaint.
+            if decision == EgfxDecision::Legacy
+                && let Some(resize) = legacy_resize(&mut self.legacy_size, grab.width, grab.height)
+            {
+                return Ok(Some(resize));
+            }
+            let handle = match decision {
                 EgfxDecision::Egfx => {
                     // This session is on the graphics pipeline. Latch it: when
                     // the client re-opens the graphics channel (decoder reset),
@@ -2352,6 +2368,57 @@ fn settle_debt(remainder: Option<(u16, u16, u16, u16)>) -> (bool, Option<(u16, u
     match remainder {
         Some(rest) => (true, Some(rest)),
         None => (false, None),
+    }
+}
+
+/// A `DisplayUpdate::Resize` when a legacy frame no longer has the size of
+/// the client's desktop, recorded in `known` for the frames after it.
+fn legacy_resize(known: &mut Option<(u16, u16)>, width: u16, height: u16) -> Option<DisplayUpdate> {
+    let previous = known.replace((width, height))?;
+    if previous == (width, height) {
+        return None;
+    }
+    tracing::info!(
+        ?previous,
+        width,
+        height,
+        "desktop size changed on the legacy path: deactivation-reactivation"
+    );
+    Some(DisplayUpdate::Resize(DesktopSize { width, height }))
+}
+
+#[cfg(test)]
+mod legacy_resize_tests {
+    use super::*;
+
+    fn resized_to(update: Option<DisplayUpdate>) -> Option<(u16, u16)> {
+        match update {
+            Some(DisplayUpdate::Resize(size)) => Some((size.width, size.height)),
+            None => None,
+            Some(other) => panic!("expected a resize, got {other:?}"),
+        }
+    }
+
+    /// MS-RDPEDISP 1.3: without the graphics pipeline, a new desktop size
+    /// takes a Deactivation-Reactivation Sequence.
+    ///
+    /// Regression: the legacy path sent bitmaps of the new size into the
+    /// client's old desktop.
+    #[test]
+    fn a_legacy_frame_of_another_size_resizes_the_desktop_once() {
+        let mut known = Some((1920, 1080));
+
+        assert_eq!(resized_to(legacy_resize(&mut known, 1920, 1080)), None);
+        assert_eq!(resized_to(legacy_resize(&mut known, 1600, 900)), Some((1600, 900)));
+        assert_eq!(resized_to(legacy_resize(&mut known, 1600, 900)), None, "only once");
+    }
+
+    #[test]
+    fn an_unknown_size_is_adopted_without_a_resize() {
+        let mut known = None;
+
+        assert_eq!(resized_to(legacy_resize(&mut known, 1600, 900)), None);
+        assert_eq!(known, Some((1600, 900)));
     }
 }
 
