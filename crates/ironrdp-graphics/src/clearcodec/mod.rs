@@ -410,6 +410,17 @@ pub struct ClearCodecEncoder {
     seq_number: u8,
     glyph_cache: GlyphCache,
     next_glyph_index: u16,
+    /// The glyph the last [`Self::encode`] stored, while it is not yet known
+    /// whether its message reaches the client. See [`Self::rollback_glyph`].
+    pending_glyph: Option<PendingGlyph>,
+}
+
+/// A glyph stored by an encode whose message may still be dropped: enough to
+/// put the cache back the way the client has it.
+struct PendingGlyph {
+    index: u16,
+    previous: Option<GlyphEntry>,
+    previous_next_index: u16,
 }
 
 impl ClearCodecEncoder {
@@ -418,6 +429,7 @@ impl ClearCodecEncoder {
             seq_number: 0,
             glyph_cache: GlyphCache::new(),
             next_glyph_index: 0,
+            pending_glyph: None,
         }
     }
 
@@ -432,7 +444,15 @@ impl ClearCodecEncoder {
     /// alpha; this encoder reads only B, G, R from each input pixel and
     /// discards the alpha byte. Callers that need to preserve alpha across
     /// the network must transport it separately.
+    ///
+    /// A glyph this stores is provisional until the next `encode`: a caller
+    /// whose message may not reach the client calls [`Self::rollback_glyph`]
+    /// when it does not, or [`Self::commit_glyph`] when it does.
     pub fn encode(&mut self, bgra: &[u8], width: u16, height: u16) -> Vec<u8> {
+        // Whatever the previous message stored has been settled by now; one
+        // the caller never rolled back is taken as delivered.
+        self.pending_glyph = None;
+
         let w = usize::from(width);
         let h = usize::from(height);
         let pixel_count = w.saturating_mul(h);
@@ -453,6 +473,11 @@ impl ClearCodecEncoder {
         let glyph_index = if use_glyph {
             flags |= FLAG_GLYPH_INDEX;
             let idx = self.next_glyph_index;
+            self.pending_glyph = Some(PendingGlyph {
+                index: idx,
+                previous: self.glyph_cache.get(idx).cloned(),
+                previous_next_index: idx,
+            });
             self.glyph_cache.store(
                 idx,
                 GlyphEntry {
@@ -489,6 +514,27 @@ impl ClearCodecEncoder {
         out.extend_from_slice(&residual_data);
 
         out
+    }
+
+    /// The message from the last [`Self::encode`] reached the client: the glyph
+    /// it stored, if any, is now in the client's glyph storage too.
+    pub fn commit_glyph(&mut self) {
+        self.pending_glyph = None;
+    }
+
+    /// The message from the last [`Self::encode`] never reached the client
+    /// (dropped by backpressure, say): forget the glyph it stored.
+    ///
+    /// MS-RDPEGFX 2.2.4.1: with CLEARCODEC_FLAG_GLYPH_HIT "the glyph data is
+    /// already present in the Decompressor Glyph Storage" of the client. A
+    /// glyph kept here although its message was dropped would later be hit in
+    /// a slot the client never filled, or filled with something else. The
+    /// slot gets back whatever the client still has in it.
+    pub fn rollback_glyph(&mut self) {
+        if let Some(pending) = self.pending_glyph.take() {
+            self.glyph_cache.restore(pending.index, pending.previous);
+            self.next_glyph_index = pending.previous_next_index;
+        }
     }
 
     /// Encode a cache reset message (FLAG_CACHE_RESET).
@@ -558,6 +604,7 @@ impl ClearCodecEncoder {
         self.seq_number = 0;
         self.glyph_cache = GlyphCache::new();
         self.next_glyph_index = 0;
+        self.pending_glyph = None;
     }
 }
 
@@ -1003,5 +1050,53 @@ mod tests {
             0,
             "the client dropped its glyph cache, so a hit would dangle"
         );
+    }
+
+    /// MS-RDPEGFX 2.2.4.1: a CLEARCODEC_FLAG_GLYPH_HIT means "the glyph data is
+    /// already present in the Decompressor Glyph Storage" of the client.
+    ///
+    /// Regression: the glyph was stored when it was encoded, so a message
+    /// dropped by backpressure left behind a glyph the client never received,
+    /// and the next identical bitmap was sent as a hit on a slot the client had
+    /// never filled.
+    #[test]
+    fn a_rolled_back_glyph_is_sent_again_instead_of_hit() {
+        let px = vec![9u8; 8 * 8 * 4];
+        let mut enc = ClearCodecEncoder::new();
+
+        let dropped = enc.encode(&px, 8, 8);
+        assert_eq!(dropped[0] & FLAG_GLYPH_INDEX, FLAG_GLYPH_INDEX, "stored as a glyph");
+        enc.rollback_glyph();
+
+        let resent = enc.encode(&px, 8, 8);
+        assert_eq!(resent[0] & FLAG_GLYPH_HIT, 0, "the client never got it, so no hit");
+        assert_eq!(
+            resent[2..4],
+            dropped[2..4],
+            "the rolled-back slot is reused for the resend"
+        );
+        enc.commit_glyph();
+
+        let hit = enc.encode(&px, 8, 8);
+        assert_eq!(hit[0] & FLAG_GLYPH_HIT, FLAG_GLYPH_HIT, "a delivered glyph is hit");
+    }
+
+    /// A rollback gives the slot back what the client still holds in it: a
+    /// glyph delivered earlier stays hittable.
+    #[test]
+    fn a_rollback_keeps_the_glyphs_already_delivered() {
+        let delivered = vec![1u8; 4 * 4 * 4];
+        let dropped = vec![2u8; 4 * 4 * 4];
+        let mut enc = ClearCodecEncoder::new();
+
+        let _ = enc.encode(&delivered, 4, 4);
+        enc.commit_glyph();
+        let _ = enc.encode(&dropped, 4, 4);
+        enc.rollback_glyph();
+
+        let hit = enc.encode(&delivered, 4, 4);
+        assert_eq!(hit[0] & FLAG_GLYPH_HIT, FLAG_GLYPH_HIT);
+        let miss = enc.encode(&dropped, 4, 4);
+        assert_eq!(miss[0] & FLAG_GLYPH_HIT, 0);
     }
 }
