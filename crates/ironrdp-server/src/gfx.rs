@@ -113,14 +113,20 @@ impl DvcServerProcessor for GfxDvcBridge {}
 #[derive(Debug)]
 pub enum EgfxServerMessage {
     /// Pre-encoded DVC messages from `GraphicsPipelineServer::drain_output()`.
-    SendMessages { messages: Vec<SvcMessage> },
+    ///
+    /// `generation` is `GraphicsPipelineServer::generation()`, read under the
+    /// same lock as the drain. The messages go out only while the connection's
+    /// pipeline is still in that generation. Output drained before a
+    /// mid-session CapsAdvertise, before the channel closed, or on an earlier
+    /// connection is dropped (MS-RDPEGFX 3.2.5.18).
+    SendMessages { messages: Vec<SvcMessage>, generation: u64 },
 }
 
 impl core::fmt::Display for EgfxServerMessage {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::SendMessages { messages } => {
-                write!(f, "SendMessages(count={})", messages.len())
+            Self::SendMessages { messages, generation } => {
+                write!(f, "SendMessages(count={}, generation={generation})", messages.len())
             }
         }
     }

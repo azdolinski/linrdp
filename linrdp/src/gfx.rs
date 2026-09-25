@@ -84,6 +84,9 @@ impl GfxSession {
     /// the server event loop. Returns the drained byte count (for stats).
     pub(crate) fn drain_and_send(&self, handle: &GfxServerHandle) -> usize {
         let mut server = handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Read under the same lock as the drain: the server loop drops the
+        // batch if the pipeline has been reset since (MS-RDPEGFX 3.2.5.18).
+        let generation = server.generation();
         let drained = server.drain_output();
         let bytes = drained.iter().map(|m| m.size()).sum();
         let Some(channel_id) = server.channel_id() else {
@@ -96,7 +99,10 @@ impl GfxSession {
         };
         let guard = self.sender.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(sender) = guard.as_ref() {
-            let _ = sender.send(ServerEvent::Egfx(EgfxServerMessage::SendMessages { messages }));
+            let _ = sender.send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+                messages,
+                generation,
+            }));
         }
         bytes
     }
