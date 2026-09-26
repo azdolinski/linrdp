@@ -10,8 +10,9 @@
 //! pair from the TCP bootstrap.
 //!
 //! The client connects to the UDP port matching the TCP listener address
-//! (MS-RDPEMT 3.1.1). One transport is served at a time: the accept loop
-//! rebinds after a transport closes.
+//! (MS-RDPEMT 3.1.1). A connection gets one tunnel: it lasts as long as the
+//! main connection (MS-RDPEMT 1.3.3), so once it closes the server is told
+//! and nothing further is accepted.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -118,6 +119,10 @@ async fn listen_loop(
                 }
                 let _ = transport.shutdown().await;
                 tracing::info!("RDP-UDP transport closed");
+                // The dynamic channels moved to it cannot come back to TCP,
+                // so the server decides whether the connection goes on.
+                let _ = events.send(ironrdp_server::ServerEvent::UdpTunnelClosed);
+                return;
             }
             Err(error) => {
                 // Most common: the accept timed out because the client is
