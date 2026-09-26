@@ -1288,13 +1288,7 @@ impl GraphicsPipelineServer {
             self.output_queue.push_back(GfxPdu::ResetGraphics(ResetGraphicsPdu {
                 width: u32::from(desktop_width),
                 height: u32::from(desktop_height),
-                monitors: vec![Monitor {
-                    left: 0,
-                    top: 0,
-                    right: i32::from(desktop_width),
-                    bottom: i32::from(desktop_height),
-                    flags: MonitorFlags::PRIMARY,
-                }],
+                monitors: vec![primary_monitor(desktop_width, desktop_height)],
             }));
 
             self.output_width = desktop_width;
@@ -1383,8 +1377,18 @@ impl GraphicsPipelineServer {
         self.resize_with_monitors(width, height, Vec::new());
     }
 
-    /// Resize with explicit monitor configuration
+    /// Resize with explicit monitor configuration.
+    ///
+    /// An empty `monitors` means a single primary monitor covering the new
+    /// desktop: RDPGFX_RESET_GRAPHICS_PDU also updates the monitor layout
+    /// (MS-RDPEGFX 2.2.2.14), and a layout with no monitor in it describes
+    /// no desktop at all.
     pub fn resize_with_monitors(&mut self, width: u16, height: u16, monitors: Vec<Monitor>) {
+        let monitors = if monitors.is_empty() {
+            vec![primary_monitor(width, height)]
+        } else {
+            monitors
+        };
         if self.state != ServerState::Ready {
             debug!("Cannot resize: not in Ready state");
             return;
@@ -2361,6 +2365,20 @@ impl DvcProcessor for GraphicsPipelineServer {
 
 impl DvcServerProcessor for GraphicsPipelineServer {}
 
+/// The single primary monitor covering a `width`x`height` desktop.
+///
+/// TS_MONITOR_DEF bounds are inclusive (MS-RDPBCGR 2.2.1.3.6.1): a 1920x1080
+/// desktop is right = 1919, bottom = 1079.
+fn primary_monitor(width: u16, height: u16) -> Monitor {
+    Monitor {
+        left: 0,
+        top: 0,
+        right: i32::from(width.max(1)) - 1,
+        bottom: i32::from(height.max(1)) - 1,
+        flags: MonitorFlags::PRIMARY,
+    }
+}
+
 // ============================================================================
 // AVC444 Encoding Helper
 // ============================================================================
@@ -2783,6 +2801,52 @@ mod tests {
             .position(|pdu| matches!(pdu, GfxPdu::CreateSurface(_)))
             .expect("CreateSurface queued");
         assert!(reset_at < create_at, "ResetGraphics must precede CreateSurface");
+    }
+
+    fn reset_graphics_in(server: &mut GraphicsPipelineServer) -> ResetGraphicsPdu {
+        server
+            .output_queue
+            .drain(..)
+            .find_map(|pdu| match pdu {
+                GfxPdu::ResetGraphics(reset) => Some(reset),
+                _ => None,
+            })
+            .expect("ResetGraphics queued")
+    }
+
+    /// RDPGFX_RESET_GRAPHICS_PDU carries the session's monitor layout
+    /// (MS-RDPEGFX 2.2.2.14) as TS_MONITOR_DEF entries, whose right and bottom
+    /// bounds are inclusive (MS-RDPBCGR 2.2.1.3.6.1).
+    ///
+    /// Regression: the first ResetGraphics described a monitor one pixel wider
+    /// and taller than the desktop (right = width, bottom = height), and one
+    /// sent for a mid-session resize carried no monitor at all.
+    #[test]
+    fn reset_graphics_describes_the_desktop_with_inclusive_bounds() {
+        let primary = |width: i32, height: i32| Monitor {
+            left: 0,
+            top: 0,
+            right: width - 1,
+            bottom: height - 1,
+            flags: MonitorFlags::PRIMARY,
+        };
+        let mut server = GraphicsPipelineServer::new(Box::new(DefaultsHandler));
+        server.handle_capabilities_advertise(v10_6_advertise());
+        server.set_output_dimensions(1920, 1080);
+        server.create_surface(1920, 1080).expect("surface created");
+
+        let first = reset_graphics_in(&mut server);
+        assert_eq!(first.monitors, vec![primary(1920, 1080)]);
+
+        server.resize(2560, 1440);
+        let resized = reset_graphics_in(&mut server);
+        assert_eq!((resized.width, resized.height), (2560, 1440));
+        assert_eq!(resized.monitors, vec![primary(2560, 1440)]);
+        assert_eq!(
+            GfxPdu::ResetGraphics(resized).size(),
+            340,
+            "MS-RDPEGFX 2.2.2.14: the PDU is always 340 bytes"
+        );
     }
 
     #[test]
