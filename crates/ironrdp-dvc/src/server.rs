@@ -157,6 +157,37 @@ pub struct DrdynvcServer {
     soft_sync_state: SoftSyncState,
     outgoing_tunnel_channels: BTreeMap<u32, SoftSyncTunnelType>,
     incoming_tunnel_channels: BTreeMap<u32, SoftSyncTunnelType>,
+    /// Tunnel frames that arrived before the client's Soft-Sync Response,
+    /// oldest first: MS-RDPEDYC 3.3.5.3.2 forbids reading them until then.
+    early_tunnel_frames: Vec<Vec<u8>>,
+}
+
+/// How many tunnel frames may wait for the Soft-Sync Response. The client
+/// sends the response before it writes to the tunnel, so only the ones that
+/// overtake it on the way wait here.
+const MAX_EARLY_TUNNEL_FRAMES: usize = 1024;
+
+/// The channel a DRDYNVC data PDU (Data First, Data, or their compressed
+/// forms) is for, read from its header alone; `None` for any other PDU.
+///
+/// MS-RDPEDYC 2.2: the header byte is `Cmd << 4 | Sp << 2 | cbId`, and the
+/// ChannelId field, 1, 2 or 4 bytes wide by cbId, follows it.
+fn data_channel_id(unframed: &[u8]) -> Option<u32> {
+    let header = *unframed.first()?;
+    // Cmd: 0x02 Data First, 0x03 Data, 0x06 and 0x07 their compressed forms.
+    if !matches!(header >> 4, 0x02 | 0x03 | 0x06 | 0x07) {
+        return None;
+    }
+    let id = unframed.get(1..)?;
+    match header & 0b11 {
+        0 => id.first().map(|&byte| u32::from(byte)),
+        1 => id
+            .get(..2)
+            .map(|bytes| u32::from(u16::from_le_bytes([bytes[0], bytes[1]]))),
+        _ => id
+            .get(..4)
+            .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+    }
 }
 
 impl fmt::Debug for DrdynvcServer {
@@ -185,6 +216,7 @@ impl DrdynvcServer {
             soft_sync_state: SoftSyncState::Idle,
             outgoing_tunnel_channels: BTreeMap::new(),
             incoming_tunnel_channels: BTreeMap::new(),
+            early_tunnel_frames: Vec::new(),
         }
     }
 
@@ -336,6 +368,9 @@ impl DrdynvcServer {
     }
 
     fn remove_by_channel_id(&mut self, id: u32) -> Option<DynamicChannel> {
+        // A later channel may get the same ID, and it was not moved.
+        self.outgoing_tunnel_channels.remove(&id);
+        self.incoming_tunnel_channels.remove(&id);
         self.dynamic_channels.remove(id).inspect(|dvc| {
             let type_id = dvc.processor_type_id();
 
@@ -424,6 +459,29 @@ impl DrdynvcServer {
         self.outgoing_tunnel_channels.get(&channel_id).copied()
     }
 
+    /// Whether a Soft-Sync Request moved any channel to a tunnel.
+    pub fn tunnels_channels(&self) -> bool {
+        !self.outgoing_tunnel_channels.is_empty()
+    }
+
+    /// The tunnel an encoded, unframed DRDYNVC PDU goes through, or `None`
+    /// for the DRDYNVC channel on the main connection.
+    ///
+    /// MS-RDPEDYC 3.3.5.3.1: "Immediately after sending this PDU [the
+    /// Soft-Sync Request], for each dynamic virtual channel, the server
+    /// manager MUST consistently use either a multitransport tunnel or the
+    /// DRDYNVC static virtual channel on the main RDP connection to send
+    /// data." Data of a channel the request moved goes through its tunnel,
+    /// from the request on. Data of every other channel, and every DRDYNVC PDU
+    /// that is not data (Capabilities, Create, Close, Soft-Sync), goes over
+    /// the main connection.
+    pub fn outgoing_tunnel(&self, unframed: &[u8]) -> Option<SoftSyncTunnelType> {
+        if self.outgoing_tunnel_channels.is_empty() {
+            return None;
+        }
+        data_channel_id(unframed).and_then(|channel_id| self.tunnel_for_outgoing_channel(channel_id))
+    }
+
     /// Returns whether the client has acknowledged the Soft-Sync request over TCP.
     pub const fn soft_sync_response_received(&self) -> bool {
         matches!(
@@ -436,17 +494,55 @@ impl DrdynvcServer {
     }
 
     /// Processes raw DRDYNVC data received through an established multitransport tunnel.
+    ///
+    /// MS-RDPEDYC 3.3.5.3.2: the server "MUST NOT begin to read dynamic
+    /// virtual channel data on any multitransport tunnel until after the
+    /// Soft-Sync Response PDU has been received", so what arrives earlier
+    /// waits, in order, and is read when the response comes.
     pub fn process_tunnel(&mut self, payload: &[u8]) -> PduResult<Vec<SvcMessage>> {
-        let pdu = decode_dvc_message(payload).map_err(|e| decode_err!(e))?;
-        let DrdynvcClientPdu::Data(data) = pdu else {
-            return Err(pdu_other_err!("only DVC data is permitted on a multitransport tunnel"));
-        };
-        if !self.incoming_tunnel_channels.contains_key(&data.channel_id()) {
-            return Err(pdu_other_err!(
-                "received tunneled data for a channel not selected by Soft-Sync"
-            ));
+        if !self.soft_sync_response_received() {
+            if self.early_tunnel_frames.len() >= MAX_EARLY_TUNNEL_FRAMES {
+                return Err(pdu_other_err!("too much tunnel data before the Soft-Sync Response"));
+            }
+            self.early_tunnel_frames.push(payload.to_vec());
+            return Ok(Vec::new());
         }
-        self.process_data(data)
+        self.read_tunnel_frame(payload)
+    }
+
+    /// One frame from a tunnel the client has switched to. Data of an open
+    /// channel is processed and a Close honored; anything else has no place
+    /// on a tunnel and is ignored rather than ending the session.
+    fn read_tunnel_frame(&mut self, payload: &[u8]) -> PduResult<Vec<SvcMessage>> {
+        let pdu = match decode_dvc_message(payload) {
+            Ok(pdu) => pdu,
+            Err(error) => {
+                warn!(%error, "ignoring a tunnel frame that is not a DRDYNVC PDU");
+                return Ok(Vec::new());
+            }
+        };
+        match pdu {
+            DrdynvcClientPdu::Data(data) => {
+                let channel_id = data.channel_id();
+                if !self.is_channel_opened(channel_id) {
+                    debug!(channel_id, "ignoring tunneled data for a channel that is not open");
+                    return Ok(Vec::new());
+                }
+                if !self.incoming_tunnel_channels.contains_key(&channel_id) {
+                    debug!(channel_id, "tunneled data for a channel the Soft-Sync did not move");
+                }
+                self.process_data(data)
+            }
+            DrdynvcClientPdu::Close(close) => {
+                debug!("Got DVC Close PDU through a tunnel: {close:?}");
+                self.remove_by_channel_id(close.channel_id());
+                Ok(Vec::new())
+            }
+            other => {
+                warn!(pdu = ?other, "ignoring a DRDYNVC PDU that has no place on a tunnel");
+                Ok(Vec::new())
+            }
+        }
     }
 
     fn process_data(&mut self, data: crate::pdu::DrdynvcDataPdu) -> PduResult<Vec<SvcMessage>> {
@@ -464,16 +560,18 @@ impl DrdynvcServer {
         Ok(resp)
     }
 
-    fn process_soft_sync_response(&mut self, response: crate::pdu::SoftSyncResponsePdu) -> PduResult<()> {
+    fn process_soft_sync_response(&mut self, response: crate::pdu::SoftSyncResponsePdu) -> PduResult<Vec<SvcMessage>> {
         let SoftSyncState::Active {
             requested_tunnels,
             response_received,
         } = &mut self.soft_sync_state
         else {
-            return Err(pdu_other_err!("received unexpected Soft-Sync response"));
+            warn!("ignoring a Soft-Sync Response to no request");
+            return Ok(Vec::new());
         };
         if *response_received {
-            return Err(pdu_other_err!("received duplicate Soft-Sync response"));
+            warn!("ignoring a second Soft-Sync Response");
+            return Ok(Vec::new());
         }
         for tunnel_type in response.tunnels_to_switch() {
             if !requested_tunnels.contains(tunnel_type) {
@@ -487,7 +585,14 @@ impl DrdynvcServer {
             .map(|(channel_id, tunnel_type)| (*channel_id, *tunnel_type))
             .collect();
         *response_received = true;
-        Ok(())
+
+        // The tunnels may be read from now on (3.3.5.3.2), starting with
+        // what arrived before the response.
+        let mut responses = Vec::new();
+        for frame in core::mem::take(&mut self.early_tunnel_frames) {
+            responses.extend(self.read_tunnel_frame(&frame)?);
+        }
+        Ok(responses)
     }
 }
 
@@ -573,13 +678,18 @@ impl SvcProcessor for DrdynvcServer {
             }
             DrdynvcClientPdu::Data(data) => {
                 if self.incoming_tunnel_channels.contains_key(&data.channel_id()) {
-                    return Err(pdu_other_err!("received TCP data for a channel selected by Soft-Sync"));
+                    // The client said it would use the tunnel for this
+                    // channel (3.2.5.3.2). Its data still counts.
+                    debug!(
+                        channel_id = data.channel_id(),
+                        "TCP data for a channel moved to a tunnel"
+                    );
                 }
                 resp.extend(self.process_data(data)?);
             }
             DrdynvcClientPdu::SoftSyncResponse(response) => {
                 debug!("Got DVC Soft-Sync Response PDU: {response:?}");
-                self.process_soft_sync_response(response)?;
+                resp.extend(self.process_soft_sync_response(response)?);
             }
         }
 
@@ -791,34 +901,200 @@ mod tests {
         assert!(!server.is_channel_opened(channel_id));
     }
 
-    #[test]
-    fn soft_sync_rejects_tunnel_data_until_the_client_responds() {
-        let mut server = DrdynvcServer::new();
-        let channel_id = server.dynamic_channels.insert_channel(TestDvc, ChannelState::Opened);
+    /// Answers every message with its own bytes, so a test sees what was
+    /// processed and in which order.
+    struct EchoDvc;
 
+    impl_as_any!(EchoDvc);
+
+    struct Raw(Vec<u8>);
+
+    impl ironrdp_core::Encode for Raw {
+        fn encode(&self, dst: &mut ironrdp_core::WriteCursor<'_>) -> ironrdp_core::EncodeResult<()> {
+            ironrdp_core::ensure_size!(in: dst, size: self.0.len());
+            dst.write_slice(&self.0);
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "Raw"
+        }
+
+        fn size(&self) -> usize {
+            self.0.len()
+        }
+    }
+
+    impl crate::DvcEncode for Raw {}
+
+    impl DvcProcessor for EchoDvc {
+        fn channel_name(&self) -> &str {
+            "echo"
+        }
+
+        fn start(&mut self, _channel_id: u32) -> PduResult<Vec<crate::DvcMessage>> {
+            Ok(Vec::new())
+        }
+
+        fn process(&mut self, _channel_id: u32, payload: &[u8]) -> PduResult<Vec<crate::DvcMessage>> {
+            Ok(alloc::vec![Box::new(Raw(payload.to_vec()))])
+        }
+    }
+
+    impl DvcServerProcessor for EchoDvc {}
+
+    fn client_data(channel_id: u32, data: &[u8]) -> Vec<u8> {
+        ironrdp_core::encode_vec(&DrdynvcClientPdu::Data(crate::pdu::DrdynvcDataPdu::Data(
+            crate::pdu::DataPdu::new(channel_id, data.to_vec()),
+        )))
+        .unwrap()
+    }
+
+    fn soft_sync_response() -> Vec<u8> {
+        ironrdp_core::encode_vec(&DrdynvcClientPdu::SoftSyncResponse(
+            crate::pdu::SoftSyncResponsePdu::new(alloc::vec![SoftSyncTunnelType::RELIABLE_UDP]),
+        ))
+        .unwrap()
+    }
+
+    /// The payloads of the Data PDUs the server answered with.
+    fn echoed(messages: &[SvcMessage]) -> Vec<Vec<u8>> {
+        decode_server_pdus(messages)
+            .into_iter()
+            .map(|pdu| match pdu {
+                DrdynvcServerPdu::Data(crate::pdu::DrdynvcDataPdu::Data(data)) => data.data().to_vec(),
+                other => panic!("expected data, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// MS-RDPEDYC 3.3.5.3.2: the server "MUST NOT begin to read dynamic
+    /// virtual channel data on any multitransport tunnel until after the
+    /// Soft-Sync Response PDU has been received".
+    ///
+    /// Regression: such data ended the session, and a tunnel frame that
+    /// overtakes the response on the network is ordinary.
+    #[test]
+    fn tunnel_data_waits_for_the_soft_sync_response() {
+        let mut server = DrdynvcServer::new();
+        let channel_id = server.dynamic_channels.insert_channel(EchoDvc, ChannelState::Opened);
         server.request_reliable_udp(alloc::vec![channel_id]).unwrap();
-        assert_eq!(
-            server.tunnel_for_outgoing_channel(channel_id),
-            Some(SoftSyncTunnelType::RELIABLE_UDP)
+
+        assert!(
+            server
+                .process_tunnel(&client_data(channel_id, b"first"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            server
+                .process_tunnel(&client_data(channel_id, b"second"))
+                .unwrap()
+                .is_empty()
         );
 
-        let tunnel_data = ironrdp_core::encode_vec(&DrdynvcClientPdu::Data(crate::pdu::DrdynvcDataPdu::Data(
-            crate::pdu::DataPdu::new(channel_id, Vec::new()),
-        )))
-        .unwrap();
-        assert!(server.process_tunnel(&tunnel_data).is_err());
+        let answers = server.process(&soft_sync_response()).unwrap();
+        assert_eq!(
+            echoed(&answers),
+            [b"first".to_vec(), b"second".to_vec()],
+            "read in order, once the response is in"
+        );
 
-        server
-            .process_soft_sync_response(crate::pdu::SoftSyncResponsePdu::new(alloc::vec![
-                SoftSyncTunnelType::RELIABLE_UDP,
-            ]))
-            .unwrap();
+        let answers = server.process_tunnel(&client_data(channel_id, b"third")).unwrap();
+        assert_eq!(echoed(&answers), [b"third".to_vec()]);
+    }
 
-        assert!(server.soft_sync_response_received());
-        assert!(server.process_tunnel(&tunnel_data).is_ok());
+    /// MS-RDPEDYC 3.3.5.3.1: immediately after the Soft-Sync Request the
+    /// server "MUST consistently use either a multitransport tunnel or the
+    /// DRDYNVC static virtual channel" per channel. Data of a moved channel
+    /// takes the tunnel from the request on; everything else stays on TCP.
+    ///
+    /// Regression: nothing took the tunnel until the Soft-Sync Response, and
+    /// after it everything did, control PDUs and unmoved channels included.
+    #[test]
+    fn data_of_a_moved_channel_takes_the_tunnel_from_the_request_on() {
+        let mut server = DrdynvcServer::new();
+        let moved = server.dynamic_channels.insert_channel(EchoDvc, ChannelState::Opened);
+        let unmoved = server.dynamic_channels.insert_channel(TestDvc, ChannelState::Opened);
+        let data = |channel_id: u32| {
+            encode_dvc_messages(
+                channel_id,
+                alloc::vec![Box::new(Raw(alloc::vec![7; 3000]))],
+                ChannelFlags::empty(),
+            )
+            .unwrap()
+            .iter()
+            .map(|message| message.encode_unframed_pdu().unwrap())
+            .collect::<Vec<_>>()
+        };
+        let close = ironrdp_core::encode_vec(&DrdynvcServerPdu::Close(ClosePdu::new(moved))).unwrap();
 
-        server.close_channel(channel_id).unwrap();
-        assert!(server.request_reliable_udp(alloc::vec![channel_id]).is_err());
+        assert!(
+            data(moved).iter().all(|pdu| server.outgoing_tunnel(pdu).is_none()),
+            "no request yet"
+        );
+
+        server.request_reliable_udp(alloc::vec![moved]).unwrap();
+        let moved_data = data(moved);
+        assert_eq!(moved_data.len(), 2, "Data First and Data");
+        assert!(
+            moved_data
+                .iter()
+                .all(|pdu| server.outgoing_tunnel(pdu) == Some(SoftSyncTunnelType::RELIABLE_UDP))
+        );
+        assert!(data(unmoved).iter().all(|pdu| server.outgoing_tunnel(pdu).is_none()));
+        assert_eq!(server.outgoing_tunnel(&close), None, "control PDUs stay on TCP");
+    }
+
+    /// Channel IDs 1, 2 and 4 bytes wide (cbId, MS-RDPEDYC 2.2).
+    #[test]
+    fn the_channel_of_a_data_pdu_is_read_from_its_header() {
+        for channel_id in [5, 0x1234, 0x0012_3456] {
+            let pdu = client_data(channel_id, b"x");
+            assert_eq!(data_channel_id(&pdu), Some(channel_id));
+        }
+        assert_eq!(data_channel_id(&caps_response()), None);
+        assert_eq!(data_channel_id(&[]), None);
+    }
+
+    /// A channel ID the client closed and a later channel reuses was not
+    /// moved by the Soft-Sync: its data stays on TCP.
+    #[test]
+    fn a_reused_channel_id_does_not_inherit_the_tunnel() {
+        let mut server = DrdynvcServer::new();
+        let _ = server.process(&caps_response()).unwrap();
+        let (moved, _) = server.create_channel_boxed(Box::new(EchoDvc)).unwrap();
+        let _ = server.process(&create_response(moved)).unwrap();
+        server.request_reliable_udp(alloc::vec![moved]).unwrap();
+
+        let close = ironrdp_core::encode_vec(&DrdynvcClientPdu::Close(ClosePdu::new(moved))).unwrap();
+        let _ = server.process(&close).unwrap();
+
+        assert_eq!(server.tunnel_for_outgoing_channel(moved), None);
+    }
+
+    /// Anything on a tunnel other than data and Close is ignored; it does
+    /// not end the session.
+    #[test]
+    fn an_unexpected_tunnel_pdu_is_ignored() {
+        let mut server = DrdynvcServer::new();
+        let channel_id = server.dynamic_channels.insert_channel(EchoDvc, ChannelState::Opened);
+        server.request_reliable_udp(alloc::vec![channel_id]).unwrap();
+        let _ = server.process(&soft_sync_response()).unwrap();
+
+        assert!(server.process_tunnel(&caps_response()).unwrap().is_empty());
+        assert!(server.process_tunnel(&[0xFF, 0xFF]).unwrap().is_empty());
+        assert!(
+            server.process_tunnel(&client_data(999, b"x")).unwrap().is_empty(),
+            "no such channel"
+        );
+
+        let close = ironrdp_core::encode_vec(&DrdynvcClientPdu::Close(ClosePdu::new(channel_id))).unwrap();
+        assert!(server.process_tunnel(&close).unwrap().is_empty());
+        assert!(
+            !server.is_channel_opened(channel_id),
+            "a Close through the tunnel is honored"
+        );
     }
 
     #[test]
