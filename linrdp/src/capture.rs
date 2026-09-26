@@ -219,7 +219,9 @@ impl X11Display {
             tracing::debug!("fixed desktop size — ignoring client layout change");
             return;
         }
-        let Some(monitor) = layout.monitors().first() else {
+        // The primary monitor is the desktop's (0, 0) (MS-RDPEDISP
+        // 2.2.2.2.1); it need not come first.
+        let Some(monitor) = layout.primary_monitor() else {
             return;
         };
         let (w, h) = (monitor.width() as u16, monitor.height() as u16);

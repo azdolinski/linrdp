@@ -174,6 +174,23 @@ impl DisplayControlCapabilities {
     pub fn max_monitor_area(&self) -> u64 {
         self.max_monitor_area
     }
+
+    /// One monitor of up to 3840 x 2400 pixels: what a
+    /// [`DisplayControlServer`](crate::server::DisplayControlServer)
+    /// advertises unless told otherwise.
+    pub(crate) fn server_default() -> Self {
+        Self {
+            max_num_monitors: 1,
+            max_monitor_area_factor_a: 3840,
+            max_monitor_area_factor_b: 2400,
+            max_monitor_area: 9_216_000,
+        }
+    }
+
+    /// The most monitors a layout may have (`MaxNumMonitors`).
+    pub fn max_num_monitors(&self) -> u32 {
+        self.max_num_monitors
+    }
 }
 
 impl Encode for DisplayControlCapabilities {
@@ -294,6 +311,13 @@ impl DisplayControlMonitorLayout {
 
     pub fn monitors(&self) -> &[MonitorLayoutEntry] {
         &self.monitors
+    }
+
+    /// The monitor flagged `DISPLAYCONTROL_MONITOR_PRIMARY`, the one whose
+    /// upper-left corner is (0, 0) (MS-RDPEDISP 2.2.2.2.1). The first one if
+    /// the layout, against 2.2.2.2, flags several.
+    pub fn primary_monitor(&self) -> Option<&MonitorLayoutEntry> {
+        self.monitors.iter().find(|monitor| monitor.is_primary())
     }
 }
 

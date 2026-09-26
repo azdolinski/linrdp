@@ -106,7 +106,7 @@ impl DisplaySourceFactory for SessionDisplayFactory {
 
     fn request_layout(&self, layout: ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout) {
         match active() {
-            Some(desktop) => match layout.monitors().first() {
+            Some(desktop) => match layout.primary_monitor() {
                 Some(monitor) => desktop.resize(monitor.width(), monitor.height()),
                 None => desktop.frames().request_layout(layout),
             },
