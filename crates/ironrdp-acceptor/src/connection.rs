@@ -49,9 +49,10 @@ pub struct Acceptor {
     received_auto_reconnect: Option<ClientAutoReconnect>,
     reactivation: bool,
     honor_client_desktop_size: Option<DesktopSize>,
-    /// Whether to announce UDP/FECR multitransport support in the server GCC
-    /// blocks (TS_UD_SC_MULTITRANSPORT, section 2.2.1.4.6). Per 3.3.5.8 the
-    /// server only bootstraps a multitransport it announced here.
+    /// Whether to announce UDP/FECR multitransport and Soft-Sync support in
+    /// the server GCC blocks (TS_UD_SC_MULTITRANSPORT, section 2.2.1.4.6).
+    /// Per 3.3.5.8 the server only bootstraps a multitransport it announced
+    /// here.
     multitransport_announce: bool,
     /// Domain parameters merged from the client's MCS Connect Initial per
     /// 3.3.5.3.3, echoed back in the Connect Response.
@@ -261,13 +262,19 @@ impl Acceptor {
         self.honor_client_desktop_size = max;
     }
 
-    /// Announce UDP/FECR multitransport support in the server GCC blocks
-    /// (TS_UD_SC_MULTITRANSPORT, section 2.2.1.4.6).
+    /// Announce UDP/FECR multitransport and Soft-Sync support in the server
+    /// GCC blocks (TS_UD_SC_MULTITRANSPORT, section 2.2.1.4.6).
     ///
     /// [MS-RDPBCGR] 3.3.5.8 ties the later Server Initiate Multitransport
     /// Request to this announcement: a compliant client may reject a
     /// transport the server never advertised, so the embedder must enable
     /// this whenever it intends to bootstrap RDP-UDP. Disabled by default.
+    ///
+    /// Soft-Sync (`SOFTSYNC_TCP_TO_UDP`) comes with it: the server moves its
+    /// dynamic channels to the tunnel with a Soft-Sync Request, which
+    /// [MS-RDPEDYC] 3.1.5.3 allows only when both sides announce it, and a
+    /// client may answer the Initiate Multitransport Request with S_OK only
+    /// to a server that announced it (2.2.15.2).
     pub fn set_multitransport_announce(&mut self, announce: bool) {
         self.multitransport_announce = announce;
     }
@@ -1207,9 +1214,50 @@ fn create_gcc_blocks(
             mcs_message_channel_id: id,
         }),
         // TS_UD_SC_MULTITRANSPORT (2.2.1.4.6): announce the UDP/FECR
-        // transport the server is prepared to bootstrap (3.3.5.8).
+        // transport the server is prepared to bootstrap (3.3.5.8), and
+        // Soft-Sync, the only way this server moves dynamic channels to it
+        // ([MS-RDPEDYC] 3.1.5.3).
         multi_transport_channel: multitransport_announce.then(|| gcc::MultiTransportChannelData {
-            flags: gcc::MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR,
+            flags: gcc::MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR | gcc::MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server_blocks(multitransport_announce: bool) -> gcc::ServerGccBlocks {
+        create_gcc_blocks(
+            1003,
+            vec![1004],
+            SecurityProtocol::HYBRID,
+            false,
+            Some(1005),
+            multitransport_announce,
+        )
+    }
+
+    /// MS-RDPEDYC 3.1.5.3: "Soft-Sync MUST NOT be used unless it is supported
+    /// by both the server and client", each saying so with
+    /// SOFTSYNC_TCP_TO_UDP in its multitransport block. MS-RDPBCGR 2.2.15.2:
+    /// S_OK "MUST only be sent to a server that advertises" it.
+    ///
+    /// Regression: the server announced UDP/FECR alone, yet waited for S_OK
+    /// and then sent a Soft-Sync Request.
+    #[test]
+    fn a_multitransport_server_announces_soft_sync() {
+        let blocks = server_blocks(true);
+        let flags = blocks.multi_transport_channel.expect("TS_UD_SC_MULTITRANSPORT").flags;
+
+        assert_eq!(
+            flags,
+            gcc::MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR | gcc::MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP
+        );
+    }
+
+    #[test]
+    fn a_server_without_multitransport_announces_nothing() {
+        assert!(server_blocks(false).multi_transport_channel.is_none());
     }
 }
