@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use ironrdp_egfx::pdu::{Avc420Region, Encoding, PixelFormat};
 use ironrdp_egfx::server::{CLIENT_QUEUE_BACKOFF, GraphicsPipelineServer};
 use ironrdp_graphics::clearcodec::ClearCodecEncoder;
-use ironrdp_pdu::geometry::ExclusiveRectangle;
+use ironrdp_pdu::geometry::{ExclusiveRectangle, InclusiveRectangle};
 use ironrdp_server::{
     DesktopSize, DisplayUpdate, LargePointer, RdpServerDisplay, RdpServerDisplayUpdates,
     RGBAPointer, ServerResult,
@@ -291,10 +291,11 @@ enum DebtCause {
     ClearSendFailed,
     NoEncoder,
     H264SendFailed,
+    ClientRefresh,
 }
 
 impl DebtCause {
-    const COUNT: usize = 11;
+    const COUNT: usize = 12;
 
     fn idx(self) -> usize {
         match self {
@@ -309,6 +310,7 @@ impl DebtCause {
             Self::ClearSendFailed => 8,
             Self::NoEncoder => 9,
             Self::H264SendFailed => 10,
+            Self::ClientRefresh => 11,
         }
     }
 
@@ -324,6 +326,7 @@ impl DebtCause {
         "clear_send_failed",
         "no_encoder",
         "h264_send_failed",
+        "client_refresh",
     ];
 }
 
@@ -470,6 +473,8 @@ pub(crate) struct EgfxDisplay {
     /// Whether it is *used* additionally depends on what the client
     /// negotiates — see `EgfxUpdates::avc444v2_enabled`.
     avc444v2_allowed: bool,
+    /// Areas the client asked to have redrawn, for the display loop.
+    refresh: Arc<RefreshRequests>,
 }
 
 impl EgfxDisplay {
@@ -492,6 +497,7 @@ impl EgfxDisplay {
             bw_kbps,
             pointer_cache,
             avc444v2_allowed,
+            refresh: Arc::default(),
         }
     }
 }
@@ -510,6 +516,12 @@ impl RdpServerDisplay for EgfxDisplay {
         self.factory.request_layout(layout)
     }
 
+    fn request_refresh(&mut self, areas: &[InclusiveRectangle]) {
+        for area in areas.iter().filter_map(inclusive_to_xywh) {
+            self.refresh.add(area);
+        }
+    }
+
     async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
         let source = self.factory.updates_source();
         let settle_until = source.settle_until();
@@ -525,6 +537,8 @@ impl RdpServerDisplay for EgfxDisplay {
             last_h264: Instant::now() - H264_MIN_INTERVAL,
             pending_full: true,
             debt_rect: None,
+            refresh: Arc::clone(&self.refresh),
+            legacy_refresh: None,
             in_motion: false,
             motion_until: Instant::now(),
             caps_reset_until: Instant::now(),
@@ -615,6 +629,12 @@ struct EgfxUpdates {
     /// 4:2:0). Repaying only the region that actually went stale is the
     /// difference between a 1.07 MB full-screen repaint and a few KB.
     debt_rect: Option<(u16, u16, u16, u16)>,
+    /// Areas the client asked to have redrawn, filled by
+    /// [`EgfxDisplay::request_refresh`].
+    refresh: Arc<RefreshRequests>,
+    /// Those areas, owed to the legacy path: they join its next bitmap
+    /// update. On the graphics pipeline they are lossless debt instead.
+    legacy_refresh: Option<(u16, u16, u16, u16)>,
     /// Motion-mode state: H.264 frames were sent recently. While active,
     /// lossless partials are suppressed (they make static UI alternate
     /// between exact and 4:2:0-lossy colors — the user-visible pulse).
@@ -783,6 +803,14 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
                 continue;
             }
 
+            // MS-RDPBCGR 3.3.5.11.1: areas the client asked to have redrawn,
+            // whether or not they changed. Owing them a lossless paint also
+            // forces the next grab (`debt_due`), so a static screen gets it.
+            if let Some(area) = self.refresh.take() {
+                self.owe_region(area.0, area.1, area.2, area.3, DebtCause::ClientRefresh);
+                self.legacy_refresh = Some(self.legacy_refresh.map_or(area, |owed| union_rect(owed, area)));
+            }
+
             let cursor_due = self.cursor_last_poll.elapsed() >= CURSOR_POLL_INTERVAL;
             if cursor_due {
                 self.cursor_last_poll = Instant::now();
@@ -868,11 +896,13 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
                     // outright (protocol error). The EGFX path rides out the
                     // swap via the generation check instead.
                     self.egfx_latched = true;
+                    // The lossless debt covers the requested areas here.
+                    self.legacy_refresh = None;
                     handle.expect("EGFX decision implies a pipeline server")
                 }
                 EgfxDecision::Legacy => {
                     self.log_legacy_fallback(&state);
-                    if let Some(update) = grab.legacy_display_update() {
+                    if let Some(update) = legacy_update(&grab, self.legacy_refresh.take()) {
                         return Ok(Some(update));
                     }
                     if let Some(update) = self.pending_cursor.take() {
@@ -2375,6 +2405,49 @@ fn union_rect(a: (u16, u16, u16, u16), b: (u16, u16, u16, u16)) -> (u16, u16, u1
     (left, top, right - left, bottom - top)
 }
 
+/// Areas the client asked to have redrawn (MS-RDPBCGR 3.3.5.11.1), handed
+/// from the server's connection task to the display loop. Kept as one
+/// bounding box, like the lossless debt they turn into.
+#[derive(Default)]
+struct RefreshRequests(Mutex<Option<(u16, u16, u16, u16)>>);
+
+impl RefreshRequests {
+    fn add(&self, area: (u16, u16, u16, u16)) {
+        let mut pending = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *pending = Some(pending.map_or(area, |owed| union_rect(owed, area)));
+    }
+
+    fn take(&self) -> Option<(u16, u16, u16, u16)> {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take()
+    }
+}
+
+/// An Inclusive Rectangle (MS-RDPBCGR 2.2.11.1) as (x, y, w, h); `None` for
+/// an inverted one. The size saturates at the edge of the u16 range.
+fn inclusive_to_xywh(rect: &InclusiveRectangle) -> Option<(u16, u16, u16, u16)> {
+    let w = rect.right.checked_sub(rect.left)?.saturating_add(1);
+    let h = rect.bottom.checked_sub(rect.top)?.saturating_add(1);
+    Some((rect.left, rect.top, w, h))
+}
+
+/// `rect` cut to a `width` x `height` frame; `None` when nothing is left.
+fn clamp_to_frame((x, y, w, h): (u16, u16, u16, u16), width: u16, height: u16) -> Option<(u16, u16, u16, u16)> {
+    let w = w.min(width.checked_sub(x)?);
+    let h = h.min(height.checked_sub(y)?);
+    (w > 0 && h > 0).then_some((x, y, w, h))
+}
+
+/// The legacy bitmap update for `grab`: its damage, plus `refresh`, an area
+/// the client asked to have redrawn whether or not it changed.
+fn legacy_update(grab: &Grab, refresh: Option<(u16, u16, u16, u16)>) -> Option<DisplayUpdate> {
+    let refresh = refresh.and_then(|area| clamp_to_frame(area, grab.width, grab.height));
+    let region = match (grab.damage, refresh) {
+        (Some(damage), Some(refresh)) => union_rect(damage, refresh),
+        (damage, refresh) => damage.or(refresh)?,
+    };
+    grab.legacy_display_update_of(region)
+}
+
 fn half_of(pw: usize) -> usize {
     pw / 2
 }
@@ -2679,6 +2752,86 @@ mod avc444v2_tests {
                 "chroma V row {row}: left must be U, right V"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+
+    fn grab(width: u16, height: u16, damage: Option<(u16, u16, u16, u16)>) -> Grab {
+        Grab {
+            data: vec![0; usize::from(width) * usize::from(height) * 4],
+            width,
+            height,
+            damage,
+            changed_tiles: 0,
+            total_tiles: 1,
+        }
+    }
+
+    fn bitmap_area(update: Option<DisplayUpdate>) -> (u16, u16, u16, u16) {
+        match update {
+            Some(DisplayUpdate::Bitmap(bitmap)) => (bitmap.x, bitmap.y, bitmap.width.get(), bitmap.height.get()),
+            other => panic!("expected a bitmap update, got {other:?}"),
+        }
+    }
+
+    /// MS-RDPBCGR 2.2.11.1: right and bottom are inclusive.
+    #[test]
+    fn an_inclusive_rectangle_covers_its_last_row_and_column() {
+        let rect = |left, top, right, bottom| InclusiveRectangle {
+            left,
+            top,
+            right,
+            bottom,
+        };
+
+        assert_eq!(inclusive_to_xywh(&rect(0, 0, 1919, 1079)), Some((0, 0, 1920, 1080)));
+        assert_eq!(inclusive_to_xywh(&rect(5, 7, 5, 7)), Some((5, 7, 1, 1)));
+        assert_eq!(inclusive_to_xywh(&rect(10, 0, 9, 0)), None, "inverted");
+        assert_eq!(
+            inclusive_to_xywh(&rect(0, 0, u16::MAX, u16::MAX)),
+            Some((0, 0, u16::MAX, u16::MAX))
+        );
+    }
+
+    /// MS-RDPBCGR 3.3.5.11.1: "the server MUST send updated graphics data for
+    /// the region specified by the PDU" — also where nothing changed.
+    ///
+    /// Regression: a Refresh Rect only cleared the suppress-output flag, and a
+    /// static screen sent nothing at all.
+    #[test]
+    fn a_refresh_is_drawn_even_where_nothing_changed() {
+        let area = bitmap_area(legacy_update(&grab(64, 48, None), Some((8, 4, 16, 10))));
+        assert_eq!(area, (8, 4, 16, 10));
+    }
+
+    #[test]
+    fn a_refresh_and_the_damage_go_out_as_one_bitmap() {
+        let area = bitmap_area(legacy_update(&grab(64, 48, Some((40, 30, 8, 8))), Some((0, 0, 10, 10))));
+        assert_eq!(area, (0, 0, 48, 38));
+    }
+
+    /// A client can name an area beyond the desktop, e.g. an inclusive
+    /// rectangle computed for a larger window.
+    #[test]
+    fn a_refresh_is_cut_to_the_frame() {
+        let area = bitmap_area(legacy_update(&grab(64, 48, None), Some((60, 40, 100, 100))));
+        assert_eq!(area, (60, 40, 4, 8));
+
+        assert!(legacy_update(&grab(64, 48, None), Some((64, 0, 10, 10))).is_none());
+        assert!(legacy_update(&grab(64, 48, None), None).is_none());
+    }
+
+    #[test]
+    fn refresh_requests_merge_until_taken() {
+        let requests = RefreshRequests::default();
+        requests.add((0, 0, 10, 10));
+        requests.add((20, 20, 5, 5));
+
+        assert_eq!(requests.take(), Some((0, 0, 25, 25)));
+        assert_eq!(requests.take(), None);
     }
 }
 
