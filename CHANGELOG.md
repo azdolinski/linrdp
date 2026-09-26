@@ -69,6 +69,74 @@ Releasing is driven by this file: a push to `main` that adds a new
   closing one works in every state: a channel the client never heard of is
   simply dropped, and one whose creation is still unanswered is closed as soon
   as the client confirms it (#7).
+- The microphone works. The server now plays the recording side of
+  MS-RDPEAI: it sends Version, Sound Formats and Open first (3.3.5.1). The
+  AUDIO_INPUT channel is open only while an application in the session
+  records from `linrdp_mic`, and closes 2 s after the last one stops, so the
+  client's microphone is in use only then (3.1.4.1). The client's audio is
+  converted to the 48 kHz stereo that the session's microphone source reads
+  (#7).
+- UDP multitransport follows the rules for moving dynamic channels
+  (Soft-Sync, MS-RDPEDYC 3.1.5.3). The tunnel is offered only when both sides
+  announce `SOFTSYNC_TCP_TO_UDP`. The Initiate Multitransport Request goes out
+  during the connection sequence, after licensing (MS-RDPBCGR 1.3.1.1). It
+  used to go out after the connection finalization, and again on every
+  reactivation (#7).
+- Only the channels open at the Soft-Sync Request move to the tunnel, from the
+  request on. Control PDUs and channels opened later stay on TCP. Tunnel data
+  that arrives before the Soft-Sync Response waits for it; it used to end the
+  session, as did any other unexpected PDU on the tunnel (MS-RDPEDYC
+  3.3.5.3.1–2) (#7).
+- The UDP tunnel no longer drops graphics data when its queue is full
+  (MS-RDPEGFX 2.1). Losing the tunnel after channels moved to it ends the
+  session, so the client reconnects instead of keeping silent channels
+  (MS-RDPEMT 1.3.3). A reactivation keeps the tunnel (#7).
+- The graphics pipeline (#7):
+  - A client that re-advertises its capabilities no longer receives frames
+    for the surfaces it has just discarded, which caused protocol error
+    0xD06 (MS-RDPEGFX 3.2.5.18).
+  - A client that suspends frame acknowledgements no longer freezes the
+    display when it resumes them (3.2.5.13).
+  - A ClearCodec glyph dropped under backpressure is no longer referenced
+    later as a cache hit, which could garble small bitmaps (2.2.4.1).
+  - ResetGraphics describes the monitor with inclusive bounds and never as an
+    empty list (2.2.2.14).
+  - A malformed capability set is skipped instead of stalling the
+    negotiation. With no set in common, the channel is closed and the session
+    falls back to bitmaps; the server used to confirm a version the client
+    never offered (3.2.5.18–19).
+  - The negotiation response announces the graphics pipeline
+    (`DYNVC_GFX_PROTOCOL_SUPPORTED`, MS-RDPBCGR 2.2.1.2.1).
+- A refused login, such as a wrong password over TLS, reaches the client as a
+  proper Set Error Info PDU (MS-RDPBCGR 2.2.5.1.1). It used to arrive as four
+  bytes that no client can parse (#7).
+- An auto-reconnect cookie that does not verify, typically after a server
+  restart, no longer refuses the connection. The client's credentials are
+  checked as for any logon (MS-RDPBCGR 3.3.5.3.11) (#7).
+- Network auto-detection probes go only to clients that announce support
+  for them. No Network Characteristics Result is sent over TCP during the
+  session (MS-RDPBCGR 2.2.1.3.2, 1.3.9) (#7).
+- A Refresh Rect PDU, or resuming output after Suppress Output, redraws the
+  requested area even when nothing changed on screen (MS-RDPBCGR 3.3.5.11)
+  (#7).
+- Display Control (MS-RDPEDISP 3.1.5.2, 1.3) (#7):
+  - Invalid monitor layouts are ignored; they used to be applied or to end
+    the session.
+  - The primary monitor is used, not the first one listed.
+  - The advertised maximum matches the largest session screen (3840x2160).
+  - A resize without the graphics pipeline runs the
+    Deactivation-Reactivation Sequence, so the client sees the new size.
+- Clients without fast-path output get slow-path output in the form
+  MS-RDPBCGR 2.2.9.1.1 defines (#7):
+  - bitmap updates without a duplicated update type,
+  - pointers as Pointer PDUs,
+  - no surface commands or large pointers, which have no slow-path form,
+  - updates small enough for one PDU.
+- RDP-UDP: a client that offers only protocol version 1 or 2 stays on TCP;
+  it used to get a version 3 answer. The SYN+ACK carries the negotiated MTUs
+  (MS-RDPEUDP 3.1.5.1.3, 3.1.1.3) (#7).
+- Relative mouse movement, which the server announces, works on X11 and
+  libei (#7).
 
 ### Changed
 - The `wayland` cargo feature is on by default. It adds no build-time
