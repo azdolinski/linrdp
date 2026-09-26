@@ -31,8 +31,8 @@ use ironrdp_server::{RdpsndServerHandler, RdpsndServerMessage, ServerEvent, Serv
 use libpulse_binding as pulse;
 use tokio::sync::mpsc::UnboundedSender;
 
-type PaMainloop = pulse::mainloop::standard::Mainloop;
-type PaContext = pulse::context::Context;
+pub(crate) type PaMainloop = pulse::mainloop::standard::Mainloop;
+pub(crate) type PaContext = pulse::context::Context;
 
 /// The sink this session's desktop plays into, and the source its
 /// applications see as a microphone.
@@ -42,14 +42,14 @@ type PaContext = pulse::context::Context;
 /// The arrangement being replaced had one sink in one account's daemon, which
 /// is exactly how a second user came to hear the first user's desktop.
 const SINK: &str = "linrdp_audio";
-const MIC_SOURCE: &str = "linrdp_mic";
+pub(crate) const MIC_SOURCE: &str = "linrdp_mic";
 
 /// How long to wait before asking the gate again.
 ///
 /// Having nothing to attach to is the normal state for part of a connection's
 /// life: RDPSND negotiates while the logon screen is still up, so on the
 /// greeter port this is where the capture thread sits until someone logs in.
-const ATTACH_RETRY: Duration = Duration::from_millis(500);
+pub(crate) const ATTACH_RETRY: Duration = Duration::from_millis(500);
 
 /// How long any one step of attaching may take before it counts as failed.
 ///
@@ -434,7 +434,7 @@ impl RdpsndServerHandler for SystemSoundHandler {
 }
 
 /// What this worker may capture right now.
-enum Attach {
+pub(crate) enum Attach {
     /// Single-session, or console mode: whatever the environment names, as
     /// before. There the unit's description of the desktop is a correct one,
     /// because there is only ever one desktop to describe.
@@ -451,7 +451,7 @@ enum Attach {
     Nothing,
 }
 
-fn attach_point() -> Attach {
+pub(crate) fn attach_point() -> Attach {
     if !crate::session::gate::is_armed() {
         return Attach::Ambient;
     }
@@ -548,62 +548,12 @@ fn stream_from(
 ) -> anyhow::Result<()> {
     use pulse::stream::FlagSet as StreamFlags;
 
-    let mut mainloop = PaMainloop::new().ok_or_else(|| anyhow::anyhow!("pulse mainloop"))?;
-    let mut context = PaContext::new(&mainloop, "linrdp-capture").ok_or_else(|| anyhow::anyhow!("pulse context"))?;
-
-    // The server is passed explicitly rather than left to the environment.
-    // That is the whole point of the change: an explicit server string
-    // outranks `PULSE_SERVER`, so a unit that still exports one cannot
-    // redirect a session's audio to another account's daemon. The cookie has
-    // no such argument and comes from `PULSE_COOKIE`, which the gate set when
-    // it bound this session.
-    // Look at the socket first. libpulse answers a *missing* socket with
-    // `Access denied` — the same words it uses for a rejected cookie — and an
-    // explicit server string suppresses autospawn, so a session with no sound
-    // server of its own can never grow one while we wait. Saying which of the
-    // two it is turns a long investigation into one log line.
-    if let Some(target) = target
-        && !target.socket().exists()
-    {
-        anyhow::bail!("{}", no_daemon(target));
-    }
-
+    let abandon = || stop.lock().map(|g| *g).unwrap_or(true) || crate::session::gate::generation() != generation;
+    let Some((mut mainloop, mut context)) = connect(target, "linrdp-capture", &abandon)? else {
+        return Ok(());
+    };
     let server = target.map(|t| t.server.as_str());
-    context
-        .connect(server, pulse::context::FlagSet::NOFLAGS, None)
-        .map_err(|e| anyhow::anyhow!("connect to {}: {e}", server.unwrap_or("the default daemon")))?;
-    context.set_state_callback(Some(Box::new(|| {})));
-
-    let deadline = Instant::now() + ATTACH_TIMEOUT;
-    loop {
-        match context.get_state() {
-            pulse::context::State::Ready => break,
-            pulse::context::State::Failed | pulse::context::State::Terminated => {
-                anyhow::bail!(
-                    "{} refused the connection — is the cookie at {} readable?",
-                    server.unwrap_or("the default daemon"),
-                    target.map_or_else(|| "$PULSE_COOKIE".to_owned(), |t| t.cookie.display().to_string())
-                );
-            }
-            _ => {}
-        }
-        if stop.lock().map(|g| *g).unwrap_or(true) || crate::session::gate::generation() != generation {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            anyhow::bail!("{} did not answer within {ATTACH_TIMEOUT:?}", server.unwrap_or("the default daemon"));
-        }
-        iterate(&mut mainloop, "connecting")?;
-    }
-
-    // A session's own FIFO, or — with nothing bound — whatever the gate makes
-    // of the ambient environment. Both answers come from the same place the
-    // microphone writer asks, so the module we load and the file it is fed
-    // through can never disagree.
-    let fifo = target
-        .map(|t| t.mic_fifo())
-        .or_else(crate::session::gate::mic_fifo);
-    let previous = ensure_objects(&mut mainloop, &mut context, fifo.as_deref())?;
+    let previous = ensure_objects(&mut mainloop, &mut context)?;
 
     let mut map = pulse::channelmap::Map::default();
     map.init_stereo();
@@ -751,6 +701,68 @@ fn stream_from(
     Ok(())
 }
 
+/// Connect to `target`'s daemon, or with none to the ambient one, as `name`.
+///
+/// `None` when `abandon` says to stop waiting before the daemon answered.
+pub(crate) fn connect(
+    target: Option<&crate::session::gate::AudioTarget>,
+    name: &str,
+    abandon: &dyn Fn() -> bool,
+) -> anyhow::Result<Option<(PaMainloop, PaContext)>> {
+    let mut mainloop = PaMainloop::new().ok_or_else(|| anyhow::anyhow!("pulse mainloop"))?;
+    let mut context = PaContext::new(&mainloop, name).ok_or_else(|| anyhow::anyhow!("pulse context"))?;
+
+    // The server is passed explicitly rather than left to the environment.
+    // That is the whole point of the change: an explicit server string
+    // outranks `PULSE_SERVER`, so a unit that still exports one cannot
+    // redirect a session's audio to another account's daemon. The cookie has
+    // no such argument and comes from `PULSE_COOKIE`, which the gate set when
+    // it bound this session.
+    // Look at the socket first. libpulse answers a *missing* socket with
+    // `Access denied` — the same words it uses for a rejected cookie — and an
+    // explicit server string suppresses autospawn, so a session with no sound
+    // server of its own can never grow one while we wait. Saying which of the
+    // two it is turns a long investigation into one log line.
+    if let Some(target) = target
+        && !target.socket().exists()
+    {
+        anyhow::bail!("{}", no_daemon(target));
+    }
+
+    let server = target.map(|t| t.server.as_str());
+    context
+        .connect(server, pulse::context::FlagSet::NOFLAGS, None)
+        .map_err(|e| anyhow::anyhow!("connect to {}: {e}", server.unwrap_or("the default daemon")))?;
+    context.set_state_callback(Some(Box::new(|| {})));
+
+    let deadline = Instant::now() + ATTACH_TIMEOUT;
+    loop {
+        match context.get_state() {
+            pulse::context::State::Ready => break,
+            pulse::context::State::Failed | pulse::context::State::Terminated => {
+                anyhow::bail!(
+                    "{} refused the connection; is the cookie at {} readable?",
+                    server.unwrap_or("the default daemon"),
+                    target.map_or_else(|| "$PULSE_COOKIE".to_owned(), |t| t.cookie.display().to_string())
+                );
+            }
+            _ => {}
+        }
+        if abandon() {
+            return Ok(None);
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "{} did not answer within {ATTACH_TIMEOUT:?}",
+                server.unwrap_or("the default daemon")
+            );
+        }
+        iterate(&mut mainloop, "connecting")?;
+    }
+
+    Ok(Some((mainloop, context)))
+}
+
 /// Give the session's daemon the objects this session's audio needs.
 ///
 /// Idempotent, and done in-process through libpulse rather than by shelling
@@ -766,33 +778,22 @@ fn stream_from(
 ///
 /// Returns the default output the daemon had before, when it was another —
 /// to be given back on detach.
-fn ensure_objects(
-    mainloop: &mut PaMainloop,
-    context: &mut PaContext,
-    fifo: Option<&Path>,
-) -> anyhow::Result<Option<String>> {
+///
+/// The microphone is not made here: the microphone watcher (`mic.rs`) makes
+/// it, so it exists whether or not the client plays sound.
+fn ensure_objects(mainloop: &mut PaMainloop, context: &mut PaContext) -> anyhow::Result<Option<String>> {
     if !has_object(mainloop, context, Object::Sink, SINK)? {
         load_module(mainloop, context, "module-null-sink", &null_sink_args())?;
         tracing::info!(sink = SINK, "[audio-capture] created this session's sink");
     }
     let previous = default_sink(mainloop, context).filter(|name| name != SINK);
     set_default(mainloop, context, Object::Sink, SINK)?;
-
-    // No FIFO means no microphone for this attachment, which is a complete
-    // answer: the output direction does not depend on it.
-    let Some(fifo) = fifo else {
-        return Ok(previous);
-    };
-    // Nor does a microphone that cannot be made: losing the client's
-    // microphone must never cost the session its sound, which is what a
-    // refused pipe source used to do.
-    if let Err(error) = ensure_microphone(mainloop, context, fifo) {
-        tracing::warn!(error = format!("{error:#}"), "[audio-capture] no microphone for this session — sound still plays");
-    }
     Ok(previous)
 }
 
-fn ensure_microphone(mainloop: &mut PaMainloop, context: &mut PaContext, fifo: &Path) -> anyhow::Result<()> {
+/// Give the daemon the session's microphone: [`MIC_SOURCE`], a pipe source
+/// fed through `fifo`, and make it the default source.
+pub(crate) fn ensure_microphone(mainloop: &mut PaMainloop, context: &mut PaContext, fifo: &Path) -> anyhow::Result<()> {
     if !has_object(mainloop, context, Object::Source, MIC_SOURCE)? {
         prepare_fifo_dir(fifo);
         load_module(mainloop, context, "module-pipe-source", &pipe_source_args(fifo))?;
@@ -902,6 +903,46 @@ fn has_object(mainloop: &mut PaMainloop, context: &PaContext, kind: Object, name
         }
     }
     Ok(*found.borrow())
+}
+
+/// The index of the source called `name`, if the daemon has one.
+pub(crate) fn source_index(mainloop: &mut PaMainloop, context: &PaContext, name: &str) -> anyhow::Result<Option<u32>> {
+    let found = Rc::new(RefCell::new(None));
+    let slot = Rc::clone(&found);
+    let op = context.introspect().get_source_info_by_name(name, move |result| {
+        if let pulse::callbacks::ListResult::Item(info) = result {
+            *slot.borrow_mut() = Some(info.index);
+        }
+    });
+    pump(mainloop, &op, "look up a source")?;
+    let index = *found.borrow();
+    Ok(index)
+}
+
+/// One stream recording from a source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SourceOutput {
+    /// The index of the source it records from.
+    pub(crate) source: u32,
+    /// Whether it is paused.
+    pub(crate) corked: bool,
+}
+
+/// Every stream recording from any source of the daemon.
+pub(crate) fn source_outputs(mainloop: &mut PaMainloop, context: &PaContext) -> anyhow::Result<Vec<SourceOutput>> {
+    let found = Rc::new(RefCell::new(Vec::new()));
+    let slot = Rc::clone(&found);
+    let op = context.introspect().get_source_output_info_list(move |result| {
+        if let pulse::callbacks::ListResult::Item(info) = result {
+            slot.borrow_mut().push(SourceOutput {
+                source: info.source,
+                corked: info.corked,
+            });
+        }
+    });
+    pump(mainloop, &op, "list the recording streams")?;
+    let outputs = found.take();
+    Ok(outputs)
 }
 
 /// Load a module, and fail loudly if the daemon would not have it.

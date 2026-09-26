@@ -779,23 +779,6 @@ async fn serve() -> anyhow::Result<()> {
         .with_autodetect_baseline_rtt_handle(autodetect_baseline)
         .with_autodetect_bandwidth_handle(autodetect_bw)
         .with_pointer_cache_handle(pointer_cache)
-        .with_dynamic_channel_attacher(|dvc| {
-            // Write client mic audio into the PulseAudio pipe-source FIFO so
-            // Linux applications see it as a microphone (USB-sound-card model).
-            //
-            // The FIFO belongs to the session, so it is resolved when packets
-            // arrive rather than here: this channel is attached before the
-            // logon screen has accepted anyone, when no session exists yet.
-            let mut fifo = mic::MicFifo::new();
-            let channel = mic::MicInputChannel::new(Box::new(move |packet: Vec<u8>| {
-                fifo.write(&packet);
-            }));
-            *dvc = std::mem::replace(
-                dvc,
-                ironrdp_dvc::DrdynvcServer::new(),
-            )
-            .with_dynamic_channel(channel);
-        })
         .with_usb_factory(enable_usb.then(|| Box::new(usb::LoggingUsbDeviceFactory) as Box<dyn ironrdp_server::DeviceFactory>))
         .with_bitmap_codecs(ironrdp_pdu::rdp::capability_sets::BitmapCodecs(vec![
             ironrdp_pdu::rdp::capability_sets::Codec {
@@ -874,6 +857,11 @@ async fn serve() -> anyhow::Result<()> {
     // display pacing uses; heartbeat lets clients detect dead connections.
     server.enable_autodetect();
     server.enable_heartbeat(ironrdp_server::heartbeat::HeartbeatConfig::default());
+
+    // Microphone redirection (MS-RDPEAI): the AUDIO_INPUT channel is opened
+    // while an application in the session records from its microphone
+    // (3.1.4.1), not for the whole connection.
+    mic::spawn_watcher(server.event_sender().clone());
 
     // Continuous auto-detect (1.3.9): periodic RTT probes keep the RTT and
     // bandwidth estimates fresh, and the bandwidth window they pace doubles as

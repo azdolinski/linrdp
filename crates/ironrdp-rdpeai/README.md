@@ -1,12 +1,15 @@
 # IronRDP AUDIO_INPUT (MS-RDPEAI)
 
-Client-side [MS-RDPEAI][1] implementation over Dynamic Virtual Channels [MS-RDPEDYC][2].
+[MS-RDPEAI][1] implementation over Dynamic Virtual Channels [MS-RDPEDYC][2].
 
 This library includes:
 
 - AUDIO_INPUT PDU parse/serialize (`MSG_SNDIN_*`)
-- Dynamic virtual channel client processor
+- Dynamic virtual channel client processor (the side that captures)
 - Capture backend trait for feeding PCM packets upstream
+- Dynamic virtual channel server processor (the side that records): it
+  drives the initialization sequence and hands the client's audio to a
+  handler
 
 Minimum supported codec: `WAVE_FORMAT_PCM` (0x0001).
 
