@@ -841,6 +841,11 @@ pub struct RdpServer {
     /// Core Data `earlyCapabilityFlags`. MS-RDPBCGR 3.3.5.7.1: the Set Error
     /// Info PDU MUST NOT be sent to a client that did not set it.
     client_supports_errinfo: bool,
+    /// Whether the client set RNS_UD_CS_SUPPORT_NETCHAR_AUTODETECT: it
+    /// "supports network characteristics detection using the structures and
+    /// PDUs described in section 2.2.14" (MS-RDPBCGR 2.2.1.3.2). Auto-detect
+    /// requests go only to such a client.
+    client_supports_autodetect: bool,
     /// Whether the client advertised FASTPATH_OUTPUT_SUPPORTED (2.2.7.1.1).
     /// When it did not, display updates fall back to slow-path Share Data
     /// Update PDUs (MS-RDPBCGR 2.2.9.1.1) instead of failing the session.
@@ -1672,6 +1677,7 @@ impl RdpServer {
             pending_soft_sync: None,
             heartbeat: None,
             client_supports_errinfo: false,
+            client_supports_autodetect: false,
             client_fastpath_output: true,
             client_initiated_disconnect: false,
             connection_handler,
@@ -2091,6 +2097,9 @@ impl RdpServer {
     /// Auto-detect uses lightweight Share Data PDUs on the IO channel,
     /// separate from the ECHO DVC. It supports bandwidth measurement
     /// in addition to RTT and works even when DVC is unavailable.
+    ///
+    /// Probes go only to clients that advertise
+    /// `RNS_UD_CS_SUPPORT_NETCHAR_AUTODETECT` (MS-RDPBCGR 2.2.1.3.2).
     ///
     /// Send probes via [`ServerEvent::AutoDetectRttRequest`] and
     /// query results with [`rtt_snapshot()`](Self::rtt_snapshot).
@@ -3673,8 +3682,12 @@ impl RdpServer {
                 ServerEvent::AutoDetectRttRequest => {
                     // Auto-detect requests ride the MCS message channel
                     // ([MS-RDPBCGR] 2.2.14.3). With none negotiated (the client
-                    // did not request it), there is nowhere to send them.
-                    if let (Some(ad), Some(message_channel_id)) = (self.autodetect.as_mut(), message_channel_id) {
+                    // did not request it), there is nowhere to send them, and
+                    // a client without RNS_UD_CS_SUPPORT_NETCHAR_AUTODETECT
+                    // does not take them at all.
+                    if self.client_supports_autodetect
+                        && let (Some(ad), Some(message_channel_id)) = (self.autodetect.as_mut(), message_channel_id)
+                    {
                         let now_ms = monotonic_now_ms();
                         ad.expire_stale_probes(now_ms, crate::autodetect::RTT_PROBE_MAX_AGE_MS);
                         let request = ad.send_rtt_request(now_ms);
@@ -3684,23 +3697,14 @@ impl RdpServer {
                             .await
                             .map_err(|e| ServerError::io("write_all", e))?;
 
-                        // Report the measured characteristics to the client
-                        // ([MS-RDPBCGR] 2.2.14.1.5). The client does not reply. Sent only
-                        // once both RTT and bandwidth are known, and paced independently
-                        // of this probe cadence, so a fast caller does not turn into a
-                        // fast stream of unsolicited PDUs.
-                        if let Some(result) = ad.build_netchar_result(now_ms) {
-                            let data = encode_autodetect_request(result, message_channel_id, user_channel_id)?;
-                            writer
-                                .write_all(&data)
-                                .await
-                                .map_err(|e| ServerError::io("write_all", e))?;
-                        }
+                        // No Network Characteristics Result here: [MS-RDPBCGR]
+                        // 1.3.9 lists it among the main-connection messages of
+                        // Connect-Time Auto-Detection only. During Continuous
+                        // Auto-Detection it travels over sideband channels.
 
                         // Periodically measure bandwidth: Start on one tick, Stop several
                         // ticks later, with ordinary traffic in between counted by the
-                        // client, then a Bandwidth Measure Results PDU in reply. Until one
-                        // has completed there is no characteristics result to send at all.
+                        // client, then a Bandwidth Measure Results PDU in reply.
                         if let Some(pdu) = ad.build_bandwidth_measure() {
                             let data = encode_autodetect_request(pdu, message_channel_id, user_channel_id)?;
                             writer
@@ -4307,6 +4311,9 @@ impl RdpServer {
         self.client_supports_errinfo = result
             .client_early_capability_flags
             .contains(ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU);
+        self.client_supports_autodetect = result
+            .client_early_capability_flags
+            .contains(ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::SUPPORT_NET_CHAR_AUTODETECT);
 
         // MS-RDPEGFX 1.5: a client implementing the graphics pipeline MUST
         // advertise RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL here. This is the
@@ -4802,6 +4809,118 @@ impl RdpServer {
     pub fn set_credentials(&mut self, creds: Option<Credentials>) {
         debug!(?creds, "Changing credentials");
         self.creds = creds
+    }
+}
+
+#[cfg(test)]
+mod autodetect_tests {
+    use ironrdp_pdu::rdp::autodetect::{AutoDetectReqPdu, AutoDetectRequest, AutoDetectResponse};
+    use tokio::io::AsyncReadExt as _;
+
+    use super::*;
+
+    /// The Auto-Detect Requests in what the server wrote, in order.
+    fn requests(mut written: &[u8]) -> Vec<AutoDetectRequest> {
+        let mut requests = Vec::new();
+        while !written.is_empty() {
+            // TPKT: version, reserved, then the length, big-endian (T.123).
+            let length = usize::from(u16::from_be_bytes([written[2], written[3]]));
+            let (frame, rest) = written.split_at(length);
+            let indication = decode::<X224<SendDataIndication<'_>>>(frame)
+                .expect("MCS Send Data Indication")
+                .0;
+            let pdu = decode::<AutoDetectReqPdu>(&indication.user_data).expect("Auto-Detect Request PDU");
+            requests.push(pdu.request);
+            written = rest;
+        }
+        requests
+    }
+
+    /// What one probe tick sends.
+    async fn probe(server: &mut RdpServer) -> Vec<AutoDetectRequest> {
+        let (mut client, server_side) = tokio::io::duplex(64 * 1024);
+        let mut writer = TokioFramed::new(server_side);
+        let mut events = vec![ServerEvent::AutoDetectRttRequest];
+        server
+            .dispatch_server_events(&mut events, &mut writer, 1003, 1007, Some(1008))
+            .await
+            .expect("dispatched");
+        drop(writer);
+
+        let mut written = Vec::new();
+        client.read_to_end(&mut written).await.expect("read");
+        requests(&written)
+    }
+
+    fn server_with_autodetect() -> RdpServer {
+        let mut server = RdpServer::builder()
+            .with_addr(([127, 0, 0, 1], 0))
+            .with_no_security()
+            .with_no_input()
+            .with_no_display()
+            .build();
+        server.enable_autodetect();
+        server
+    }
+
+    /// MS-RDPBCGR 2.2.1.3.2: RNS_UD_CS_SUPPORT_NETCHAR_AUTODETECT "indicates
+    /// that the client supports network characteristics detection using the
+    /// structures and PDUs described in section 2.2.14".
+    ///
+    /// Regression: every client got the probes.
+    #[tokio::test]
+    async fn auto_detect_goes_only_to_a_client_that_supports_it() {
+        let mut server = server_with_autodetect();
+        assert!(probe(&mut server).await.is_empty());
+
+        server.client_supports_autodetect = true;
+        assert!(matches!(
+            probe(&mut server).await.first(),
+            Some(AutoDetectRequest::RttRequest { .. })
+        ));
+    }
+
+    /// MS-RDPBCGR 1.3.9: over the main connection, Continuous Auto-Detection
+    /// sends RTT Measure Requests and Bandwidth Measure Start and Stop. The
+    /// Network Characteristics Result is a connect-time message there.
+    ///
+    /// Regression: one followed the probes as soon as both figures were
+    /// known.
+    #[tokio::test]
+    async fn continuous_auto_detect_sends_no_network_characteristics_result() {
+        let mut server = server_with_autodetect();
+        server.client_supports_autodetect = true;
+
+        // Measure both figures, which is when a result used to go out.
+        let manager = server.autodetect.as_mut().expect("enabled");
+        let AutoDetectRequest::RttRequest { sequence_number, .. } = manager.send_rtt_request(0) else {
+            panic!("an RTT request");
+        };
+        manager.handle_response(&AutoDetectResponse::RttResponse { sequence_number }, 20);
+        let stop = (0..1000)
+            .find_map(|_| match manager.build_bandwidth_measure() {
+                Some(AutoDetectRequest::BandwidthMeasureStop { sequence_number, .. }) => Some(sequence_number),
+                _ => None,
+            })
+            .expect("a bandwidth measurement completes");
+        manager.handle_response(
+            &AutoDetectResponse::BandwidthMeasureResults {
+                sequence_number: stop,
+                response_type: 0x0003,
+                time_delta_ms: 100,
+                byte_count: 125_000,
+            },
+            30,
+        );
+
+        let sent = probe(&mut server).await;
+        assert!(!sent.is_empty());
+        assert!(
+            !sent
+                .iter()
+                .any(|request| matches!(request, AutoDetectRequest::NetworkCharacteristicsResult { .. })),
+            "sent {sent:?}"
+        );
     }
 }
 
