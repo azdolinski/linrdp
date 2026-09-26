@@ -161,6 +161,16 @@ impl Default for ConnectionConfig {
 /// so the effective limit is whichever of the two is smaller.
 const RDPEUDP2_MTU: usize = 1232;
 
+/// The range MS-RDPEUDP 3.1.1.3 allows for `uUpStreamMtu`/`uDownStreamMtu`.
+const MTU_RANGE: core::ops::RangeInclusive<u16> = 1132..=1232;
+
+/// One direction's negotiated MTU (MS-RDPEUDP 3.1.1.3): the smaller of what
+/// the sender can produce and the receiver can accept, kept inside
+/// [`MTU_RANGE`].
+fn negotiated_mtu(sender: u16, receiver: u16) -> u16 {
+    sender.min(receiver).clamp(*MTU_RANGE.start(), *MTU_RANGE.end())
+}
+
 /// What a data packet spends on framing before any payload: the
 /// PacketPrefixByte (1), the RDP-UDP2 header (2), the DataHeader (2) and the
 /// DataBody's ChannelSeqNum (2).
@@ -438,34 +448,39 @@ impl RdpeudpConnection {
             )
         })?;
 
-        // Version settlement: the SYN+ACK's uUdpVer is authoritative
-        // (MS-RDPEUDP 3.1.5.1.3: "MUST be set to the highest RDP-UDP protocol
-        // version supported by both endpoints"), and `enqueue_syn_ack` below
-        // always answers with version 3. mstsc offers version 2 in its SYN —
-        // the offer is what the client wants to speak at minimum; accepting
-        // it and answering v3 lets the client upgrade, which Win11 mstsc
-        // does (verified live: refusing the offer made mstsc abort its UDP
-        // bootstrap with E_ABORT and fall back to TCP). The caller (tokio
-        // wrapper) logs the offered version for diagnostics; this crate is
-        // logging-free by design.
-        let offered_below_v3 = syn_data_ex.udp_ver.0 < UdpVersion::V3.0;
+        // Version settlement. The SYN's uUdpVer is "the highest RDP-UDP
+        // protocol version supported by the endpoint" (MS-RDPEUDP 3.1.5.1.1;
+        // without RDPUDP_VERSION_INFO_VALID it offers version 1), and the
+        // SYN+ACK's MUST be "the highest RDP-UDP protocol version supported by
+        // both endpoints" (3.1.5.1.3). Only version 3 selects the MS-RDPEUDP2
+        // data transfer this crate implements (1.3.2.2), so a client offering
+        // 1 or 2 has no version in common with it: refuse, rather than answer
+        // with a version the client never offered. A client offering more than
+        // 3 settles on 3, the highest both support.
+        let offered = if syn_data_ex.syn_ex_flags.contains(SynExFlags::VERSION_INFO_VALID) {
+            syn_data_ex.udp_ver
+        } else {
+            UdpVersion::V1
+        };
+        if offered.0 < UdpVersion::V3.0 {
+            return Err(RdpeudpError::invalid_packet(
+                "accept",
+                "remote's highest protocol version is below 3; the highest version both endpoints support (MS-RDPEUDP 3.1.5.1.3) would use the MS-RDPEUDP data transfer, which is not implemented",
+            ));
+        }
 
-        // 3.1.5.1.1 requires the cookieHash only in a version 3 client→server
-        // SYN ("MUST NOT be present in any other case"), so the check applies
-        // only there. It is an anti-spoof convenience: the real binding to
-        // this multitransport request is the TLS layer plus the tunnel
-        // request_id/security_cookie exchange.
-        if !offered_below_v3 {
-            let offered_hash = syn_data_ex
-                .cookie_hash
-                .ok_or_else(|| RdpeudpError::invalid_packet("accept", "version 3 SYN carries no cookieHash"))?;
+        // 3.1.5.1.1: a version 3 SYN MUST carry the cookieHash, and a wrong
+        // one MUST reset the connection to version 2 — a version with no data
+        // transfer here, so a wrong hash refuses the connection instead.
+        let offered_hash = syn_data_ex
+            .cookie_hash
+            .ok_or_else(|| RdpeudpError::invalid_packet("accept", "version 3 SYN carries no cookieHash"))?;
 
-            if offered_hash != expected_hash {
-                return Err(RdpeudpError::invalid_packet(
-                    "accept",
-                    "cookieHash does not match the security cookie for this multitransport request",
-                ));
-            }
+        if offered_hash != expected_hash {
+            return Err(RdpeudpError::invalid_packet(
+                "accept",
+                "cookieHash does not match the security cookie for this multitransport request",
+            ));
         }
 
         let mut conn = Self::new(Side::Server, config);
@@ -489,7 +504,15 @@ impl RdpeudpConnection {
             log_window_size: conn.config.log_window_size,
         });
 
-        conn.enqueue_syn_ack(remote_isn, now);
+        // MS-RDPEUDP 3.1.1.3: the SYN+ACK carries the negotiated sizes, "the
+        // final negotiated MTU size", each the smaller of what one side can
+        // send and the other can receive. The client MUST NOT send more than
+        // uUpStreamMtu and the server MUST NOT send more than uDownStreamMtu;
+        // both stay within 1132..=1232.
+        let upstream_mtu = negotiated_mtu(syn_data.upstream_mtu, conn.config.downstream_mtu);
+        let downstream_mtu = negotiated_mtu(syn_data.downstream_mtu, conn.config.upstream_mtu);
+
+        conn.enqueue_syn_ack(remote_isn, upstream_mtu, downstream_mtu, now);
         conn.timers.set(Timer::Idle, now + conn.config.idle_timeout);
 
         Ok(conn)
@@ -901,7 +924,7 @@ impl RdpeudpConnection {
     }
 
     /// Build and enqueue the server SYN+ACK datagram.
-    fn enqueue_syn_ack(&mut self, remote_isn: u32, now: MonotonicInstant) {
+    fn enqueue_syn_ack(&mut self, remote_isn: u32, upstream_mtu: u16, downstream_mtu: u16, now: MonotonicInstant) {
         let datagram = V1Datagram {
             header: FecHeader {
                 sn_source_ack: remote_isn,
@@ -914,8 +937,8 @@ impl RdpeudpConnection {
             ack_of_acks: None,
             syn_data: Some(SynDataPayload {
                 initial_sequence_number: self.config.initial_sequence_number,
-                upstream_mtu: self.config.upstream_mtu,
-                downstream_mtu: self.config.downstream_mtu,
+                upstream_mtu,
+                downstream_mtu,
             }),
             correlation_id: None,
             syn_data_ex: Some(SynDataExPayload {
@@ -2131,5 +2154,88 @@ mod tests {
         conn.sample_handshake_rtt(sent_at + Duration::from_millis(40));
 
         assert_eq!(conn.rtt.srtt(), None);
+    }
+
+    /// A client SYN as `connect` builds it, decoded so a test can alter it.
+    fn client_syn(config: ConnectionConfig) -> V1Datagram {
+        let now = MonotonicInstant::from_millis(0);
+        let mut client = RdpeudpConnection::connect(config, now).expect("connect");
+        let syn = client.poll_transmit(now).expect("SYN queued");
+        decode::<V1Datagram>(&syn.contents).expect("decode SYN")
+    }
+
+    /// The SYN+ACK `accept` queued, decoded.
+    fn server_syn_ack(server: &mut RdpeudpConnection) -> V1Datagram {
+        let transmit = server
+            .poll_transmit(MonotonicInstant::from_millis(0))
+            .expect("SYN+ACK queued");
+        decode::<V1Datagram>(&transmit.contents).expect("decode SYN+ACK")
+    }
+
+    /// MS-RDPEUDP 3.1.5.1.3: the SYN+ACK's uUdpVer "MUST be set to the highest
+    /// RDP-UDP protocol version supported by both endpoints", and a SYN names
+    /// the highest its sender supports. A client whose highest is 1 or 2 has
+    /// no version in common with a server that implements only version 3.
+    ///
+    /// Regression: such a SYN was answered with version 3 all the same.
+    #[test]
+    fn a_syn_whose_highest_version_is_below_3_is_refused() {
+        for version in [UdpVersion::V1, UdpVersion::V2] {
+            let mut syn = client_syn(test_config());
+            let ex = syn.syn_data_ex.as_mut().expect("SYNEX");
+            ex.udp_ver = version;
+            ex.cookie_hash = None;
+
+            let refused = RdpeudpConnection::accept(test_config(), &syn, MonotonicInstant::from_millis(0));
+            assert!(refused.is_err(), "version {version:?} must not be answered with 3");
+        }
+    }
+
+    /// Without RDPUDP_VERSION_INFO_VALID the SYN offers version 1
+    /// (MS-RDPEUDP 3.1.5.1.1).
+    #[test]
+    fn a_syn_without_version_info_is_version_1() {
+        let mut syn = client_syn(test_config());
+        syn.syn_data_ex.as_mut().expect("SYNEX").syn_ex_flags = SynExFlags::empty();
+
+        assert!(RdpeudpConnection::accept(test_config(), &syn, MonotonicInstant::from_millis(0)).is_err());
+    }
+
+    /// A client offering more than version 3 settles on 3, the highest both
+    /// endpoints support.
+    #[test]
+    fn a_higher_offer_settles_on_version_3() {
+        let mut syn = client_syn(test_config());
+        syn.syn_data_ex.as_mut().expect("SYNEX").udp_ver = UdpVersion(0x0102);
+
+        let mut server =
+            RdpeudpConnection::accept(test_config(), &syn, MonotonicInstant::from_millis(0)).expect("accepted");
+        let syn_ack = server_syn_ack(&mut server);
+        assert_eq!(syn_ack.syn_data_ex.expect("SYNEX").udp_ver, UdpVersion::V3);
+    }
+
+    /// MS-RDPEUDP 3.1.1.3: the SYN+ACK carries the negotiated MTUs — for each
+    /// direction the smaller of what the sender can send and the receiver can
+    /// receive — not the server's own configuration.
+    #[test]
+    fn the_syn_ack_carries_the_negotiated_mtus() {
+        let client_config = ConnectionConfig {
+            upstream_mtu: 1200,
+            downstream_mtu: 1150,
+            ..test_config()
+        };
+        let syn = client_syn(client_config);
+
+        let mut server =
+            RdpeudpConnection::accept(test_config(), &syn, MonotonicInstant::from_millis(0)).expect("accepted");
+        let syn_data = server_syn_ack(&mut server).syn_data.expect("SynData");
+        assert_eq!(
+            syn_data.upstream_mtu, 1200,
+            "client to server: what the client can send"
+        );
+        assert_eq!(
+            syn_data.downstream_mtu, 1150,
+            "server to client: what the client can receive"
+        );
     }
 }
