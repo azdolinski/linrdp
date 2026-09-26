@@ -105,6 +105,13 @@ impl DvcProcessor for GfxDvcBridge {
             .expect("GfxServerHandle mutex poisoned")
             .close(channel_id)
     }
+
+    fn close_requested(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("GfxServerHandle mutex poisoned")
+            .close_requested()
+    }
 }
 
 impl DvcServerProcessor for GfxDvcBridge {}

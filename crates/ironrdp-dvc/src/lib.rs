@@ -106,6 +106,13 @@ pub trait DvcProcessor: AsAny + Send {
     fn process(&mut self, channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>>;
 
     fn close(&mut self, _channel_id: u32) {}
+
+    /// Whether the processor wants its channel closed, asked after every
+    /// `process`. The DVC manager then sends the processor's answer, then a
+    /// Close PDU (MS-RDPEDYC 2.2.4), and forgets the channel.
+    fn close_requested(&self) -> bool {
+        false
+    }
 }
 
 assert_obj_safe!(DvcProcessor);
