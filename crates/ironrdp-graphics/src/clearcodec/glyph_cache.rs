@@ -46,6 +46,15 @@ impl GlyphCache {
         }
     }
 
+    /// Put a slot back to `entry` — a glyph, or empty.
+    ///
+    /// Out-of-range indices are ignored, as in [`Self::store`].
+    pub fn restore(&mut self, index: u16, entry: Option<GlyphEntry>) {
+        if let Some(slot) = self.entries.get_mut(usize::from(index)) {
+            *slot = entry;
+        }
+    }
+
     /// Reset the entire glyph cache, removing all entries.
     pub fn reset(&mut self) {
         for slot in &mut self.entries {

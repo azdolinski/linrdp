@@ -1776,6 +1776,17 @@ impl EgfxUpdates {
         // MIN_IN_FLIGHT, which starved it further.
         self.producer_frames += 1;
         let delivered = sent.is_some();
+        // A glyph the encoder stored for this message exists on the client
+        // only if the message goes out (MS-RDPEGFX 2.2.4.1): keep it on
+        // delivery, forget it on a drop, or a later GLYPH_HIT points at a slot
+        // the client never filled.
+        if let Some(encoders) = self.encoders.as_mut() {
+            if delivered {
+                encoders.clear.commit_glyph();
+            } else {
+                encoders.clear.rollback_glyph();
+            }
+        }
         if delivered {
             // The message is on the wire: the session's next ClearCodec
             // message carries this one plus one.
