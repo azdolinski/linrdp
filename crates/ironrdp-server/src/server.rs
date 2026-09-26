@@ -4842,6 +4842,34 @@ fn encode_share_data_pdu(
     encode_vec(&X224(mcs_pdu)).map_err(ServerError::encode)
 }
 
+/// Encode a Server Initiate Multitransport Request PDU (MS-RDPBCGR 2.2.15.1)
+/// for the MCS message channel.
+///
+/// The PDU rides an MCS Send Data Indication on the negotiated message
+/// channel — the spec's MUST — framed by a Basic Security Header
+/// (SEC_TRANSPORT_REQ) rather than a Share Control header.
+fn encode_multitransport_request(
+    mt: &MultiTransportRequest,
+    message_channel_id: u16,
+    user_channel_id: u16,
+) -> ServerResult<Vec<u8>> {
+    let pdu = rdp::multitransport::MultitransportRequestPdu {
+        security_header: rdp::headers::BasicSecurityHeader {
+            flags: rdp::headers::BasicSecurityHeaderFlags::TRANSPORT_REQ,
+        },
+        request_id: mt.request_id,
+        requested_protocol: rdp::multitransport::RequestedProtocol::UdpFecR,
+        security_cookie: mt.security_cookie,
+    };
+    let user_data = encode_vec(&pdu).map_err(ServerError::encode)?.into();
+    let mcs_pdu = SendDataIndication {
+        initiator_id: user_channel_id,
+        channel_id: message_channel_id,
+        user_data,
+    };
+    encode_vec(&X224(mcs_pdu)).map_err(ServerError::encode)
+}
+
 #[cfg(test)]
 mod auto_reconnect_tests {
     use core::sync::atomic::AtomicUsize;
@@ -4928,34 +4956,6 @@ mod auto_reconnect_tests {
             .expect("read");
         assert!(!denied.is_empty(), "the refusal is still announced");
     }
-}
-
-/// Encode a Server Initiate Multitransport Request PDU (MS-RDPBCGR 2.2.15.1)
-/// for the MCS message channel.
-///
-/// The PDU rides an MCS Send Data Indication on the negotiated message
-/// channel — the spec's MUST — framed by a Basic Security Header
-/// (SEC_TRANSPORT_REQ) rather than a Share Control header.
-fn encode_multitransport_request(
-    mt: &MultiTransportRequest,
-    message_channel_id: u16,
-    user_channel_id: u16,
-) -> ServerResult<Vec<u8>> {
-    let pdu = rdp::multitransport::MultitransportRequestPdu {
-        security_header: rdp::headers::BasicSecurityHeader {
-            flags: rdp::headers::BasicSecurityHeaderFlags::TRANSPORT_REQ,
-        },
-        request_id: mt.request_id,
-        requested_protocol: rdp::multitransport::RequestedProtocol::UdpFecR,
-        security_cookie: mt.security_cookie,
-    };
-    let user_data = encode_vec(&pdu).map_err(ServerError::encode)?.into();
-    let mcs_pdu = SendDataIndication {
-        initiator_id: user_channel_id,
-        channel_id: message_channel_id,
-        user_data,
-    };
-    encode_vec(&X224(mcs_pdu)).map_err(ServerError::encode)
 }
 
 async fn deactivate_all(io_channel_id: u16, user_channel_id: u16, writer: &mut impl FramedWrite) -> ServerResult<()> {
