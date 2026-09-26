@@ -2983,11 +2983,8 @@ impl RdpServer {
         self.static_channels.get_channel_id_by_type::<T>()
     }
 
-    /// Write DVC (DRDYNVC) messages: unframed through the UDP tunnel once the
-    /// client's Soft-Sync response confirmed the migration, otherwise framed
-    /// on the TCP drdynvc channel.
     /// Bind the UDP tunnel and ask the client (via TCP DVC Soft-Sync) to move
-    /// every open dynamic channel to it.
+    /// every open dynamic channel to it. A channel opened later stays on TCP.
     async fn soft_sync(
         &mut self,
         to_tunnel: mpsc::Sender<Vec<u8>>,
@@ -3045,39 +3042,63 @@ impl RdpServer {
         Ok(())
     }
 
+    /// Write DVC (DRDYNVC) messages.
+    ///
+    /// Data of a channel the Soft-Sync Request moved goes through the UDP
+    /// tunnel, unframed, from the request on (MS-RDPEDYC 3.3.5.3.1). Data of
+    /// every other channel, and every DRDYNVC PDU that is not data, goes
+    /// framed over the TCP drdynvc channel.
     async fn write_dvc_messages(
         &mut self,
         messages: Vec<SvcMessage>,
         writer: &mut impl FramedWrite,
         user_channel_id: u16,
     ) -> ServerResult<()> {
-        let tunneled = self.udp_tunnel_tx.is_some()
-            && self
-                .get_svc_processor::<dvc::DrdynvcServer>()
-                .is_some_and(|d: &mut dvc::DrdynvcServer| d.soft_sync_response_received());
-        if tunneled {
-            self.send_to_tunnel(messages)?;
-        } else {
+        let (tunneled, direct) = self.route_dvc_messages(messages)?;
+        if !direct.is_empty() {
             let channel_id = self
                 .get_channel_id_by_type::<dvc::DrdynvcServer>()
                 .ok_or_else(|| ServerError::channel("DRDYNVC channel not found"))?;
-            let data =
-                server_encode_svc_messages(messages, channel_id, user_channel_id).map_err(ServerError::encode)?;
+            let data = server_encode_svc_messages(direct, channel_id, user_channel_id).map_err(ServerError::encode)?;
             writer
                 .write_all(&data)
                 .await
                 .map_err(|e| ServerError::io("write dvc messages", e))?;
         }
+        if !tunneled.is_empty() {
+            self.send_to_tunnel(tunneled)?;
+        }
         Ok(())
     }
 
-    /// Encode DVC messages unframed and hand them to the UDP tunnel pump.
-    fn send_to_tunnel(&self, messages: Vec<SvcMessage>) -> ServerResult<()> {
+    /// Split DVC messages into those for the tunnel, encoded unframed, and
+    /// those for the TCP drdynvc channel.
+    fn route_dvc_messages(&mut self, messages: Vec<SvcMessage>) -> ServerResult<(Vec<Vec<u8>>, Vec<SvcMessage>)> {
+        let Some(drdynvc) = self.get_svc_processor::<dvc::DrdynvcServer>() else {
+            return Ok((Vec::new(), messages));
+        };
+        if !drdynvc.tunnels_channels() {
+            return Ok((Vec::new(), messages));
+        }
+        let mut tunneled = Vec::new();
+        let mut direct = Vec::new();
+        for message in messages {
+            let unframed = message.encode_unframed_pdu().map_err(ServerError::encode)?;
+            if drdynvc.outgoing_tunnel(&unframed).is_some() {
+                tunneled.push(unframed);
+            } else {
+                direct.push(message);
+            }
+        }
+        Ok((tunneled, direct))
+    }
+
+    /// Hand encoded, unframed DVC messages to the UDP tunnel pump.
+    fn send_to_tunnel(&self, messages: Vec<Vec<u8>>) -> ServerResult<()> {
         let Some(tx) = self.udp_tunnel_tx.as_ref() else {
             return Err(ServerError::custom("udp tunnel", std::io::Error::other("no tunnel installed")));
         };
-        for msg in messages {
-            let bytes = msg.encode_unframed_pdu().map_err(ServerError::encode)?;
+        for bytes in messages {
             if tx.try_send(bytes).is_err() {
                 warn!("UDP tunnel write queue full; dropping DVC message");
             }
@@ -3360,10 +3381,10 @@ impl RdpServer {
                     let responses = drdynvc
                         .process_tunnel(&frame)
                         .map_err_kind("process tunnel data", ServerErrorKind::Pdu)?;
-                    // Responses to tunneled data always go back through the
-                    // tunnel — the client no longer reads these channels on TCP.
+                    // Answers follow their channel: through the tunnel for a
+                    // channel the Soft-Sync moved, over TCP otherwise.
                     if !responses.is_empty() {
-                        self.send_to_tunnel(responses)?;
+                        self.write_dvc_messages(responses, writer, user_channel_id).await?;
                     }
                 }
                 ServerEvent::Rdpdr(msg) => {
@@ -6614,5 +6635,147 @@ mod tests {
         .await;
         receive(&mut server, allow()).await;
         assert_eq!(*requested.lock().expect("recorder"), [area, desktop.clone()]);
+    }
+}
+
+#[cfg(test)]
+mod soft_sync_tests {
+    use ironrdp_core::impl_as_any;
+    use ironrdp_dvc::pdu::{CapabilitiesResponsePdu, CapsVersion, CreateResponsePdu, CreationStatus, DrdynvcClientPdu};
+    use ironrdp_dvc::{DvcEncode, DvcMessage, DvcProcessor, DvcServerProcessor};
+
+    use super::*;
+
+    struct Quiet;
+
+    impl_as_any!(Quiet);
+
+    impl DvcProcessor for Quiet {
+        fn channel_name(&self) -> &str {
+            "quiet"
+        }
+
+        fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
+            Ok(Vec::new())
+        }
+
+        fn process(&mut self, _channel_id: u32, _payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl DvcServerProcessor for Quiet {}
+
+    struct Payload(Vec<u8>);
+
+    impl ironrdp_core::Encode for Payload {
+        fn encode(&self, dst: &mut ironrdp_core::WriteCursor<'_>) -> ironrdp_core::EncodeResult<()> {
+            ironrdp_core::ensure_size!(in: dst, size: self.0.len());
+            dst.write_slice(&self.0);
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "Payload"
+        }
+
+        fn size(&self) -> usize {
+            self.0.len()
+        }
+    }
+
+    impl DvcEncode for Payload {}
+
+    fn drdynvc(server: &mut RdpServer) -> &mut dvc::DrdynvcServer {
+        server.get_svc_processor::<dvc::DrdynvcServer>().expect("DRDYNVC")
+    }
+
+    /// Opens a dynamic channel the way a client answers for one.
+    fn open_channel(server: &mut RdpServer) -> u32 {
+        let (channel_id, _) = drdynvc(server).create_channel_boxed(Box::new(Quiet)).expect("create");
+        let created = encode_vec(&DrdynvcClientPdu::Create(CreateResponsePdu::new(
+            channel_id,
+            CreationStatus::OK,
+        )))
+        .expect("encode");
+        drdynvc(server).process(&created).expect("Create Response");
+        channel_id
+    }
+
+    /// A server whose DRDYNVC channel has finished its capability exchange.
+    fn server() -> RdpServer {
+        let mut server = RdpServer::builder()
+            .with_addr(([127, 0, 0, 1], 0))
+            .with_no_security()
+            .with_no_input()
+            .with_no_display()
+            .build();
+        server.static_channels.insert(dvc::DrdynvcServer::new());
+        server
+            .static_channels
+            .attach_channel_id(core::any::TypeId::of::<dvc::DrdynvcServer>(), 1004);
+        let caps = encode_vec(&DrdynvcClientPdu::Capabilities(CapabilitiesResponsePdu::new(
+            CapsVersion::V2,
+        )))
+        .expect("encode");
+        drdynvc(&mut server).process(&caps).expect("Capabilities Response");
+        server
+    }
+
+    /// Data First and Data PDUs for `channel_id`.
+    fn data(channel_id: u32) -> Vec<SvcMessage> {
+        ironrdp_dvc::encode_dvc_messages(
+            channel_id,
+            vec![Box::new(Payload(vec![7; 3000]))],
+            ChannelFlags::empty(),
+        )
+        .expect("encode")
+    }
+
+    /// MS-RDPEDYC 3.3.5.3.1: immediately after the Soft-Sync Request the
+    /// server "MUST consistently use either a multitransport tunnel or the
+    /// DRDYNVC static virtual channel" for each channel. Data of the channels
+    /// the request moved goes through the tunnel; data of a channel opened
+    /// later, and every control PDU, over TCP.
+    ///
+    /// Regression: nothing took the tunnel until the Soft-Sync Response, and
+    /// then everything did.
+    #[tokio::test]
+    async fn after_the_soft_sync_request_only_moved_data_takes_the_tunnel() {
+        let mut server = server();
+        let moved = open_channel(&mut server);
+        let (to_tunnel, mut tunnel) = mpsc::channel(16);
+        let (_client, server_side) = tokio::io::duplex(64 * 1024);
+        let mut writer = TokioFramed::new(server_side);
+
+        server
+            .soft_sync(to_tunnel, &mut writer, 1007)
+            .await
+            .expect("Soft-Sync Request");
+        assert!(tunnel.try_recv().is_err(), "the request itself goes over TCP");
+
+        let later = open_channel(&mut server);
+        let close_later = drdynvc(&mut server).close_channel(later).expect("Close");
+        let mut messages = data(moved);
+        messages.extend(data(later));
+        messages.push(close_later);
+        let (tunneled, direct) = server.route_dvc_messages(messages).expect("routed");
+        assert_eq!(tunneled.len(), 2, "the moved channel's Data First and Data");
+        assert_eq!(direct.len(), 3, "the later channel's data and the Close");
+
+        server
+            .write_dvc_messages(data(moved), &mut writer, 1007)
+            .await
+            .expect("written");
+        let mut frames = Vec::new();
+        while let Ok(frame) = tunnel.try_recv() {
+            frames.push(frame);
+        }
+        assert_eq!(frames.len(), 2);
+        assert!(
+            frames
+                .iter()
+                .all(|frame| drdynvc(&mut server).outgoing_tunnel(frame).is_some())
+        );
     }
 }
