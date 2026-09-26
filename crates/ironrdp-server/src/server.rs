@@ -3879,17 +3879,28 @@ impl RdpServer {
     {
         debug!("Client accepted");
 
-        let is_auto_reconnect = if let Some(reconnect) = result.auto_reconnect.as_ref() {
-            if !self.verify_auto_reconnect_cookie(reconnect) {
-                warn!("Auto-reconnect cookie validation rejected");
-                send_access_denied(result.io_channel_id, result.user_channel_id, self.client_supports_errinfo, writer).await?;
-                return Err(ServerError::reason("auto-reconnect validation", "cookie rejected"));
-            }
+        // MS-RDPBCGR 3.3.5.7.1: whether this client takes the Set Error Info
+        // PDU that announces a refusal below. `self.client_supports_errinfo`
+        // is set only further down, and until then describes the previous
+        // connection.
+        let client_supports_errinfo = result
+            .client_early_capability_flags
+            .contains(ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU);
 
-            debug!("Auto-reconnect cookie validation accepted");
-            true
-        } else {
-            false
+        // MS-RDPBCGR 3.3.5.3.11: "If logon with the cookie fails, the
+        // credentials supplied in the Client Info PDU SHOULD be used" (5.5,
+        // step 6). A cookie that does not verify makes this an ordinary logon,
+        // with every check an ordinary logon gets.
+        let is_auto_reconnect = match result.auto_reconnect.as_ref() {
+            Some(reconnect) if self.verify_auto_reconnect_cookie(reconnect) => {
+                debug!("Auto-reconnect cookie validation accepted");
+                true
+            }
+            Some(_) => {
+                warn!("Auto-reconnect cookie validation rejected; logging on with the Client Info credentials");
+                false
+            }
+            None => false,
         };
 
         // Validate credentials if a validator is configured. The validator runs here, in the
@@ -3904,12 +3915,24 @@ impl RdpServer {
                     }
                     Ok(CredentialDecision::Reject) => {
                         warn!("Credential validation rejected");
-                        send_access_denied(result.io_channel_id, result.user_channel_id, self.client_supports_errinfo, writer).await?;
+                        send_access_denied(
+                            result.io_channel_id,
+                            result.user_channel_id,
+                            client_supports_errinfo,
+                            writer,
+                        )
+                        .await?;
                         return Err(ServerError::reason("credential validation", "rejected by validator"));
                     }
                     Err(e) => {
                         error!(error = %e, "Credential validator backend error");
-                        send_access_denied(result.io_channel_id, result.user_channel_id, self.client_supports_errinfo, writer).await?;
+                        send_access_denied(
+                            result.io_channel_id,
+                            result.user_channel_id,
+                            client_supports_errinfo,
+                            writer,
+                        )
+                        .await?;
                         return Err(ServerError::custom("credential validation", e));
                     }
                 }
@@ -4817,6 +4840,94 @@ fn encode_share_data_pdu(
         user_data,
     };
     encode_vec(&X224(mcs_pdu)).map_err(ServerError::encode)
+}
+
+#[cfg(test)]
+mod auto_reconnect_tests {
+    use core::sync::atomic::AtomicUsize;
+
+    use ironrdp_pdu::rdp::client_info::ClientAutoReconnect;
+
+    use super::*;
+
+    /// Counts its calls and refuses everyone.
+    struct Refuse(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl CredentialValidator for Refuse {
+        async fn validate(&self, _credentials: &Credentials) -> Result<CredentialDecision, CredentialValidationError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(CredentialDecision::Reject)
+        }
+    }
+
+    /// MS-RDPBCGR 3.3.5.3.11: "If logon with the cookie fails, the
+    /// credentials supplied in the Client Info PDU SHOULD be used".
+    ///
+    /// Regression: a cookie that did not verify ended the connection with
+    /// an access-denied error, however good the credentials were. And the
+    /// first connection's refusal was never announced: whether the client
+    /// takes a Set Error Info PDU was still unknown at that point.
+    #[tokio::test]
+    async fn a_cookie_that_does_not_verify_falls_back_to_the_credentials() {
+        let validated = Arc::new(AtomicUsize::new(0));
+        let mut server = RdpServer::builder()
+            .with_addr(([127, 0, 0, 1], 0))
+            .with_no_security()
+            .with_no_input()
+            .with_no_display()
+            .build();
+        server.set_credential_validator(Some(Arc::new(Refuse(Arc::clone(&validated)))));
+
+        let result = AcceptorResult {
+            static_channels: StaticChannelSet::new(),
+            capabilities: Vec::new(),
+            input_events: Vec::new(),
+            user_channel_id: 1007,
+            io_channel_id: 1003,
+            message_channel_id: None,
+            reactivation: false,
+            desktop_size: DesktopSize {
+                width: 1024,
+                height: 768,
+            },
+            keyboard_layout: 0,
+            keyboard_type: ironrdp_pdu::gcc::KeyboardType::IBM_ENHANCED,
+            ime_file_name: String::new(),
+            client_cluster: None,
+            client_early_capability_flags: ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU,
+            multitransport_flags: ironrdp_pdu::gcc::MultiTransportFlags::empty(),
+            credentials: Some(Credentials {
+                username: "user".to_owned(),
+                password: "password".to_owned(),
+                domain: None,
+            }),
+            auto_reconnect: Some(ClientAutoReconnect {
+                logon_id: 1,
+                security_verifier: [0x42; 16],
+            }),
+        };
+
+        let (_client_reader, server_reader) = tokio::io::duplex(1024);
+        let (mut client_writer, server_writer) = tokio::io::duplex(64 * 1024);
+        let mut reader = TokioFramed::new(server_reader);
+        let mut writer = TokioFramed::new(server_writer);
+        let outcome = server.client_accepted(&mut reader, &mut writer, result).await;
+
+        assert_eq!(
+            validated.load(Ordering::Relaxed),
+            1,
+            "the credentials decide, not the cookie"
+        );
+        let error = outcome.expect_err("the validator refuses");
+        assert!(format!("{error}").contains("credential validation"), "{error}");
+        drop(writer);
+        let mut denied = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut client_writer, &mut denied)
+            .await
+            .expect("read");
+        assert!(!denied.is_empty(), "the refusal is still announced");
+    }
 }
 
 /// Encode a Server Initiate Multitransport Request PDU (MS-RDPBCGR 2.2.15.1)
