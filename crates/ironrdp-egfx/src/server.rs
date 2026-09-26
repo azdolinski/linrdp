@@ -537,6 +537,12 @@ pub struct FrameTracker {
     last_backpressure_state: bool,
     /// Tracks last-emitted ack_suspended state for the same reason.
     last_ack_suspended_state: bool,
+    /// The first frame ID sent after the client resumed acknowledgements.
+    /// Frames before it were sent while they were suspended and are not
+    /// tracked, so an acknowledgement for one of them has nothing to match —
+    /// that is expected, not a protocol violation. Cleared once a tracked
+    /// frame is acknowledged.
+    untracked_before: Option<u32>,
 }
 
 impl Default for FrameTracker {
@@ -559,6 +565,7 @@ impl FrameTracker {
             total_acked: 0,
             last_backpressure_state: false,
             last_ack_suspended_state: false,
+            untracked_before: None,
         }
     }
 
@@ -617,15 +624,20 @@ impl FrameTracker {
         let frame_id = self.next_frame_id;
         self.next_frame_id = self.next_frame_id.wrapping_add(1);
 
-        self.unacknowledged.insert(
-            frame_id,
-            FrameInfo {
+        // MS-RDPEGFX 3.2.5.13: while acknowledgements are suspended the server
+        // MUST NOT wait on unacknowledged frames, so none are tracked — the
+        // list would otherwise grow for as long as the suspension lasts.
+        if !self.ack_suspended {
+            self.unacknowledged.insert(
                 frame_id,
-                timestamp,
-                sent_at: Instant::now(),
-                size_bytes: 0,
-            },
-        );
+                FrameInfo {
+                    frame_id,
+                    timestamp,
+                    sent_at: Instant::now(),
+                    size_bytes: 0,
+                },
+            );
+        }
 
         self.total_sent += 1;
         // Edge-trigger after insert so a frame that pushes us to max_in_flight
@@ -643,18 +655,29 @@ impl FrameTracker {
 
     /// Handle frame acknowledgment from client
     pub fn acknowledge(&mut self, frame_id: u32, queue_depth: u32) -> Option<FrameInfo> {
+        let info = self.unacknowledged.remove(&frame_id);
+
         if queue_depth == SUSPEND_FRAME_ACK_QUEUE_DEPTH {
+            // MS-RDPEGFX 3.2.5.13: "the server MUST clear the Unacknowledged
+            // Frames ADM element and MUST NOT expect any further
+            // RDPGFX_FRAME_ACKNOWLEDGE_PDU messages from the client".
+            self.unacknowledged.clear();
             self.ack_suspended = true;
             self.client_queue_depth = 0;
+            self.untracked_before = None;
         } else {
+            if self.ack_suspended {
+                // Resumed. Everything sent until now went untracked.
+                self.untracked_before = Some(self.next_frame_id);
+            }
             self.ack_suspended = false;
             self.client_queue_depth = queue_depth;
         }
         self.client_queue_depth_at = Some(Instant::now());
 
-        let info = self.unacknowledged.remove(&frame_id);
         if info.is_some() {
             self.total_acked += 1;
+            self.untracked_before = None;
         }
         // Edge-trigger after remove so an ack that releases backpressure logs.
         self.emit_state_transitions();
@@ -724,6 +747,16 @@ impl FrameTracker {
         self.ack_suspended
     }
 
+    /// Whether `frame_id` was sent while acknowledgements were suspended, and
+    /// so was never tracked: an acknowledgement for it has nothing to match.
+    pub fn was_untracked(&self, frame_id: u32) -> bool {
+        self.untracked_before.is_some_and(|first_tracked| {
+            // Frame IDs wrap, so "before" is a wrapping distance.
+            let distance = first_tracked.wrapping_sub(frame_id);
+            distance != 0 && distance < u32::MAX / 2
+        })
+    }
+
     /// Get total frames sent
     pub fn total_sent(&self) -> u64 {
         self.total_sent
@@ -740,6 +773,7 @@ impl FrameTracker {
         self.client_queue_depth = 0;
         self.client_queue_depth_at = None;
         self.ack_suspended = false;
+        self.untracked_before = None;
     }
 }
 
@@ -2222,6 +2256,13 @@ impl GraphicsPipelineServer {
                 in_flight_after = self.frames.in_flight(),
                 "EGFX FrameAcknowledge received"
             );
+        } else if self.frames.was_untracked(pdu.frame_id) {
+            // A frame sent while acknowledgements were suspended: nothing
+            // was recorded for it (MS-RDPEGFX 3.2.5.13).
+            debug!(
+                frame_id = pdu.frame_id,
+                queue_depth, "EGFX FrameAcknowledge for a frame sent while acknowledgements were suspended"
+            );
         } else {
             // PROTOCOL COMPLIANCE: per MS-RDPEGFX 2.2.4.3 the client MUST only
             // acknowledge frame_ids the server has sent. An ack for an unknown
@@ -2568,6 +2609,51 @@ mod queue_depth_tests {
         tracker.acknowledge(0, super::SUSPEND_FRAME_ACK_QUEUE_DEPTH);
         assert_eq!(tracker.fresh_client_queue_depth(), None);
         assert!(!tracker.should_backpressure());
+    }
+
+    /// MS-RDPEGFX 3.2.5.13: on SUSPEND_FRAME_ACKNOWLEDGEMENT the server MUST
+    /// clear the Unacknowledged Frames ADM element and MUST NOT wait on
+    /// unacknowledged frames.
+    ///
+    /// Regression: the list was not cleared and every frame sent while
+    /// suspended was still added to it. It grew for the whole suspension, and
+    /// once the client resumed acknowledging, the in-flight count stayed above
+    /// the window forever — frames the client was never asked to acknowledge
+    /// held the display back.
+    #[test]
+    fn a_suspension_clears_the_list_and_a_resume_starts_from_nothing() {
+        let timestamp = super::Timestamp {
+            milliseconds: 0,
+            seconds: 0,
+            minutes: 0,
+            hours: 0,
+        };
+        let mut tracker = FrameTracker::new();
+        tracker.set_max_in_flight(2);
+        let first = tracker.begin_frame(timestamp);
+        let _second = tracker.begin_frame(timestamp);
+        assert!(tracker.should_backpressure(), "two frames fill a window of two");
+
+        tracker.acknowledge(first, super::SUSPEND_FRAME_ACK_QUEUE_DEPTH);
+        assert_eq!(tracker.in_flight(), 0, "a suspension clears the list");
+
+        for _ in 0..100 {
+            tracker.begin_frame(timestamp);
+        }
+        assert_eq!(tracker.in_flight(), 0, "nothing is tracked while suspended");
+        assert!(!tracker.should_backpressure());
+
+        // The client resumes by acknowledging a frame sent while suspended.
+        let sent_while_suspended = tracker.next_frame_id.wrapping_sub(1);
+        assert!(tracker.acknowledge(sent_while_suspended, 0).is_none());
+        assert!(tracker.was_untracked(sent_while_suspended), "expected, not a violation");
+        assert!(!tracker.should_backpressure());
+
+        let after_resume = tracker.begin_frame(timestamp);
+        assert_eq!(tracker.in_flight(), 1, "tracking resumes with the next frame");
+        assert!(!tracker.was_untracked(after_resume));
+        assert!(tracker.acknowledge(after_resume, 0).is_some());
+        assert_eq!(tracker.in_flight(), 0);
     }
 }
 
