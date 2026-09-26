@@ -72,12 +72,18 @@ use ironrdp_rdpeusb::{InterfaceAlloc, server::UrbdrcControlServer, server::Urbdr
 const LISTENER_BACKLOG: u32 = 1024;
 const AUTO_RECONNECT_COOKIE_UPDATE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
-/// Largest update payload carried in a single slow-path Share Data Update PDU
-/// (MS-RDPBCGR 2.2.9.1.1): the MCS PDU ceiling (65535) minus the Share Data
-/// Header (18), the updateType prefix (2) and X.224/MCS framing overhead.
-/// Slow-path has no fragmentation, so bigger updates are dropped with a
-/// warning rather than corrupted.
+/// Largest update payload carried in a single slow-path Share Data PDU
+/// (MS-RDPBCGR 2.2.9.1.1): the TPKT ceiling (65535) minus the Share Data
+/// Header (18), a pointer update's messageType and padding (4) and X.224/MCS
+/// framing overhead. Slow-path has no fragmentation, so bigger updates are
+/// dropped with a warning rather than corrupted.
 const MAX_SLOWPATH_UPDATE_SIZE: usize = 65_400;
+
+/// Largest uncompressed bitmap tile encoded for a slow-path client. The
+/// encoder splits damage into tiles of at most this many bytes of 32-bpp
+/// pixels, so that a compressed tile, which can come out slightly larger than
+/// its pixels, still fits [`MAX_SLOWPATH_UPDATE_SIZE`].
+const SLOWPATH_TILE_BYTES: u32 = 48 * 1024;
 
 /// How long a single [`ironrdp_acceptor::accept_finalize`] pass may take before
 /// the connection is dropped.
@@ -3026,31 +3032,27 @@ impl RdpServer {
             let mut fragmenter = fragmenter?;
 
             if !fastpath_output {
-                // MS-RDPBCGR 2.2.9.1.1: slow-path graphics/pointer updates —
-                // a Share Data Update PDU carrying the whole update body
-                // (updateType + data) in one shot. Slow-path has no
+                // MS-RDPBCGR 2.2.9.1.1: slow-path graphics and pointer
+                // updates, one Share Data PDU each. Slow-path has no
                 // fragmentation, so an update larger than what fits in a
                 // single MCS PDU is dropped (with a warning) rather than
                 // corrupted.
+                let code = fragmenter.update_code();
                 let payload = fragmenter.payload();
                 if payload.len() > MAX_SLOWPATH_UPDATE_SIZE {
                     warn!(
                         size = payload.len(),
                         max = MAX_SLOWPATH_UPDATE_SIZE,
-                        update_code = fragmenter.update_code().as_u8(),
+                        update_code = code.as_u8(),
                         "slow-path update too large for one PDU; dropping"
                     );
                     continue;
                 }
-                let mut body = Vec::with_capacity(2 + payload.len());
-                body.extend_from_slice(&u16::from(fragmenter.update_code().as_u8()).to_le_bytes());
-                body.extend_from_slice(payload);
-                let data = encode_share_data_pdu(
-                    rdp::headers::ShareDataPdu::Update(body),
-                    io_channel_id,
-                    io_channel_id,
-                    user_channel_id,
-                )?;
+                let Some(pdu) = slow_path_update(code, payload) else {
+                    warn!(update_code = code.as_u8(), "update has no slow-path form; dropping");
+                    continue;
+                };
+                let data = encode_share_data_pdu(pdu, io_channel_id, io_channel_id, user_channel_id)?;
                 budget.acquire(data.len()).await;
                 writer
                     .write_all(&data)
@@ -4118,12 +4120,25 @@ impl RdpServer {
             }
         }
 
+        // MS-RDPBCGR 2.2.9.1.1: slow-path output has no surface commands
+        // (2.2.9.1.2.1.10) and no Large Pointer Update (2.2.9.1.2.1.11); both
+        // exist only as fast-path updates. Each update also has to fit one
+        // PDU. So a slow-path client gets Bitmap Updates in small tiles, and
+        // pointers of at most 96x96.
+        let max_request_size = if self.client_fastpath_output {
+            self.opts.max_request_size
+        } else {
+            surface_flags = CmdFlags::empty();
+            large_pointer_flags.remove(LargePointerSupportFlags::UP_TO_384X384_PIXELS);
+            self.opts.max_request_size.min(SLOWPATH_TILE_BYTES)
+        };
+
         let desktop_size = self.display.lock().await.size().await;
         let encoder = UpdateEncoder::new(
             desktop_size,
             surface_flags,
             update_codecs,
-            self.opts.max_request_size,
+            max_request_size,
             pointer_cache_size,
             large_pointer_flags,
         )?;
@@ -4790,6 +4805,191 @@ impl DisplayBudget {
                 return;
             }
         }
+    }
+}
+
+/// The slow-path form of an encoded update (MS-RDPBCGR 2.2.9.1.1).
+///
+/// A Bitmap Update body is already `TS_UPDATE_BITMAP_DATA`, updateType
+/// included, which is all a slow-path `TS_UPDATE_BITMAP` carries after its
+/// Share Data Header (2.2.9.1.1.3.1). A pointer update becomes a
+/// `TS_POINTER_PDU`: messageType, padding, then the same attribute structure
+/// the fast-path update carries (2.2.9.1.1.4). `None` for what slow-path
+/// output cannot carry: surface commands and the Large Pointer Update are
+/// fast-path only, and the server produces no orders, palettes or
+/// synchronize updates.
+fn slow_path_update(code: ironrdp_pdu::fast_path::UpdateCode, payload: &[u8]) -> Option<rdp::headers::ShareDataPdu> {
+    use ironrdp_pdu::fast_path::UpdateCode;
+
+    const TS_PTRMSGTYPE_SYSTEM: u16 = 0x0001;
+    const TS_PTRMSGTYPE_POSITION: u16 = 0x0003;
+    const TS_PTRMSGTYPE_COLOR: u16 = 0x0006;
+    const TS_PTRMSGTYPE_CACHED: u16 = 0x0007;
+    const TS_PTRMSGTYPE_POINTER: u16 = 0x0008;
+    // TS_SYSTEMPOINTERATTRIBUTE (2.2.9.1.1.4.3).
+    const SYSPTR_NULL: u32 = 0x0000_0000;
+    const SYSPTR_DEFAULT: u32 = 0x0000_7F00;
+
+    let pointer = |message_type: u16, attribute: &[u8]| {
+        let mut body = Vec::with_capacity(4 + attribute.len());
+        body.extend_from_slice(&message_type.to_le_bytes());
+        body.extend_from_slice(&[0, 0]); // pad2Octets
+        body.extend_from_slice(attribute);
+        rdp::headers::ShareDataPdu::Pointer(body)
+    };
+
+    match code {
+        UpdateCode::Bitmap => Some(rdp::headers::ShareDataPdu::Update(payload.to_vec())),
+        UpdateCode::HiddenPointer => Some(pointer(TS_PTRMSGTYPE_SYSTEM, &SYSPTR_NULL.to_le_bytes())),
+        UpdateCode::DefaultPointer => Some(pointer(TS_PTRMSGTYPE_SYSTEM, &SYSPTR_DEFAULT.to_le_bytes())),
+        UpdateCode::PositionPointer => Some(pointer(TS_PTRMSGTYPE_POSITION, payload)),
+        UpdateCode::ColorPointer => Some(pointer(TS_PTRMSGTYPE_COLOR, payload)),
+        UpdateCode::CachedPointer => Some(pointer(TS_PTRMSGTYPE_CACHED, payload)),
+        UpdateCode::NewPointer => Some(pointer(TS_PTRMSGTYPE_POINTER, payload)),
+        UpdateCode::SurfaceCommands
+        | UpdateCode::LargePointer
+        | UpdateCode::Orders
+        | UpdateCode::Palette
+        | UpdateCode::Synchronize => None,
+    }
+}
+
+#[cfg(test)]
+mod slow_path_tests {
+    use core::num::{NonZeroU16, NonZeroUsize};
+
+    use ironrdp_core::ReadCursor;
+    use ironrdp_graphics::image_processing::PixelFormat;
+    use ironrdp_pdu::fast_path::UpdateCode;
+    use ironrdp_pdu::pointer::{CachedPointerAttribute, Point16, PointerUpdateData};
+    use ironrdp_pdu::slow_path::{
+        GraphicsUpdateType, decode_slow_path_bitmap, decode_slow_path_pointer, read_graphics_update_type,
+    };
+
+    use super::*;
+    use crate::display::BitmapUpdate;
+
+    /// Every PDU a slow-path client gets for `update`, encoded the way
+    /// `client_accepted` sets the encoder up for such a client.
+    async fn slow_path_pdus(update: DisplayUpdate) -> Vec<rdp::headers::ShareDataPdu> {
+        let mut encoder = UpdateEncoder::new(
+            DesktopSize {
+                width: 640,
+                height: 480,
+            },
+            CmdFlags::empty(),
+            UpdateEncoderCodecs::new(),
+            SLOWPATH_TILE_BYTES,
+            0,
+            LargePointerSupportFlags::empty(),
+        )
+        .expect("encoder");
+        let mut updates = encoder.update(update);
+        let mut pdus = Vec::new();
+        while let Some(fragmenter) = updates.next().await {
+            let fragmenter = fragmenter.expect("encoded");
+            assert!(
+                fragmenter.payload().len() <= MAX_SLOWPATH_UPDATE_SIZE,
+                "{} bytes do not fit one slow-path PDU",
+                fragmenter.payload().len()
+            );
+            pdus.push(slow_path_update(fragmenter.update_code(), fragmenter.payload()).expect("a slow-path form"));
+        }
+        pdus
+    }
+
+    fn pointer(pdu: &rdp::headers::ShareDataPdu) -> PointerUpdateData<'_> {
+        let rdp::headers::ShareDataPdu::Pointer(body) = pdu else {
+            panic!("expected a Pointer Update PDU, got {}", pdu.as_short_name());
+        };
+        let mut src = ReadCursor::new(body);
+        let pointer = decode_slow_path_pointer(&mut src).expect("TS_POINTER_PDU");
+        assert!(src.is_empty(), "nothing may follow the pointer attribute");
+        pointer
+    }
+
+    /// MS-RDPBCGR 2.2.9.1.1.3.1: after the Share Data Header, a slow-path
+    /// Bitmap Update is `TS_UPDATE_BITMAP_DATA`, which starts with its own
+    /// updateType.
+    ///
+    /// Regression: the server put a second updateType in front of it, so a
+    /// client read the first as the update type and the second as the
+    /// rectangle count. And the whole frame went into one update, far more
+    /// than one PDU can carry, so it was dropped.
+    #[tokio::test]
+    async fn a_frame_goes_out_as_bitmap_updates_that_each_fit_one_pdu() {
+        let pixels: Vec<u8> = (0..640 * 480 * 4)
+            .map(|i| u8::try_from(i % 251).expect("< 256"))
+            .collect();
+        let frame = DisplayUpdate::Bitmap(BitmapUpdate {
+            x: 0,
+            y: 0,
+            width: NonZeroU16::new(640).expect("width"),
+            height: NonZeroU16::new(480).expect("height"),
+            format: PixelFormat::BgrX32,
+            data: pixels.into(),
+            stride: NonZeroUsize::new(640 * 4).expect("stride"),
+        });
+
+        let pdus = slow_path_pdus(frame).await;
+        assert!(pdus.len() > 1, "a 640x480 frame does not fit one PDU");
+
+        let mut covered = 0u32;
+        for pdu in &pdus {
+            let rdp::headers::ShareDataPdu::Update(body) = pdu else {
+                panic!("expected an Update PDU, got {}", pdu.as_short_name());
+            };
+            let mut src = ReadCursor::new(body);
+            assert_eq!(
+                read_graphics_update_type(&mut src).expect("updateType"),
+                GraphicsUpdateType::Bitmap
+            );
+            let bitmap = decode_slow_path_bitmap(&mut src).expect("TS_UPDATE_BITMAP_DATA");
+            assert!(src.is_empty(), "nothing may follow the rectangles");
+            covered += bitmap
+                .rectangles
+                .iter()
+                .map(|rect| u32::from(rect.width) * u32::from(rect.height))
+                .sum::<u32>();
+        }
+        assert_eq!(covered, 640 * 480, "every pixel is sent once");
+    }
+
+    /// MS-RDPBCGR 2.2.9.1.1.4: a slow-path pointer update is a
+    /// `TS_POINTER_PDU` — messageType, padding and the pointer attribute.
+    /// Hiding and resetting the pointer are System Pointer Updates
+    /// (2.2.9.1.1.4.3).
+    ///
+    /// Regression: pointer updates went out as Update PDUs led by their
+    /// fast-path update code.
+    #[tokio::test]
+    async fn pointer_updates_go_out_as_pointer_pdus() {
+        let hidden = slow_path_pdus(DisplayUpdate::HidePointer).await;
+        assert!(matches!(pointer(&hidden[0]), PointerUpdateData::SetHidden));
+
+        let default = slow_path_pdus(DisplayUpdate::DefaultPointer).await;
+        assert!(matches!(pointer(&default[0]), PointerUpdateData::SetDefault));
+
+        let moved = slow_path_pdus(DisplayUpdate::PointerPosition(Point16 { x: 10, y: 20 })).await;
+        assert!(matches!(
+            pointer(&moved[0]),
+            PointerUpdateData::SetPosition(Point16 { x: 10, y: 20 })
+        ));
+
+        // TS_CACHEDPOINTERATTRIBUTE is the same in both paths (2.2.9.1.1.4.6).
+        let cached = slow_path_update(UpdateCode::CachedPointer, &5u16.to_le_bytes()).expect("a slow-path form");
+        assert!(matches!(
+            pointer(&cached),
+            PointerUpdateData::Cached(CachedPointerAttribute { cache_index: 5 })
+        ));
+    }
+
+    /// Surface commands (2.2.9.1.2.1.10) and the Large Pointer Update
+    /// (2.2.9.1.2.1.11) exist only in fast-path output.
+    #[test]
+    fn fast_path_only_updates_have_no_slow_path_form() {
+        assert!(slow_path_update(UpdateCode::SurfaceCommands, &[0; 8]).is_none());
+        assert!(slow_path_update(UpdateCode::LargePointer, &[0; 8]).is_none());
     }
 }
 
