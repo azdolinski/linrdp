@@ -2115,6 +2115,27 @@ impl RdpServer {
         self.gfx_handle.as_ref()
     }
 
+    /// Whether EGFX output drained in `generation` is still wanted by this
+    /// connection's pipeline (see `GraphicsPipelineServer::generation`).
+    ///
+    /// The pipeline resets while this loop processes a mid-session
+    /// CapsAdvertise and writes the new CapsConfirm straight away. Batches
+    /// the display thread drained before that are already queued as events
+    /// and would follow the confirm. MS-RDPEGFX 3.2.5.18: the client has
+    /// "disregarded all the messages sent by the server prior to
+    /// RDPGFX_CAPS_CONFIRM_PDU", so these batches address surfaces it no
+    /// longer has.
+    #[cfg(feature = "egfx")]
+    fn egfx_output_is_current(&self, generation: u64) -> bool {
+        self.gfx_handle.as_ref().is_some_and(|handle| {
+            handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .generation()
+                == generation
+        })
+    }
+
     fn attach_channels(&mut self, acceptor: &mut Acceptor) {
         if let Some(cliprdr_factory) = self.cliprdr_factory.as_deref() {
             let backend = cliprdr_factory.build_cliprdr_backend();
@@ -3616,8 +3637,16 @@ impl RdpServer {
                 },
                 #[cfg(feature = "egfx")]
                 ServerEvent::Egfx(msg) => match msg {
-                    EgfxServerMessage::SendMessages { messages } => {
-                        self.write_dvc_messages(messages, writer, user_channel_id).await?;
+                    EgfxServerMessage::SendMessages { messages, generation } => {
+                        if self.egfx_output_is_current(generation) {
+                            self.write_dvc_messages(messages, writer, user_channel_id).await?;
+                        } else {
+                            debug!(
+                                generation,
+                                count = messages.len(),
+                                "Dropping EGFX output drained before a pipeline reset or close"
+                            );
+                        }
                     }
                 },
                 ServerEvent::AutoDetectRttRequest => {
@@ -5872,6 +5901,46 @@ mod tests {
             Some(told),
             "the address the embedder accepted is the one it must be told about"
         );
+    }
+
+    /// MS-RDPEGFX 3.2.5.18: output drained before a mid-session
+    /// CapsAdvertise is void once the new CapsConfirm is out, and so is
+    /// output for a closed channel.
+    ///
+    /// Regression: the event loop wrote such batches after the confirm.
+    #[cfg(feature = "egfx")]
+    #[test]
+    fn egfx_output_goes_out_only_in_the_generation_it_was_drained_in() {
+        use ironrdp_dvc::DvcProcessor as _;
+        use ironrdp_egfx::pdu::{CapabilitiesAdvertisePdu, CapabilitySet};
+        use ironrdp_egfx::server::{GraphicsPipelineHandler, GraphicsPipelineServer};
+
+        struct Handler;
+
+        impl GraphicsPipelineHandler for Handler {
+            fn capabilities_advertise(&mut self, _pdu: &CapabilitiesAdvertisePdu) {}
+            fn on_ready(&mut self, _negotiated: &CapabilitySet) {}
+        }
+
+        let mut server = RdpServer::builder()
+            .with_addr(([127, 0, 0, 1], 0))
+            .with_no_security()
+            .with_no_input()
+            .with_no_display()
+            .build();
+
+        let pipeline = Arc::new(std::sync::Mutex::new(GraphicsPipelineServer::new(Box::new(Handler))));
+        let drained_in = pipeline.lock().expect("pipeline").generation();
+        assert!(
+            !server.egfx_output_is_current(drained_in),
+            "no pipeline on this connection"
+        );
+
+        server.gfx_handle = Some(Arc::clone(&pipeline));
+        assert!(server.egfx_output_is_current(drained_in));
+
+        pipeline.lock().expect("pipeline").close(0);
+        assert!(!server.egfx_output_is_current(drained_in));
     }
 
     /// Without being told, there is no address to invent.

@@ -56,6 +56,7 @@
 //! ```
 
 use std::collections::{HashMap, VecDeque};
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 use std::time::Instant;
 
@@ -1088,6 +1089,14 @@ enum ServerState {
 // Graphics Pipeline Server
 // ============================================================================
 
+/// Source of [`GraphicsPipelineServer::generation`] values, shared by every
+/// pipeline in the process so that no two generations are ever equal.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_generation() -> u64 {
+    NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Server for the Graphics Pipeline Virtual Channel (EGFX)
 ///
 /// This server handles capability negotiation, surface management,
@@ -1111,6 +1120,9 @@ pub struct GraphicsPipelineServer {
 
     /// Stored from DvcProcessor::start() for proactive frame encoding
     channel_id: Option<u32>,
+
+    /// See [`Self::generation`].
+    generation: u64,
 
     /// ZGFX compressor state (history buffer shared across frames)
     zgfx_compressor: Compressor,
@@ -1171,6 +1183,7 @@ impl GraphicsPipelineServer {
             reset_graphics_sent: false,
             output_queue: VecDeque::new(),
             channel_id: None,
+            generation: next_generation(),
             zgfx_compressor: Compressor::new(),
             compression_mode: CompressionMode::Never,
         }
@@ -1203,6 +1216,24 @@ impl GraphicsPipelineServer {
     #[must_use]
     pub fn channel_id(&self) -> Option<u32> {
         self.channel_id
+    }
+
+    /// Which output the client still expects from this pipeline.
+    ///
+    /// It changes whenever the client discards everything sent so far: on a
+    /// mid-session CapsAdvertise, after which the server MUST "assume that the
+    /// client has disregarded all the messages sent by the server prior to
+    /// RDPGFX_CAPS_CONFIRM_PDU" (MS-RDPEGFX 3.2.5.18), and when the channel
+    /// closes. No two pipelines in the process share a generation.
+    ///
+    /// Output taken by [`drain_output`](Self::drain_output) belongs to the
+    /// generation current at that moment. A caller that ships it later must
+    /// read both under the same lock, and drop the output if the generation
+    /// has changed by the time it reaches the wire: sent after the new
+    /// CapsConfirm, it would address surfaces the client no longer has.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     // ========================================================================
@@ -2184,6 +2215,8 @@ impl GraphicsPipelineServer {
             // restart from 0, matching a fresh channel.
             self.surfaces.reset_for_reinit();
             self.frames.clear();
+            // Output already drained but not yet on the wire is void too.
+            self.generation = next_generation();
             // Force ResetGraphics ahead of the next CreateSurface.
             self.reset_graphics_sent = false;
             if self.compression_mode != CompressionMode::Never {
@@ -2318,6 +2351,7 @@ impl DvcProcessor for GraphicsPipelineServer {
     fn close(&mut self, _channel_id: u32) {
         debug!("EGFX channel closed");
         self.state = ServerState::Closed;
+        self.generation = next_generation();
         self.reset_graphics_sent = false;
         self.handler.on_close();
     }
@@ -2727,6 +2761,40 @@ mod tests {
             CapabilityVersion::V10_6,
             0u32.to_le_bytes().to_vec(),
         )])
+    }
+
+    /// MS-RDPEGFX 3.2.5.18: after a mid-session CapsAdvertise the client
+    /// "has disregarded all the messages sent by the server prior to
+    /// RDPGFX_CAPS_CONFIRM_PDU". Output drained before it and shipped by
+    /// another thread can still reach the wire after the new confirm; its
+    /// generation is how the caller recognises it.
+    ///
+    /// Regression: such output was written after the confirm and addressed
+    /// surfaces the client no longer had (protocol error 0xD06).
+    #[test]
+    fn a_reset_or_a_close_starts_a_new_generation() {
+        let mut server = GraphicsPipelineServer::new(Box::new(DefaultsHandler));
+        let first = server.generation();
+
+        server.handle_capabilities_advertise(v10_6_advertise());
+        assert_eq!(server.generation(), first, "the initial negotiation voids nothing");
+
+        server.handle_capabilities_advertise(v10_6_advertise());
+        let after_reset = server.generation();
+        assert_ne!(after_reset, first, "a re-advertise voids everything drained before it");
+
+        server.close(0);
+        assert_ne!(
+            server.generation(),
+            after_reset,
+            "a closed channel takes no more output"
+        );
+
+        let next_connection = GraphicsPipelineServer::new(Box::new(DefaultsHandler));
+        assert!(
+            ![first, after_reset, server.generation()].contains(&next_connection.generation()),
+            "output of an earlier connection must not pass as current on the next"
+        );
     }
 
     /// MS-RDPEGFX 3.2.5.18: a CapsAdvertise received again mid-session (with
