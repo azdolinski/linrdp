@@ -1,7 +1,7 @@
 //! UDP multitransport (MS-RDPEMT / MS-RDPEUDP): sideband RDP-UDP listener.
 //!
-//! `ironrdp-server` sends the Initiate Multitransport Request over TCP after
-//! the connection sequence completes (see `with_multitransport`); this module
+//! `ironrdp-server` sends the Initiate Multitransport Request over TCP during
+//! the connection sequence, after licensing (see `with_multitransport`); this module
 //! owns the other half — the UDP socket on the same port as TCP that accepts
 //! the client's RDP-UDP handshake:
 //!
