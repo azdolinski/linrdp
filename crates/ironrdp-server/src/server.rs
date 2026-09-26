@@ -1072,6 +1072,10 @@ pub enum ServerEvent {
     CloseDynamicChannel {
         channel_id: u32,
     },
+    /// The UDP tunnel bound with [`Self::SoftSyncToUdp`] closed. Before any
+    /// channel moved to it, the connection stays on TCP; after, it cannot go
+    /// on, since a moved channel has no way back to TCP.
+    UdpTunnelClosed,
 }
 
 /// Creates a fresh static-channel processor for each accepted RDP connection.
@@ -1102,6 +1106,7 @@ impl fmt::Debug for ServerEvent {
             #[cfg(feature = "usb")]
             Self::Usb(..) => f.write_str("Usb(..)"),
             Self::SoftSyncToUdp { .. } => f.write_str("SoftSyncToUdp { .. }"),
+            Self::UdpTunnelClosed => f.write_str("UdpTunnelClosed"),
             Self::UdpTunnelData(data) => f.debug_tuple("UdpTunnelData").field(&data.len()).finish(),
             Self::AutoDetectRttRequest => f.write_str("AutoDetectRttRequest"),
             Self::OpenDynamicChannel { processor, .. } => f
@@ -3066,7 +3071,7 @@ impl RdpServer {
                 .map_err(|e| ServerError::io("write dvc messages", e))?;
         }
         if !tunneled.is_empty() {
-            self.send_to_tunnel(tunneled)?;
+            self.send_to_tunnel(tunneled).await?;
         }
         Ok(())
     }
@@ -3093,15 +3098,20 @@ impl RdpServer {
         Ok((tunneled, direct))
     }
 
-    /// Hand encoded, unframed DVC messages to the UDP tunnel pump.
-    fn send_to_tunnel(&self, messages: Vec<Vec<u8>>) -> ServerResult<()> {
-        let Some(tx) = self.udp_tunnel_tx.as_ref() else {
+    /// Hand encoded, unframed DVC messages to the UDP tunnel pump, waiting
+    /// while its queue is full.
+    ///
+    /// Nothing is dropped: the channels on the tunnel include the graphics
+    /// pipeline, which runs over "a non-lossy dynamic virtual channel"
+    /// (MS-RDPEGFX 2.1), so a full queue slows the server down instead.
+    async fn send_to_tunnel(&self, messages: Vec<Vec<u8>>) -> ServerResult<()> {
+        let Some(tx) = self.udp_tunnel_tx.clone() else {
             return Err(ServerError::custom("udp tunnel", std::io::Error::other("no tunnel installed")));
         };
         for bytes in messages {
-            if tx.try_send(bytes).is_err() {
-                warn!("UDP tunnel write queue full; dropping DVC message");
-            }
+            tx.send(bytes)
+                .await
+                .map_err(|_| ServerError::reason("udp tunnel", "the UDP tunnel carrying dynamic channels is gone"))?;
         }
         Ok(())
     }
@@ -3334,6 +3344,15 @@ impl RdpServer {
                         .map_err(|e| ServerError::io("write_all", e))?;
                 }
                 ServerEvent::SoftSyncToUdp { to_tunnel } => {
+                    // MS-RDPEMT 1.3.3: a tunnel lasts as long as the main
+                    // connection, so a connection has one.
+                    let moved = self
+                        .get_svc_processor::<dvc::DrdynvcServer>()
+                        .is_some_and(|drdynvc| drdynvc.tunnels_channels());
+                    if self.udp_tunnel_tx.is_some() || moved {
+                        warn!("a second UDP tunnel for this connection; ignoring it");
+                        continue;
+                    }
                     if self.multitransport_confirmed {
                         self.soft_sync(to_tunnel, writer, user_channel_id).await?;
                     } else {
@@ -3372,6 +3391,24 @@ impl RdpServer {
                     if let Some(close) = drdynvc.close_channel(channel_id) {
                         self.write_dvc_messages(vec![close], writer, user_channel_id).await?;
                     }
+                }
+                ServerEvent::UdpTunnelClosed => {
+                    let moved = self
+                        .get_svc_processor::<dvc::DrdynvcServer>()
+                        .is_some_and(|drdynvc| drdynvc.tunnels_channels());
+                    if moved {
+                        // MS-RDPEMT 1.3.3 has no way to end a tunnel on its
+                        // own, and Soft-Sync (MS-RDPEDYC 3.1.5.3) none to move
+                        // channels back to TCP: they are gone with it. Ending
+                        // the connection lets the client reconnect.
+                        return Err(ServerError::reason(
+                            "udp tunnel",
+                            "the UDP tunnel carrying dynamic channels closed",
+                        ));
+                    }
+                    info!("the UDP tunnel closed before any channel moved to it; staying on TCP");
+                    self.udp_tunnel_tx = None;
+                    self.pending_soft_sync = None;
                 }
                 ServerEvent::UdpTunnelData(frame) => {
                     let Some(drdynvc) = self.get_svc_processor::<dvc::DrdynvcServer>() else {
@@ -6776,6 +6813,101 @@ mod soft_sync_tests {
             frames
                 .iter()
                 .all(|frame| drdynvc(&mut server).outgoing_tunnel(frame).is_some())
+        );
+    }
+    /// MS-RDPEGFX 2.1: the graphics pipeline runs over "a non-lossy dynamic
+    /// virtual channel". A full tunnel queue slows the server down; it does
+    /// not drop a message.
+    ///
+    /// Regression: whatever did not fit into the queue was dropped.
+    #[tokio::test]
+    async fn a_full_tunnel_waits_instead_of_dropping() {
+        let mut server = server();
+        let (to_tunnel, mut tunnel) = mpsc::channel(1);
+        server.udp_tunnel_tx = Some(to_tunnel);
+        let reader = tokio::spawn(async move {
+            let mut frames = Vec::new();
+            while frames.len() < 3 {
+                frames.push(tunnel.recv().await.expect("frame"));
+            }
+            frames
+        });
+
+        server
+            .send_to_tunnel(vec![vec![1], vec![2], vec![3]])
+            .await
+            .expect("sent");
+
+        assert_eq!(reader.await.expect("reader"), [vec![1], vec![2], vec![3]]);
+    }
+
+    /// MS-RDPEMT 1.3.3: a tunnel ends with the main connection, and Soft-Sync
+    /// has no way to move channels back to TCP. Once channels moved, losing
+    /// the tunnel ends the connection, so the client reconnects.
+    #[tokio::test]
+    async fn losing_the_tunnel_after_the_soft_sync_ends_the_connection() {
+        let mut server = server();
+        open_channel(&mut server);
+        let (to_tunnel, _tunnel) = mpsc::channel(16);
+        let (_client, server_side) = tokio::io::duplex(64 * 1024);
+        let mut writer = TokioFramed::new(server_side);
+        server
+            .soft_sync(to_tunnel, &mut writer, 1007)
+            .await
+            .expect("Soft-Sync Request");
+
+        let mut events = vec![ServerEvent::UdpTunnelClosed];
+        let outcome = server
+            .dispatch_server_events(&mut events, &mut writer, 1003, 1007, Some(1008))
+            .await;
+
+        assert!(outcome.is_err(), "the moved channels are gone with the tunnel");
+    }
+
+    /// Before any channel moved, the connection simply stays on TCP.
+    #[tokio::test]
+    async fn losing_the_tunnel_before_the_soft_sync_keeps_the_connection() {
+        let mut server = server();
+        let (to_tunnel, _tunnel) = mpsc::channel(16);
+        server.pending_soft_sync = Some(to_tunnel);
+        let (_client, server_side) = tokio::io::duplex(64 * 1024);
+        let mut writer = TokioFramed::new(server_side);
+
+        let mut events = vec![ServerEvent::UdpTunnelClosed];
+        let outcome = server
+            .dispatch_server_events(&mut events, &mut writer, 1003, 1007, Some(1008))
+            .await;
+
+        assert!(matches!(outcome, Ok(RunState::Continue)));
+        assert!(server.pending_soft_sync.is_none());
+    }
+
+    /// A connection has one tunnel (MS-RDPEMT 1.3.3); a second one is not
+    /// bound, and does not end the session either.
+    #[tokio::test]
+    async fn a_second_tunnel_is_ignored() {
+        let mut server = server();
+        open_channel(&mut server);
+        let (first, _first_end) = mpsc::channel(16);
+        let (_client, server_side) = tokio::io::duplex(64 * 1024);
+        let mut writer = TokioFramed::new(server_side);
+        server
+            .soft_sync(first.clone(), &mut writer, 1007)
+            .await
+            .expect("Soft-Sync Request");
+
+        let (second, _second_end) = mpsc::channel(16);
+        let mut events = vec![ServerEvent::SoftSyncToUdp { to_tunnel: second }];
+        let outcome = server
+            .dispatch_server_events(&mut events, &mut writer, 1003, 1007, Some(1008))
+            .await;
+
+        assert!(matches!(outcome, Ok(RunState::Continue)));
+        assert!(
+            server
+                .udp_tunnel_tx
+                .as_ref()
+                .is_some_and(|bound| bound.same_channel(&first))
         );
     }
 }
