@@ -281,6 +281,24 @@ impl X11InputHandler {
         }
     }
 
+    /// Move the pointer by a delta: XTEST's MotionNotify with `detail` set
+    /// is relative to where the pointer is.
+    fn fake_relative_motion(&mut self, dx: i32, dy: i32) {
+        let (detail, mx, my) = relative_motion(dx, dy);
+        let err = self
+            .conn
+            .xtest_fake_input(FAKE_MOTION, detail, 0, self.root, mx, my, XTEST_DEVICE_ID)
+            .err();
+        if let Some(e) = err {
+            tracing::warn!(error = %e, "XTEST relative motion failed");
+            if self.reconnect() {
+                let _ = self
+                    .conn
+                    .xtest_fake_input(FAKE_MOTION, detail, 0, self.root, mx, my, XTEST_DEVICE_ID);
+            }
+        }
+    }
+
     fn fake_motion(&mut self, x: u16, y: u16) {
         let (mx, my) = (i16::try_from(x).unwrap_or(i16::MAX), i16::try_from(y).unwrap_or(i16::MAX));
         let err = match self.conn.xtest_fake_input(FAKE_MOTION, 0, 0, self.root, mx, my, XTEST_DEVICE_ID) {
@@ -338,9 +356,22 @@ impl RdpServerInputHandler for X11InputHandler {
                     self.fake_button(b, pressed);
                 }
             }
-            MouseEvent::ButtonRel { .. } | MouseEvent::RelMove { .. } => {
-                // Relative mode needs pointer warping with accumulated deltas;
-                // absolute mode is negotiated by default (RDP_CAPSET_POINTER).
+            // The server advertises INPUT_FLAG_MOUSE_RELATIVE (MS-RDPBCGR
+            // 2.2.7.1.6), so a client may send relative pointer events
+            // (2.2.8.1.1.3.1.1.7). A relative button event happens at the
+            // position its delta leads to.
+            MouseEvent::RelMove { x, y } => self.fake_relative_motion(x, y),
+            MouseEvent::ButtonRel { x, y, button, pressed } => {
+                self.fake_relative_motion(x, y);
+                let b = match button {
+                    MouseButton::Left => 1,
+                    MouseButton::Middle => 2,
+                    MouseButton::Right => 3,
+                    _ => 0,
+                };
+                if b != 0 {
+                    self.fake_button(b, pressed);
+                }
             }
             MouseEvent::VerticalScroll { value } => {
                 // `value` is wheel-rotation units — 120 per notch
@@ -370,9 +401,22 @@ impl RdpServerInputHandler for X11InputHandler {
     }
 }
 
+/// XTEST FakeInput arguments for a relative MotionNotify: `detail` 1 makes
+/// rootX and rootY a delta, and each fits an INT16.
+fn relative_motion(dx: i32, dy: i32) -> (u8, i16, i16) {
+    let int16 = |delta: i32| i16::try_from(delta.clamp(i32::from(i16::MIN), i32::from(i16::MAX))).unwrap_or_default();
+    (1, int16(dx), int16(dy))
+}
+
 #[cfg(test)]
 mod tests {
     use super::keycode_for;
+
+    #[test]
+    fn a_relative_motion_is_a_delta_that_fits_int16() {
+        assert_eq!(super::relative_motion(5, -7), (1, 5, -7));
+        assert_eq!(super::relative_motion(i32::MAX, i32::MIN), (1, i16::MAX, i16::MIN));
+    }
 
     // Expected keycodes verified against the live Xvfb keymap (evdev
     // layout, `xmodmap -pk`): Up=111, Left=113, Right=114, Down=116.
