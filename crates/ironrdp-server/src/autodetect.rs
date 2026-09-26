@@ -4,8 +4,10 @@
 //! round-trip time from the client's response, and periodically brackets
 //! ordinary traffic with a Bandwidth Measure Start/Stop pair so the client
 //! can report the bandwidth it observed. RTT results are exposed via
-//! [`AutoDetectManager::snapshot()`]; both RTT and bandwidth are reported to
-//! the client via [`AutoDetectManager::build_netchar_result()`].
+//! [`AutoDetectManager::snapshot()`]. [`AutoDetectManager::build_netchar_result()`]
+//! builds a Network Characteristics Result from both figures; MS-RDPBCGR 1.3.9
+//! sends one over the main connection only during Connect-Time Auto-Detection,
+//! so the server's continuous probe loop does not.
 //!
 //! [MS-RDPBCGR 2.2.14]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dc672839-4f4e-40b1-a71c-cd6a959baa38
 
