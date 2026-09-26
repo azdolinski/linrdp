@@ -262,6 +262,9 @@ pub(crate) struct EiInputHandler {
     /// Keys the client holds; released wholesale on SynchronizeEvent (the
     /// same stuck-key protection the X11 path has).
     pressed_keys: Mutex<HashSet<u32>>,
+    /// Where the pointer is, in stream coordinates: relative motion is
+    /// applied to it and sent as absolute motion.
+    position: (u32, u32),
     running: Arc<AtomicBool>,
 }
 
@@ -315,6 +318,7 @@ impl EiInputHandler {
                 state,
                 stream_size,
                 pressed_keys: Mutex::new(HashSet::new()),
+                position: (0, 0),
                 running,
             })
         }
@@ -597,6 +601,26 @@ impl RdpServerInputHandler for EiInputHandler {
     }
 
     fn mouse(&mut self, event: MouseEvent) {
+        // Relative events (MS-RDPBCGR 2.2.8.1.1.3.1.1.7, allowed by
+        // INPUT_FLAG_MOUSE_RELATIVE) move from the last known position. The
+        // portal's pointer is absolute, so the sum goes out as an absolute
+        // position, kept on the stream.
+        let event = match event {
+            MouseEvent::RelMove { x, y } => {
+                let (px, py) = moved_by(self.position, (x, y), self.stream_size);
+                MouseEvent::Move { x: px, y: py }
+            }
+            MouseEvent::ButtonRel { x, y, button, pressed } => {
+                let (px, py) = moved_by(self.position, (x, y), self.stream_size);
+                MouseEvent::Button {
+                    x: px,
+                    y: py,
+                    button,
+                    pressed,
+                }
+            }
+            other => other,
+        };
         let Ok(mut guard) = self.state.lock() else { return };
         let Some(state) = guard.as_mut() else { return };
         // SAFETY: as above.
@@ -605,11 +629,13 @@ impl RdpServerInputHandler for EiInputHandler {
             let now = (state.api.ei_now)(state.ei);
             match event {
                 MouseEvent::Move { x, y } => {
+                    self.position = (u32::from(x), u32::from(y));
                     let (dx, dy) = map_to_region(f64::from(x), f64::from(y), self.stream_size, region);
                     (state.api.ei_device_pointer_motion_absolute)(pointer, dx, dy);
                     (state.api.ei_device_frame)(pointer, now);
                 }
                 MouseEvent::Button { x, y, button, pressed } => {
+                    self.position = (u32::from(x), u32::from(y));
                     let (dx, dy) = map_to_region(f64::from(x), f64::from(y), self.stream_size, region);
                     (state.api.ei_device_pointer_motion_absolute)(pointer, dx, dy);
                     let b = match button {
@@ -646,6 +672,16 @@ fn evdev_keycode(code: u8, extended: bool) -> Option<u32> {
     crate::input::keycode_for(code, extended).map(|x_keycode| u32::from(x_keycode) - 8)
 }
 
+/// `position` moved by `delta`, kept inside a `stream`-sized screen.
+fn moved_by(position: (u32, u32), delta: (i32, i32), stream: (u32, u32)) -> (u16, u16) {
+    let axis = |at: u32, by: i32, size: u32| {
+        let last = i64::from(size.clamp(1, u32::from(u16::MAX) + 1)).saturating_sub(1);
+        let moved = i64::from(at).saturating_add(i64::from(by)).clamp(0, last);
+        u16::try_from(moved).unwrap_or(u16::MAX)
+    };
+    (axis(position.0, delta.0, stream.0), axis(position.1, delta.1, stream.1))
+}
+
 /// Scale stream coordinates into the device region (KRdp's mapping).
 fn map_to_region(x: f64, y: f64, stream: (u32, u32), region: Option<Region>) -> (f64, f64) {
     let Some(region) = region.filter(|r| r.width > 0 && r.height > 0) else {
@@ -664,5 +700,25 @@ fn unicode_to_keysym(cp: u32) -> u32 {
     match cp {
         0x20..=0x7e => cp,
         _ => 0x0100_0000 | cp,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::moved_by;
+
+    /// A relative event moves from the last position (MS-RDPBCGR
+    /// 2.2.8.1.1.3.1.1.7).
+    ///
+    /// Regression: relative events were dropped.
+    #[test]
+    fn a_relative_move_starts_from_the_last_position() {
+        assert_eq!(moved_by((100, 200), (5, -7), (1920, 1080)), (105, 193));
+    }
+
+    #[test]
+    fn a_relative_move_stays_on_the_screen() {
+        assert_eq!(moved_by((10, 10), (-50, -50), (1920, 1080)), (0, 0));
+        assert_eq!(moved_by((1900, 1070), (500, 500), (1920, 1080)), (1919, 1079));
     }
 }
