@@ -951,13 +951,21 @@ impl Sequence for Acceptor {
                                 .early_capability_flags
                                 .contains(gcc::ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU)
                             {
-                                let info = ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
-                                    ProtocolIndependentCode::ServerDeniedConnection,
+                                let info = rdp::headers::ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(
+                                    ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::ServerDeniedConnection),
                                 ));
 
                                 debug!(message = ?info, "Send");
 
-                                util::encode_send_data_indication(self.user_channel_id, self.io_channel_id, &info, output)?;
+                                // MS-RDPBCGR 2.2.5.1.1: a whole Share Data PDU,
+                                // and pduSource MUST be 0.
+                                let share_data = wrap_share_data(info, 0);
+                                util::encode_send_data_indication(
+                                    self.user_channel_id,
+                                    self.io_channel_id,
+                                    &share_data,
+                                    output,
+                                )?;
                             }
 
                             return Err(ConnectorError::general("invalid credentials"));

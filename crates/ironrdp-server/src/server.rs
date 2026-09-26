@@ -4946,21 +4946,27 @@ async fn send_access_denied(
         debug!("client did not announce SUPPORT_ERRINFO_PDU; denying the connection without a reason PDU");
         return Ok(());
     }
-    let info = ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
-        ProtocolIndependentCode::ServerDeniedConnection,
-    ));
-    let user_data = encode_vec(&info).map_err(ServerError::encode)?.into();
-    let pdu = SendDataIndication {
-        initiator_id: user_channel_id,
-        channel_id: io_channel_id,
-        user_data,
-    };
-    let msg = encode_vec(&X224(pdu)).map_err(ServerError::encode)?;
+    let msg = encode_access_denied(io_channel_id, user_channel_id)?;
     writer
         .write_all(&msg)
         .await
         .map_err(|e| ServerError::io("write access_denied", e))?;
     Ok(())
+}
+
+/// The Set Error Info PDU that refuses a connection with
+/// `ERRINFO_SERVER_DENIED_CONNECTION`.
+///
+/// MS-RDPBCGR 2.2.5.1.1: TS_SET_ERROR_INFO_PDU is a Share Data Header with
+/// `pduType2` = PDUTYPE2_SET_ERROR_INFO_PDU followed by the error value, and
+/// its `pduSource` MUST be 0. The bare four-byte `errorInfo` this used to send
+/// on its own was not a PDU the client could parse, so a refused login read
+/// as a protocol error instead of "access denied".
+fn encode_access_denied(io_channel_id: u16, user_channel_id: u16) -> ServerResult<Vec<u8>> {
+    let pdu = rdp::headers::ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(
+        ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::ServerDeniedConnection),
+    ));
+    encode_share_data_pdu(pdu, 0, io_channel_id, user_channel_id)
 }
 
 struct SharedWriter<'w, W: FramedWrite> {
@@ -5171,6 +5177,32 @@ mod preempt_tests {
             )) => {
                 assert_eq!(code, ProtocolIndependentCode::DisconnectedByOtherconnection);
             }
+            other => panic!("unexpected share data pdu: {other:?}"),
+        }
+    }
+
+    /// MS-RDPBCGR 2.2.5.1.1: the refusal is a whole TS_SET_ERROR_INFO_PDU —
+    /// Share Control and Share Data headers, `pduSource` 0 — carrying
+    /// ERRINFO_SERVER_DENIED_CONNECTION, not the bare error value.
+    #[test]
+    fn a_refused_login_is_a_share_data_pdu_with_the_denied_code() {
+        let bytes = encode_access_denied(1003, 1002).expect("encode access denied");
+
+        let x224: X224<mcs::McsMessage<'_>> = decode(&bytes).expect("decode X.224/MCS");
+        let mcs::McsMessage::SendDataIndication(data) = x224.0 else {
+            panic!("the refusal must ride an MCS Send Data Indication");
+        };
+        assert_eq!(data.channel_id, 1003, "on the I/O channel");
+        let control: rdp::headers::ShareControlHeader =
+            decode(data.user_data.as_ref()).expect("decode Share Control header");
+        assert_eq!(control.pdu_source, 0, "MS-RDPBCGR 2.2.5.1.1 requires pduSource=0");
+        let ShareControlPdu::Data(header) = control.share_control_pdu else {
+            panic!("the refusal must be a Share Data PDU");
+        };
+        match header.share_data_pdu {
+            rdp::headers::ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(
+                ErrorInfo::ProtocolIndependentCode(code),
+            )) => assert_eq!(code, ProtocolIndependentCode::ServerDeniedConnection),
             other => panic!("unexpected share data pdu: {other:?}"),
         }
     }
