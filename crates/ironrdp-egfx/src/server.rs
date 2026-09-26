@@ -1124,6 +1124,10 @@ pub struct GraphicsPipelineServer {
     /// See [`Self::generation`].
     generation: u64,
 
+    /// The channel is to be closed: the client advertised no capability set
+    /// this server supports (MS-RDPEGFX 3.2.5.19).
+    close_requested: bool,
+
     /// ZGFX compressor state (history buffer shared across frames)
     zgfx_compressor: Compressor,
     /// Whether to compress EGFX output with ZGFX
@@ -1184,6 +1188,7 @@ impl GraphicsPipelineServer {
             output_queue: VecDeque::new(),
             channel_id: None,
             generation: next_generation(),
+            close_requested: false,
             zgfx_compressor: Compressor::new(),
             compression_mode: CompressionMode::Never,
         }
@@ -2230,35 +2235,32 @@ impl GraphicsPipelineServer {
         self.handler.capabilities_advertise(&pdu);
         let server_caps = self.handler.preferred_capabilities();
 
-        // Parse client raw caps into typed. Silently skip unknown versions for
-        // negotiation purposes (the raw form is still observable in `pdu`), but
-        // treat parse failures for known versions as malformed input instead of
-        // negotiating as if the client never advertised them.
+        // Parse client raw caps into typed. Unknown versions are skipped for
+        // negotiation (the raw form is still observable in `pdu`), and so is a
+        // set of a known version that does not parse: MS-RDPEGFX 3.2.5.18 asks
+        // for a CapsConfirm to every advertise, so one bad set must not cost
+        // the others.
         let mut client_caps = Vec::with_capacity(pdu.0.len());
         for raw in &pdu.0 {
             match raw.parsed() {
                 Ok(Some(cap)) => client_caps.push(cap),
                 Ok(None) => {}
-                Err(e) => {
-                    warn!(error = ?e, "Received malformed client capability set; aborting capability negotiation");
-                    return;
-                }
+                Err(e) => warn!(error = ?e, "Skipping a malformed client capability set"),
             }
         }
 
-        // When no version overlaps with server preferences, confirm the client's
-        // highest-priority capability to avoid confirming a version the client
-        // did not advertise.
-        let negotiated = sanitize_capabilities_for_confirm(
-            negotiate_capabilities(&client_caps, &server_caps).unwrap_or_else(|| {
-                warn!("No capability match with server preferences, selecting client's highest version");
-                let mut client_sorted = client_caps.clone();
-                client_sorted.sort_by_key(|cap| core::cmp::Reverse(capability_priority(cap)));
-                client_sorted.into_iter().next().unwrap_or(CapabilitySet::V8 {
-                    flags: CapabilitiesV8Flags::empty(),
-                })
-            }),
-        );
+        // MS-RDPEGFX 3.2.5.19: when none of the advertised sets is supported,
+        // the server "SHOULD close the dynamic virtual channel" instead of
+        // confirming one.
+        let Some(negotiated) = negotiate_capabilities(&client_caps, &server_caps) else {
+            warn!(
+                advertised = pdu.0.len(),
+                "No capability set in common with the client; closing the graphics channel"
+            );
+            self.close_requested = true;
+            return;
+        };
+        let negotiated = sanitize_capabilities_for_confirm(negotiated);
 
         self.codec_caps = CodecCapabilities::from_capability_set(&negotiated);
         self.state = ServerState::Ready;
@@ -2346,6 +2348,10 @@ impl DvcProcessor for GraphicsPipelineServer {
         self.channel_id = Some(channel_id);
         debug!(channel_id, "EGFX channel started");
         Ok(vec![])
+    }
+
+    fn close_requested(&self) -> bool {
+        self.close_requested
     }
 
     fn close(&mut self, _channel_id: u32) {
@@ -2915,6 +2921,48 @@ mod tests {
             340,
             "MS-RDPEGFX 2.2.2.14: the PDU is always 340 bytes"
         );
+    }
+
+    /// MS-RDPEGFX 3.2.5.18: the server "MUST respond by sending the
+    /// RDPGFX_CAPS_CONFIRM_PDU". One set that does not parse must not cost the
+    /// answer to the others.
+    ///
+    /// Regression: negotiation stopped at the first malformed set, and the
+    /// client waited for a confirm that never came.
+    #[test]
+    fn a_malformed_capability_set_is_skipped() {
+        let mut server = GraphicsPipelineServer::new(Box::new(DefaultsHandler));
+
+        server.handle_capabilities_advertise(CapabilitiesAdvertisePdu(vec![
+            // V10.6 carries 4 bytes of flags; none here.
+            RawCapabilitySet::new(CapabilityVersion::V10_6, Vec::new()),
+            RawCapabilitySet::new(CapabilityVersion::V8, 0u32.to_le_bytes().to_vec()),
+        ]));
+
+        let queued: Vec<_> = server.output_queue.drain(..).collect();
+        assert!(
+            matches!(queued.as_slice(), [GfxPdu::CapabilitiesConfirm(_)]),
+            "{queued:?}"
+        );
+        assert!(!server.close_requested());
+    }
+
+    /// MS-RDPEGFX 3.2.5.19: when none of the advertised sets is supported,
+    /// the server "SHOULD close the dynamic virtual channel".
+    ///
+    /// Regression: the server confirmed the client's highest version anyway,
+    /// or V8 when it had parsed nothing, a version the client never offered.
+    #[test]
+    fn no_supported_capability_set_closes_the_channel() {
+        let mut server = GraphicsPipelineServer::new(Box::new(DefaultsHandler));
+
+        server.handle_capabilities_advertise(CapabilitiesAdvertisePdu(vec![RawCapabilitySet::new(
+            CapabilityVersion(0x00FF_0000),
+            0u32.to_le_bytes().to_vec(),
+        )]));
+
+        assert!(server.output_queue.is_empty(), "no confirm");
+        assert!(server.close_requested());
     }
 
     #[test]

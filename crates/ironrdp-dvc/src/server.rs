@@ -553,9 +553,17 @@ impl DrdynvcServer {
             return Err(pdu_other_err!("invalid channel state"));
         }
         let mut resp = Vec::new();
-        if let Some(complete) = c.complete_data.process_data(data).map_err(|e| decode_err!(e))? {
+        let close = if let Some(complete) = c.complete_data.process_data(data).map_err(|e| decode_err!(e))? {
             let msg = c.processor.process(channel_id, &complete)?;
             resp.extend(encode_dvc_messages(channel_id, msg, ChannelFlags::SHOW_PROTOCOL).map_err(|e| encode_err!(e))?);
+            c.processor.close_requested()
+        } else {
+            false
+        };
+        if close {
+            debug!(channel_id, "the channel's processor asks to close it");
+            self.remove_by_channel_id(channel_id);
+            resp.push(close_pdu(channel_id));
         }
         Ok(resp)
     }
@@ -793,6 +801,48 @@ mod tests {
             closed.load(core::sync::atomic::Ordering::Relaxed),
             "the processor must be told the channel was refused"
         );
+    }
+
+    /// Asks for its channel to be closed after the first message.
+    struct OneShot;
+
+    impl_as_any!(OneShot);
+
+    impl DvcProcessor for OneShot {
+        fn channel_name(&self) -> &str {
+            "one-shot"
+        }
+
+        fn start(&mut self, _channel_id: u32) -> PduResult<Vec<crate::DvcMessage>> {
+            Ok(Vec::new())
+        }
+
+        fn process(&mut self, _channel_id: u32, _payload: &[u8]) -> PduResult<Vec<crate::DvcMessage>> {
+            Ok(Vec::new())
+        }
+
+        fn close_requested(&self) -> bool {
+            true
+        }
+    }
+
+    impl DvcServerProcessor for OneShot {}
+
+    /// A processor that has nothing more to say on its channel gets it
+    /// closed (MS-RDPEDYC 2.2.4), as the EGFX pipeline needs when the client
+    /// advertises no usable capability set (MS-RDPEGFX 3.2.5.19).
+    #[test]
+    fn a_processor_can_have_its_channel_closed() {
+        let mut server = DrdynvcServer::new();
+        let channel_id = server.dynamic_channels.insert_channel(OneShot, ChannelState::Opened);
+        let data = ironrdp_core::encode_vec(&DrdynvcClientPdu::Data(crate::pdu::DrdynvcDataPdu::Data(
+            crate::pdu::DataPdu::new(channel_id, alloc::vec![1]),
+        )))
+        .unwrap();
+
+        let sent = decode_server_pdus(&server.process(&data).unwrap());
+        assert!(matches!(sent.as_slice(), [DrdynvcServerPdu::Close(close)] if close.channel_id() == channel_id));
+        assert!(!server.is_channel_opened(channel_id));
     }
 
     fn decode_server_pdus(messages: &[SvcMessage]) -> Vec<DrdynvcServerPdu> {
