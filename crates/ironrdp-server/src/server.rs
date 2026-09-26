@@ -1155,6 +1155,7 @@ impl PendingConnection {
         credential_resolver: Option<std::sync::Arc<dyn Fn(&str) -> std::io::Result<Credentials> + Send + Sync>>,
     enable_ainput: bool,
     multitransport: bool,
+    graphics_pipeline: bool,
     ) -> Self {
         let mut acceptor = Acceptor::new_with_resolver(security.flag(), desktop_size, capabilities, creds, credential_resolver);
         acceptor.set_honor_client_desktop_size(honor_client_desktop_size);
@@ -1162,6 +1163,9 @@ impl PendingConnection {
         // whenever the embedder configured multitransport — 3.3.5.8 requires
         // the announcement before bootstrapping it.
         acceptor.set_multitransport_announce(multitransport);
+        // RDP_NEG_RSP (2.2.1.2.1): DYNVC_GFX_PROTOCOL_SUPPORTED whenever the
+        // embedder offers the graphics pipeline.
+        acceptor.set_graphics_pipeline_announce(graphics_pipeline);
         Self { security, acceptor }
     }
 
@@ -1451,6 +1455,8 @@ struct NegotiationContext {
     creds: Option<Credentials>,
     credential_resolver: Option<std::sync::Arc<dyn Fn(&str) -> std::io::Result<Credentials> + Send + Sync>>,
     enable_ainput: bool,
+    /// See [`RdpServer::offers_graphics_pipeline`].
+    graphics_pipeline: bool,
     display: Arc<Mutex<Box<dyn RdpServerDisplay>>>,
 }
 
@@ -1488,6 +1494,7 @@ async fn negotiate_candidate(
         ctx.credential_resolver.clone(),
         ctx.enable_ainput,
         ctx.opts.multitransport.is_some(),
+        ctx.graphics_pipeline,
     );
 
     // NOTE: deliberately NO channel attachment here. Building the cliprdr /
@@ -2221,6 +2228,15 @@ impl RdpServer {
         }
     }
 
+    /// Whether this server offers the graphics pipeline (MS-RDPEGFX): an EGFX
+    /// factory is configured, so every connection gets the channel.
+    fn offers_graphics_pipeline(&self) -> bool {
+        #[cfg(feature = "egfx")]
+        return self.gfx_factory.is_some();
+        #[cfg(not(feature = "egfx"))]
+        return false;
+    }
+
     /// Build the cheap, cloned snapshot a preempting candidate negotiates
     /// against — see [`NegotiationContext`].
     fn negotiation_context(&self) -> NegotiationContext {
@@ -2229,6 +2245,7 @@ impl RdpServer {
             creds: self.creds.clone(),
             credential_resolver: self.credential_resolver.clone(),
             enable_ainput: self.enable_ainput,
+            graphics_pipeline: self.offers_graphics_pipeline(),
             display: Arc::clone(&self.display),
         }
     }
@@ -2408,6 +2425,7 @@ impl RdpServer {
             self.credential_resolver.clone(),
             self.enable_ainput,
             self.opts.multitransport.is_some(),
+            self.offers_graphics_pipeline(),
         );
 
         self.attach_channels(pending.acceptor_mut());
@@ -4665,6 +4683,57 @@ fn encode_autodetect_request(
     encode_vec(&X224(mcs_pdu)).map_err(ServerError::encode)
 }
 
+#[cfg(all(test, feature = "egfx"))]
+mod graphics_pipeline_tests {
+    use ironrdp_egfx::pdu::{CapabilitiesAdvertisePdu, CapabilitySet};
+    use ironrdp_egfx::server::GraphicsPipelineHandler;
+
+    use super::*;
+
+    struct Handler;
+
+    impl GraphicsPipelineHandler for Handler {
+        fn capabilities_advertise(&mut self, _pdu: &CapabilitiesAdvertisePdu) {}
+        fn on_ready(&mut self, _negotiated: &CapabilitySet) {}
+    }
+
+    struct Factory;
+
+    impl ServerEventSender for Factory {
+        fn set_sender(&mut self, _sender: mpsc::UnboundedSender<ServerEvent>) {}
+    }
+
+    impl GfxServerFactory for Factory {
+        fn build_gfx_handler(&self) -> Box<dyn GraphicsPipelineHandler> {
+            Box::new(Handler)
+        }
+    }
+
+    fn server(gfx_factory: Option<Box<dyn GfxServerFactory>>) -> RdpServer {
+        RdpServer::builder()
+            .with_addr(([127, 0, 0, 1], 0))
+            .with_no_security()
+            .with_no_input()
+            .with_no_display()
+            .with_gfx_factory(gfx_factory)
+            .build()
+    }
+
+    /// MS-RDPBCGR 2.2.1.2.1: the RDP Negotiation Response says whether the
+    /// server "supports the Graphics Pipeline Extension Protocol", on the
+    /// normal path and for a preempting candidate alike.
+    #[test]
+    fn a_server_with_a_graphics_factory_announces_the_pipeline() {
+        let with = server(Some(Box::new(Factory)));
+        assert!(with.offers_graphics_pipeline());
+        assert!(with.negotiation_context().graphics_pipeline);
+
+        let without = server(None);
+        assert!(!without.offers_graphics_pipeline());
+        assert!(!without.negotiation_context().graphics_pipeline);
+    }
+}
+
 /// Encode a server-initiated Heartbeat PDU for the MCS message channel.
 ///
 /// Like auto-detect (see [`encode_autodetect_request`]), heartbeats are framed
@@ -5021,6 +5090,7 @@ mod preempt_tests {
             creds: None,
             credential_resolver: None,
             enable_ainput: false,
+            graphics_pipeline: false,
             display: Arc::new(Mutex::new(Box::new(NoDisplay))),
         }
     }

@@ -28,6 +28,9 @@ const USER_CHANNEL_ID: u16 = 1002;
 pub struct Acceptor {
     pub(crate) state: AcceptorState,
     security: SecurityProtocol,
+    /// Whether the RDP Negotiation Response announces
+    /// DYNVC_GFX_PROTOCOL_SUPPORTED (section 2.2.1.2.1).
+    graphics_pipeline_announce: bool,
     io_channel_id: u16,
     user_channel_id: u16,
     message_channel_id: Option<u16>,
@@ -192,6 +195,7 @@ impl Acceptor {
     ) -> Self {
         Self {
             security,
+            graphics_pipeline_announce: false,
             state: AcceptorState::InitiationWaitRequest,
             user_channel_id: USER_CHANNEL_ID,
             io_channel_id: IO_CHANNEL_ID,
@@ -215,6 +219,15 @@ impl Acceptor {
             multitransport_announce: false,
             merged_domain_parameters: mcs::DomainParameters::target(),
         }
+    }
+
+    /// Announce DYNVC_GFX_PROTOCOL_SUPPORTED in the RDP Negotiation Response:
+    /// "The server supports the Graphics Pipeline Extension Protocol described
+    /// in [MS-RDPEGFX] sections 1, 2, and 3" ([MS-RDPBCGR] 2.2.1.2.1). The
+    /// embedder enables it when it offers the graphics pipeline. Disabled by
+    /// default.
+    pub fn set_graphics_pipeline_announce(&mut self, announce: bool) {
+        self.graphics_pipeline_announce = announce;
     }
 
     /// Adopt the desktop size requested by the client in its Client Core Data
@@ -296,6 +309,7 @@ impl Acceptor {
         };
         Ok(Self {
             security: consumed.security,
+            graphics_pipeline_announce: consumed.graphics_pipeline_announce,
             state,
             user_channel_id: consumed.user_channel_id,
             io_channel_id: consumed.io_channel_id,
@@ -638,10 +652,12 @@ impl Sequence for Acceptor {
                         requested_protocol,
                     ));
                 };
-                let connection_confirm = nego::ConnectionConfirm::Response {
-                    flags: nego::ResponseFlags::EXTENDED_CLIENT_DATA_SUPPORTED,
-                    protocol,
-                };
+                let mut flags = nego::ResponseFlags::EXTENDED_CLIENT_DATA_SUPPORTED;
+                flags.set(
+                    nego::ResponseFlags::DYNVC_GFX_PROTOCOL_SUPPORTED,
+                    self.graphics_pipeline_announce,
+                );
+                let connection_confirm = nego::ConnectionConfirm::Response { flags, protocol };
 
                 debug!(message = ?connection_confirm, "Send");
 

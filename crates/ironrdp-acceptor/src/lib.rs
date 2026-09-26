@@ -239,3 +239,6 @@ where
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod negotiation_tests;
