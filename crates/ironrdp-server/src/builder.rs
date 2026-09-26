@@ -527,8 +527,8 @@ impl RdpServerBuilder<BuilderDone> {
         self
     }
 
-    /// Enable UDP multitransport (MS-RDPEMT): after the connection sequence
-    /// completes, the server sends an Initiate Multitransport Request carrying
+    /// Enable UDP multitransport (MS-RDPEMT): during the connection sequence,
+    /// after licensing, the server sends an Initiate Multitransport Request carrying
     /// this `request_id` + `security_cookie` to clients that announce reliable
     /// UDP and Soft-Sync. The embedder must run the
     /// matching UDP listener (see `ironrdp-rdpeudp-tokio::accept_udp`) or the

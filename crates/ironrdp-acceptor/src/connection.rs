@@ -57,9 +57,26 @@ pub struct Acceptor {
     /// Per 3.3.5.8 the server only bootstraps a multitransport it announced
     /// here.
     multitransport_announce: bool,
+    /// The Initiate Multitransport Request to send in the Optional
+    /// Multitransport Bootstrapping phase, if the server offers a tunnel.
+    multitransport_request: Option<MultitransportRequest>,
+    /// The requestId of the request actually sent on this connection.
+    multitransport_request_sent: Option<u32>,
+    /// What the client sent on the MCS message channel while the acceptor
+    /// waited for something else, in order.
+    message_channel_pdus: Vec<Vec<u8>>,
     /// Domain parameters merged from the client's MCS Connect Initial per
     /// 3.3.5.3.3, echoed back in the Connect Response.
     merged_domain_parameters: mcs::DomainParameters,
+}
+
+/// The server's offer of a sideband transport: the requestId and
+/// securityCookie of its Initiate Multitransport Request PDU (MS-RDPBCGR
+/// 2.2.15.1). The client repeats both over the new transport (MS-RDPEMT).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultitransportRequest {
+    pub request_id: u32,
+    pub security_cookie: [u8; 16],
 }
 
 /// Minimum and maximum desktop dimension honored from a client.
@@ -172,6 +189,15 @@ pub struct AcceptorResult {
     /// validation, but the server must still verify its security verifier
     /// against the reconnect random for the target session.
     pub auto_reconnect: Option<ClientAutoReconnect>,
+    /// The requestId of the Initiate Multitransport Request sent during the
+    /// connection sequence, if one was (see
+    /// [`Acceptor::set_multitransport_request`]).
+    pub multitransport_request_id: Option<u32>,
+    /// What the client sent on the MCS message channel during the
+    /// Capabilities Exchange and the Connection Finalization, in order: the
+    /// Multitransport Response (section 2.2.15.2) can arrive then. Each entry
+    /// is the user data of one MCS Send Data Request.
+    pub message_channel_pdus: Vec<Vec<u8>>,
 }
 
 impl Acceptor {
@@ -218,6 +244,9 @@ impl Acceptor {
             reactivation: false,
             honor_client_desktop_size: None,
             multitransport_announce: false,
+            multitransport_request: None,
+            multitransport_request_sent: None,
+            message_channel_pdus: Vec::new(),
             merged_domain_parameters: mcs::DomainParameters::target(),
         }
     }
@@ -292,6 +321,33 @@ impl Acceptor {
         self.multitransport_announce = announce;
     }
 
+    /// Offer the client a sideband transport (MS-RDPEMT) in the Optional
+    /// Multitransport Bootstrapping phase ([MS-RDPBCGR] 1.3.1.1): after
+    /// Licensing and before the Capabilities Exchange, the acceptor sends an
+    /// Initiate Multitransport Request with these values on the MCS message
+    /// channel (2.2.15.1).
+    ///
+    /// It goes only to a client that joined a message channel and announced
+    /// reliable UDP with Soft-Sync. Dynamic channels move to a tunnel only by
+    /// Soft-Sync ([MS-RDPEDYC] 3.1.5.3), so for any other client the tunnel
+    /// would carry nothing. Use with [`Self::set_multitransport_announce`].
+    pub fn set_multitransport_request(&mut self, request: Option<MultitransportRequest>) {
+        self.multitransport_request = request;
+    }
+
+    /// The request to send in the Optional Multitransport Bootstrapping phase
+    /// of this connection, with the message channel it goes on.
+    fn multitransport_bootstrap(&self) -> Option<(MultitransportRequest, u16)> {
+        let request = self.multitransport_request?;
+        let message_channel_id = self.message_channel_id?;
+        let wanted = gcc::MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR | gcc::MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP;
+        if !self.multitransport_flags.contains(wanted) {
+            debug!(client_flags = ?self.multitransport_flags, "Client does not announce reliable UDP with Soft-Sync; staying TCP-only");
+            return None;
+        }
+        Some((request, message_channel_id))
+    }
+
     pub fn new_deactivation_reactivation(
         mut consumed: Acceptor,
         static_channels: StaticChannelSet,
@@ -338,6 +394,12 @@ impl Acceptor {
             reactivation: true,
             honor_client_desktop_size: consumed.honor_client_desktop_size,
             multitransport_announce: consumed.multitransport_announce,
+            // The request belongs to the connection sequence, not to an
+            // activation: a Deactivation-Reactivation Sequence (1.3.1.3) does
+            // not repeat it.
+            multitransport_request: None,
+            multitransport_request_sent: None,
+            message_channel_pdus: Vec::new(),
             merged_domain_parameters: mcs::DomainParameters::target(),
         })
     }
@@ -436,6 +498,8 @@ impl Acceptor {
                 reactivation: self.reactivation,
                 credentials: self.received_credentials.take(),
                 auto_reconnect: self.received_auto_reconnect.take(),
+                multitransport_request_id: self.multitransport_request_sent,
+                message_channel_pdus: mem::take(&mut self.message_channel_pdus),
             }),
             previous_state => {
                 self.state = previous_state;
@@ -496,6 +560,10 @@ pub enum AcceptorState {
         early_capability: Option<gcc::ClientEarlyCapabilityFlags>,
         channels: Vec<(u16, gcc::ChannelDef)>,
     },
+    MultitransportBootstrapping {
+        early_capability: Option<gcc::ClientEarlyCapabilityFlags>,
+        channels: Vec<(u16, gcc::ChannelDef)>,
+    },
     CapabilitiesSendServer {
         early_capability: Option<gcc::ClientEarlyCapabilityFlags>,
         channels: Vec<(u16, gcc::ChannelDef)>,
@@ -532,6 +600,7 @@ impl State for AcceptorState {
             Self::RdpSecurityCommencement { .. } => "RdpSecurityCommencement",
             Self::SecureSettingsExchange { .. } => "SecureSettingsExchange",
             Self::LicensingExchange { .. } => "LicensingExchange",
+            Self::MultitransportBootstrapping { .. } => "MultitransportBootstrapping",
             Self::CapabilitiesSendServer { .. } => "CapabilitiesSendServer",
             Self::MonitorLayoutSend { .. } => "MonitorLayoutSend",
             Self::CapabilitiesWaitConfirm { .. } => "CapabilitiesWaitConfirm",
@@ -563,6 +632,7 @@ impl Sequence for Acceptor {
             AcceptorState::RdpSecurityCommencement { .. } => None,
             AcceptorState::SecureSettingsExchange { .. } => Some(&pdu::X224_HINT),
             AcceptorState::LicensingExchange { .. } => None,
+            AcceptorState::MultitransportBootstrapping { .. } => None,
             AcceptorState::CapabilitiesSendServer { .. } => None,
             AcceptorState::MonitorLayoutSend { .. } => None,
             AcceptorState::CapabilitiesWaitConfirm { .. } => Some(&pdu::X224_HINT),
@@ -1021,10 +1091,58 @@ impl Sequence for Acceptor {
                 let written =
                     util::encode_send_data_indication(self.user_channel_id, self.io_channel_id, &license, output)?;
 
+                // A reactivation starts over at the Capabilities Exchange:
+                // licensing and multitransport bootstrapping belong to the
+                // connection sequence only (1.3.1.3).
                 self.saved_for_reactivation = AcceptorState::CapabilitiesSendServer {
                     early_capability,
                     channels: channels.clone(),
                 };
+
+                let next_state = if self.multitransport_bootstrap().is_some() {
+                    AcceptorState::MultitransportBootstrapping {
+                        early_capability,
+                        channels,
+                    }
+                } else {
+                    AcceptorState::CapabilitiesSendServer {
+                        early_capability,
+                        channels,
+                    }
+                };
+
+                (Written::from_size(written)?, next_state)
+            }
+
+            // 1.3.1.1, Optional Multitransport Bootstrapping: "After the
+            // connection has been secured and the Licensing phase has run to
+            // completion, the server can choose to initiate multitransport
+            // connections." The request MUST go on the message channel
+            // (2.2.15.1).
+            AcceptorState::MultitransportBootstrapping {
+                early_capability,
+                channels,
+            } => {
+                let (request, message_channel_id) = self
+                    .multitransport_bootstrap()
+                    .ok_or_else(|| ConnectorError::general("no multitransport request to send"))?;
+                let pdu = rdp::multitransport::MultitransportRequestPdu {
+                    security_header: rdp::headers::BasicSecurityHeader {
+                        flags: rdp::headers::BasicSecurityHeaderFlags::TRANSPORT_REQ,
+                    },
+                    request_id: request.request_id,
+                    requested_protocol: rdp::multitransport::RequestedProtocol::UdpFecR,
+                    security_cookie: request.security_cookie,
+                };
+
+                debug!(
+                    request_id = request.request_id,
+                    "Send Initiate Multitransport Request (UDP FECR)"
+                );
+
+                let written =
+                    util::encode_send_data_indication(self.user_channel_id, message_channel_id, &pdu, output)?;
+                self.multitransport_request_sent = Some(request.request_id);
 
                 (
                     Written::from_size(written)?,
@@ -1111,6 +1229,17 @@ impl Sequence for Acceptor {
                     }
                 };
                 match message {
+                    // The Multitransport Response (2.2.15.2), and anything
+                    // else the client says on the message channel, can come
+                    // before the Confirm Active: kept for the server, not
+                    // taken for the Confirm Active.
+                    mcs::McsMessage::SendDataRequest(data) if Some(data.channel_id) == self.message_channel_id => {
+                        debug!("message channel PDU during the capabilities exchange; kept for the server");
+                        self.message_channel_pdus.push(data.user_data.to_vec());
+
+                        (Written::Nothing, prev_state)
+                    }
+
                     mcs::McsMessage::SendDataRequest(data) => {
                         let capabilities_confirm = decode::<rdp::headers::ShareControlHeader>(data.user_data.as_ref())
                             .map_err(ConnectorError::decode);
@@ -1149,7 +1278,11 @@ impl Sequence for Acceptor {
                             Written::Nothing,
                             AcceptorState::ConnectionFinalization {
                                 channels: channels.clone(),
-                                finalization: FinalizationSequence::new(self.user_channel_id, self.io_channel_id),
+                                finalization: FinalizationSequence::new(
+                                    self.user_channel_id,
+                                    self.io_channel_id,
+                                    self.message_channel_id,
+                                ),
                                 client_capabilities: confirm.pdu.capability_sets,
                             },
                         )
@@ -1175,10 +1308,12 @@ impl Sequence for Acceptor {
                 let written = finalization.step(input, received_at, output)?;
 
                 let state = if finalization.is_done() {
+                    let (input_events, message_channel_pdus) = finalization.into_received();
+                    self.message_channel_pdus.extend(message_channel_pdus);
                     AcceptorState::Accepted {
                         channels,
                         client_capabilities,
-                        input_events: finalization.into_input_events(),
+                        input_events,
                     }
                 } else {
                     AcceptorState::ConnectionFinalization {
@@ -1275,5 +1410,140 @@ mod tests {
     #[test]
     fn a_server_without_multitransport_announces_nothing() {
         assert!(server_blocks(false).multi_transport_channel.is_none());
+    }
+
+    fn acceptor_after_licensing(flags: gcc::MultiTransportFlags, message_channel_id: Option<u16>) -> Acceptor {
+        let mut acceptor = Acceptor::new(
+            SecurityProtocol::SSL,
+            DesktopSize {
+                width: 1024,
+                height: 768,
+            },
+            Vec::new(),
+            None,
+        );
+        acceptor.set_multitransport_announce(true);
+        acceptor.set_multitransport_request(Some(MultitransportRequest {
+            request_id: 7,
+            security_cookie: [0x5A; 16],
+        }));
+        acceptor.multitransport_flags = flags;
+        acceptor.message_channel_id = message_channel_id;
+        acceptor.state = AcceptorState::LicensingExchange {
+            early_capability: None,
+            channels: Vec::new(),
+        };
+        acceptor
+    }
+
+    /// One step, and the MCS Send Data Indication it wrote: its channel and
+    /// user data.
+    fn step_and_read(acceptor: &mut Acceptor) -> (u16, Vec<u8>) {
+        let mut output = WriteBuf::new();
+        acceptor.step(&[], None, &mut output).expect("step");
+        let X224(indication) = decode::<X224<mcs::SendDataIndication<'_>>>(output.filled()).expect("indication");
+        (indication.channel_id, indication.user_data.to_vec())
+    }
+
+    fn is_demand_active(user_data: &[u8]) -> bool {
+        matches!(
+            decode::<rdp::headers::ShareControlHeader>(user_data).map(|pdu| pdu.share_control_pdu),
+            Ok(ShareControlPdu::ServerDemandActive(_))
+        )
+    }
+
+    const SOFT_SYNC_UDP: gcc::MultiTransportFlags =
+        gcc::MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR.union(gcc::MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP);
+
+    /// MS-RDPBCGR 1.3.1.1: Licensing, then Optional Multitransport
+    /// Bootstrapping, then the Capabilities Exchange. The request goes on the
+    /// MCS message channel (2.2.15.1).
+    ///
+    /// Regression: the server sent it after the connection finalization.
+    #[test]
+    fn the_multitransport_request_goes_between_licensing_and_demand_active() {
+        let mut acceptor = acceptor_after_licensing(SOFT_SYNC_UDP, Some(1008));
+
+        let (channel, _) = step_and_read(&mut acceptor);
+        assert_eq!(channel, acceptor.io_channel_id, "the licensing PDU");
+
+        let (channel, user_data) = step_and_read(&mut acceptor);
+        assert_eq!(channel, 1008, "on the message channel");
+        let request = decode::<rdp::multitransport::MultitransportRequestPdu>(&user_data).expect("request");
+        assert_eq!(request.request_id, 7);
+        assert_eq!(request.security_cookie, [0x5A; 16]);
+
+        let (channel, user_data) = step_and_read(&mut acceptor);
+        assert_eq!(channel, acceptor.io_channel_id);
+        assert!(is_demand_active(&user_data));
+        assert_eq!(acceptor.multitransport_request_sent, Some(7));
+    }
+
+    /// No Soft-Sync, or no message channel to send it on: no request.
+    #[test]
+    fn no_multitransport_request_without_soft_sync_or_a_message_channel() {
+        for (flags, message_channel_id) in [
+            (gcc::MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR, Some(1008)),
+            (SOFT_SYNC_UDP, None),
+        ] {
+            let mut acceptor = acceptor_after_licensing(flags, message_channel_id);
+            step_and_read(&mut acceptor);
+
+            let (_, user_data) = step_and_read(&mut acceptor);
+            assert!(is_demand_active(&user_data), "{flags:?}, {message_channel_id:?}");
+            assert_eq!(acceptor.multitransport_request_sent, None);
+        }
+    }
+
+    /// MS-RDPBCGR 1.3.1.3: a Deactivation-Reactivation Sequence repeats the
+    /// Capabilities Exchange and the Connection Finalization, not the
+    /// Optional Multitransport Bootstrapping.
+    ///
+    /// Regression: the server sent a new request after every activation.
+    #[test]
+    fn a_reactivation_sends_no_second_multitransport_request() {
+        let mut acceptor = acceptor_after_licensing(SOFT_SYNC_UDP, Some(1008));
+        step_and_read(&mut acceptor);
+
+        let size = DesktopSize {
+            width: 800,
+            height: 600,
+        };
+        let mut reactivation =
+            Acceptor::new_deactivation_reactivation(acceptor, StaticChannelSet::new(), size).expect("reactivation");
+
+        let (channel, user_data) = step_and_read(&mut reactivation);
+        assert_eq!(channel, reactivation.io_channel_id);
+        assert!(is_demand_active(&user_data));
+        assert_eq!(reactivation.multitransport_request_sent, None);
+    }
+
+    /// MS-RDPBCGR 2.2.15.2: the Multitransport Response can arrive while the
+    /// acceptor waits for the Confirm Active. It is kept for the server, not
+    /// taken for the Confirm Active.
+    #[test]
+    fn a_multitransport_response_before_the_confirm_active_is_kept() {
+        let mut acceptor = acceptor_after_licensing(SOFT_SYNC_UDP, Some(1008));
+        acceptor.state = AcceptorState::CapabilitiesWaitConfirm { channels: Vec::new() };
+        let response = ironrdp_core::encode_vec(&rdp::multitransport::MultitransportResponsePdu {
+            security_header: rdp::headers::BasicSecurityHeader {
+                flags: rdp::headers::BasicSecurityHeaderFlags::TRANSPORT_RSP,
+            },
+            request_id: 7,
+            hr_response: 0,
+        })
+        .expect("encode");
+        let pdu = ironrdp_core::encode_vec(&X224(mcs::SendDataRequest {
+            initiator_id: 1007,
+            channel_id: 1008,
+            user_data: response.as_slice().into(),
+        }))
+        .expect("encode");
+
+        let mut output = WriteBuf::new();
+        acceptor.step(&pdu, None, &mut output).expect("step");
+
+        assert!(matches!(acceptor.state, AcceptorState::CapabilitiesWaitConfirm { .. }));
+        assert_eq!(acceptor.message_channel_pdus, [response]);
     }
 }
