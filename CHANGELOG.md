@@ -64,6 +64,11 @@ Releasing is driven by this file: a push to `main` that adds a new
   logged with it (#1).
 - PipeWire capture on machines without a system `client.conf` (a container
   with only the library installed): linrdp brings a minimal one (#1).
+- A dynamic channel the server opens during a session is requested only after
+  the client has answered the DVC Capabilities Request (MS-RDPEDYC 2.2.1), and
+  closing one works in every state: a channel the client never heard of is
+  simply dropped, and one whose creation is still unanswered is closed as soon
+  as the client confirms it (#7).
 
 ### Changed
 - The `wayland` cargo feature is on by default. It adds no build-time

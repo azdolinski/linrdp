@@ -42,6 +42,10 @@ struct DynamicChannel {
     processor: Box<dyn DvcServerProcessor>,
     complete_data: CompleteData,
     channel_id: u32,
+    /// The server asked to close the channel while its Create Request was
+    /// still unanswered. The client already knows the ID, so the channel is
+    /// closed on the wire as soon as the client confirms it.
+    close_when_created: bool,
 }
 
 impl Drop for DynamicChannel {
@@ -105,6 +109,10 @@ impl DynamicChannelAllocator {
     where
         T: DvcServerProcessor + 'static,
     {
+        self.insert_boxed_with_id(Box::new(processor), state, channel_id);
+    }
+
+    fn insert_boxed_with_id(&mut self, processor: Box<dyn DvcServerProcessor>, state: ChannelState, channel_id: u32) {
         self.dynamic_channels
             .insert(channel_id, DynamicChannel::new(processor, channel_id, state));
     }
@@ -123,15 +131,13 @@ impl DynamicChannelAllocator {
 }
 
 impl DynamicChannel {
-    fn new<T>(processor: T, channel_id: u32, state: ChannelState) -> Self
-    where
-        T: DvcServerProcessor + 'static,
-    {
+    fn new(processor: Box<dyn DvcServerProcessor>, channel_id: u32, state: ChannelState) -> Self {
         Self {
             state,
-            processor: Box::new(processor),
+            processor,
             complete_data: CompleteData::new(),
             channel_id,
+            close_when_created: false,
         }
     }
 
@@ -145,6 +151,9 @@ impl DynamicChannel {
 pub struct DrdynvcServer {
     dynamic_channels: DynamicChannelAllocator,
     type_id_to_channel_id: BTreeMap<TypeId, u32>,
+    /// Whether the client has answered the Capabilities Request.
+    /// MS-RDPEDYC 2.2.1: the server MUST NOT create a channel before that.
+    caps_received: bool,
     soft_sync_state: SoftSyncState,
     outgoing_tunnel_channels: BTreeMap<u32, SoftSyncTunnelType>,
     incoming_tunnel_channels: BTreeMap<u32, SoftSyncTunnelType>,
@@ -172,6 +181,7 @@ impl DrdynvcServer {
         Self {
             dynamic_channels: DynamicChannelAllocator::new(),
             type_id_to_channel_id: BTreeMap::new(),
+            caps_received: false,
             soft_sync_state: SoftSyncState::Idle,
             outgoing_tunnel_channels: BTreeMap::new(),
             incoming_tunnel_channels: BTreeMap::new(),
@@ -250,28 +260,52 @@ impl DrdynvcServer {
             .map(|p| DynamicChannelMut::new(id, p))
     }
 
-    /// Creates a new DVC, returns CreateRequest PDU to send to client.
+    /// Creates a new DVC, returning the Create Request PDU to send to the client.
+    ///
+    /// `None` means nothing is to be sent yet: the capability exchange has not
+    /// finished, and MS-RDPEDYC 2.2.1 forbids creating a channel before it has.
+    /// The channel is then requested together with the pre-registered ones
+    /// when the client's Capabilities Response arrives.
     ///
     /// # Panics
     ///
     /// Panics if the number of registered dynamic channels reaches `u32::MAX`.
-    pub fn create_channel<T>(&mut self, channel: T) -> PduResult<SvcMessage>
+    pub fn create_channel<T>(&mut self, channel: T) -> PduResult<Option<SvcMessage>>
     where
         T: DvcServerProcessor + 'static,
     {
         let channel_id = self.dynamic_channels.reserve_channel();
-        self.create_channel_with_id(channel, channel_id)
+        self.create_channel_with_id(Box::new(channel), channel_id)
+    }
+
+    /// Creates a new DVC from a boxed processor — the form an embedder that
+    /// opens channels at run time holds them in.
+    ///
+    /// Returns the ID assigned to the channel, and the Create Request PDU when
+    /// one is to be sent now (see [`Self::create_channel`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the number of registered dynamic channels reaches `u32::MAX`.
+    pub fn create_channel_boxed(
+        &mut self,
+        channel: Box<dyn DvcServerProcessor>,
+    ) -> PduResult<(u32, Option<SvcMessage>)> {
+        let channel_id = self.dynamic_channels.reserve_channel();
+        let message = self.create_channel_with_id(channel, channel_id)?;
+        Ok((channel_id, message))
     }
 
     /// Creates a new DVC using a processor built with its assigned channel ID.
     ///
     /// The next channel ID is reserved and passed to `build`, allowing the
     /// processor or one of its dependencies to use the ID during construction.
+    /// The return value is as for [`Self::create_channel`].
     ///
     /// # Panics
     ///
     /// Panics if the number of registered dynamic channels reaches `u32::MAX`.
-    pub fn create_channel_with<T, E, F>(&mut self, build: F) -> Result<SvcMessage, E>
+    pub fn create_channel_with<T, E, F>(&mut self, build: F) -> Result<Option<SvcMessage>, E>
     where
         T: DvcServerProcessor + 'static,
         E: From<PduError>,
@@ -279,19 +313,26 @@ impl DrdynvcServer {
     {
         let channel_id = self.dynamic_channels.reserve_channel();
         let channel = build(channel_id)?;
-        self.create_channel_with_id(channel, channel_id).map_err(E::from)
+        self.create_channel_with_id(Box::new(channel), channel_id)
+            .map_err(E::from)
     }
 
-    fn create_channel_with_id<T>(&mut self, channel: T, channel_id: u32) -> PduResult<SvcMessage>
-    where
-        T: DvcServerProcessor + 'static,
-    {
+    fn create_channel_with_id(
+        &mut self,
+        channel: Box<dyn DvcServerProcessor>,
+        channel_id: u32,
+    ) -> PduResult<Option<SvcMessage>> {
+        if !self.caps_received {
+            self.dynamic_channels
+                .insert_boxed_with_id(channel, ChannelState::Pending, channel_id);
+            return Ok(None);
+        }
         let channel_name = channel.channel_name().into();
         let req = DrdynvcServerPdu::Create(CreateRequestPdu::new(channel_id, channel_name));
         let svc_msg = as_svc_msg_with_flag(req)?;
         self.dynamic_channels
-            .insert_channel_with_id(channel, ChannelState::Creation, channel_id);
-        Ok(svc_msg)
+            .insert_boxed_with_id(channel, ChannelState::Creation, channel_id);
+        Ok(Some(svc_msg))
     }
 
     fn remove_by_channel_id(&mut self, id: u32) -> Option<DynamicChannel> {
@@ -307,14 +348,34 @@ impl DrdynvcServer {
         })
     }
 
+    /// Closes a dynamic channel the server opened (MS-RDPEDYC 2.2.4, 3.3.5.2).
+    ///
+    /// Returns the Close PDU to send, or `None` when there is nothing to put
+    /// on the wire:
+    /// - the channel is unknown;
+    /// - its Create Request has not been sent yet (still waiting for the
+    ///   capability exchange), so the client never heard of it and it is
+    ///   simply forgotten;
+    /// - its Create Request is still unanswered: the client already knows the
+    ///   ID, so the Close goes out as the reply to its Create Response instead
+    ///   of racing it.
     pub fn close_channel(&mut self, channel_id: u32) -> Option<SvcMessage> {
+        let channel = self.dynamic_channels.get_mut(channel_id)?;
+        match channel.state {
+            ChannelState::Creation => {
+                channel.close_when_created = true;
+                return None;
+            }
+            ChannelState::Pending | ChannelState::CreationFailed(_) => {
+                self.remove_by_channel_id(channel_id);
+                return None;
+            }
+            ChannelState::Opened => {}
+        }
         self.remove_by_channel_id(channel_id)?;
         self.outgoing_tunnel_channels.remove(&channel_id);
         self.incoming_tunnel_channels.remove(&channel_id);
-        Some(
-            SvcMessage::from(DrdynvcServerPdu::Close(ClosePdu::new(channel_id)))
-                .with_flags(ChannelFlags::SHOW_PROTOCOL),
-        )
+        Some(close_pdu(channel_id))
     }
 
     /// Creates a Soft-Sync request that moves the supplied channels to reliable UDP.
@@ -461,6 +522,7 @@ impl SvcProcessor for DrdynvcServer {
         match pdu {
             DrdynvcClientPdu::Capabilities(caps_resp) => {
                 debug!("Got DVC Capabilities Response PDU: {caps_resp:?}");
+                self.caps_received = true;
                 for (id, c) in &mut self.dynamic_channels {
                     if c.state != ChannelState::Pending {
                         continue;
@@ -490,6 +552,14 @@ impl SvcProcessor for DrdynvcServer {
                     // negotiating" and waits for a readiness that will never
                     // come.
                     c.processor.close(id);
+                    return Ok(resp);
+                }
+                if c.close_when_created {
+                    // Closed by the server while this reply was in flight.
+                    // The processor never started, so it is not told again.
+                    debug!(channel_id = ?id, "DVC closed before its creation was confirmed");
+                    self.remove_by_channel_id(id);
+                    resp.push(close_pdu(id));
                     return Ok(resp);
                 }
                 c.state = ChannelState::Opened;
@@ -525,6 +595,10 @@ fn decode_dvc_message(user_data: &[u8]) -> DecodeResult<DrdynvcClientPdu> {
 
 fn as_svc_msg_with_flag(pdu: DrdynvcServerPdu) -> PduResult<SvcMessage> {
     Ok(SvcMessage::from(pdu).with_flags(ChannelFlags::SHOW_PROTOCOL))
+}
+
+fn close_pdu(channel_id: u32) -> SvcMessage {
+    SvcMessage::from(DrdynvcServerPdu::Close(ClosePdu::new(channel_id))).with_flags(ChannelFlags::SHOW_PROTOCOL)
 }
 
 #[cfg(test)]
@@ -609,6 +683,112 @@ mod tests {
             closed.load(core::sync::atomic::Ordering::Relaxed),
             "the processor must be told the channel was refused"
         );
+    }
+
+    fn decode_server_pdus(messages: &[SvcMessage]) -> Vec<DrdynvcServerPdu> {
+        messages
+            .iter()
+            .map(|message| {
+                let bytes = message.encode_unframed_pdu().unwrap();
+                ironrdp_core::decode::<DrdynvcServerPdu>(&bytes).unwrap()
+            })
+            .collect()
+    }
+
+    fn caps_response() -> Vec<u8> {
+        ironrdp_core::encode_vec(&DrdynvcClientPdu::Capabilities(
+            crate::pdu::CapabilitiesResponsePdu::new(CapsVersion::V2),
+        ))
+        .unwrap()
+    }
+
+    fn create_response(channel_id: u32) -> Vec<u8> {
+        ironrdp_core::encode_vec(&DrdynvcClientPdu::Create(crate::pdu::CreateResponsePdu::new(
+            channel_id,
+            CreationStatus::OK,
+        )))
+        .unwrap()
+    }
+
+    /// MS-RDPEDYC 2.2.1: "The DVC server manager MUST send a Capabilities
+    /// message prior to creating a DVC and wait for a response from the
+    /// client." A channel opened at run time before that answer is held back
+    /// and requested together with the ones registered up front.
+    #[test]
+    fn a_channel_opened_before_the_capability_exchange_waits_for_it() {
+        let mut server = DrdynvcServer::new();
+        let _ = server.start().unwrap();
+
+        let (channel_id, message) = server.create_channel_boxed(Box::new(TestDvc)).unwrap();
+        assert!(
+            message.is_none(),
+            "no Create Request may precede the Capabilities Response"
+        );
+
+        let sent = decode_server_pdus(&server.process(&caps_response()).unwrap());
+        assert!(
+            matches!(sent.as_slice(), [DrdynvcServerPdu::Create(create)] if create.channel_id() == channel_id),
+            "the Create Request goes out with the Capabilities Response: {sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_channel_opened_after_the_capability_exchange_is_requested_at_once() {
+        let mut server = DrdynvcServer::new();
+        let _ = server.process(&caps_response()).unwrap();
+
+        let (channel_id, message) = server.create_channel_boxed(Box::new(TestDvc)).unwrap();
+        let sent = decode_server_pdus(&[message.expect("Create Request")]);
+        assert!(matches!(sent.as_slice(), [DrdynvcServerPdu::Create(create)] if create.channel_id() == channel_id));
+    }
+
+    #[test]
+    fn closing_an_open_channel_sends_a_close_and_forgets_it() {
+        let closed = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let mut server = DrdynvcServer::new();
+        let _ = server.process(&caps_response()).unwrap();
+        let (channel_id, _) = server
+            .create_channel_boxed(Box::new(ClosableDvc {
+                closed: alloc::sync::Arc::clone(&closed),
+            }))
+            .unwrap();
+        let _ = server.process(&create_response(channel_id)).unwrap();
+        assert!(server.is_channel_opened(channel_id));
+
+        let sent = decode_server_pdus(&[server.close_channel(channel_id).expect("Close PDU")]);
+        assert!(matches!(sent.as_slice(), [DrdynvcServerPdu::Close(close)] if close.channel_id() == channel_id));
+        assert!(!server.is_channel_opened(channel_id));
+        assert!(
+            closed.load(core::sync::atomic::Ordering::Relaxed),
+            "the processor is told"
+        );
+    }
+
+    /// A channel the client never heard of has nothing to close on the wire.
+    #[test]
+    fn closing_a_channel_not_yet_requested_sends_nothing() {
+        let mut server = DrdynvcServer::new();
+        let (channel_id, _) = server.create_channel_boxed(Box::new(TestDvc)).unwrap();
+
+        assert!(server.close_channel(channel_id).is_none());
+        assert!(
+            decode_server_pdus(&server.process(&caps_response()).unwrap()).is_empty(),
+            "a forgotten channel is not requested later"
+        );
+    }
+
+    /// The client knows the ID once it has the Create Request, so a close
+    /// while its answer is in flight goes out as the reply to that answer.
+    #[test]
+    fn closing_a_channel_awaiting_its_create_response_closes_it_once_created() {
+        let mut server = DrdynvcServer::new();
+        let _ = server.process(&caps_response()).unwrap();
+        let (channel_id, _) = server.create_channel_boxed(Box::new(TestDvc)).unwrap();
+
+        assert!(server.close_channel(channel_id).is_none());
+        let sent = decode_server_pdus(&server.process(&create_response(channel_id)).unwrap());
+        assert!(matches!(sent.as_slice(), [DrdynvcServerPdu::Close(close)] if close.channel_id() == channel_id));
+        assert!(!server.is_channel_opened(channel_id));
     }
 
     #[test]
