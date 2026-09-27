@@ -96,6 +96,32 @@ jobs:
           tar -C "$STAGE" -czf "$DIR.tar.gz" "$DIR"
           sha256sum "$DIR.tar.gz" > "$DIR.tar.gz.sha256"
 
+      - name: Build Arch Linux package
+        run: |
+          VERSION="${{ steps.get_tag.outputs.VERSION }}"
+          # pacman's pkgver allows no '-'; dropping it keeps a pre-release
+          # (0.2.0beta.1) ordered before its release (0.2.0).
+          PKGVER="${VERSION//-/}"
+          STAGE=target/arch
+          rm -rf "$STAGE" && mkdir -p "$STAGE"
+          cp linrdp/arch/PKGBUILD linrdp/arch/linrdp.install "$STAGE/"
+          cp target/release/linrdp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE "$STAGE/"
+          sed -i "s/^pkgver=.*/pkgver=$PKGVER/" "$STAGE/PKGBUILD"
+          # makepkg refuses to run as root; the binary is already built, so
+          # --nodeps skips installing the runtime dependencies.
+          docker run --rm -v "$PWD/$STAGE:/pkg" -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            archlinux:latest bash -euc '
+              pacman -Syu --noconfirm --needed base-devel >/dev/null
+              useradd -m builder
+              chown -R builder /pkg
+              su builder -c "cd /pkg && makepkg --nodeps --noconfirm"
+              chown -R "$HOST_UID:$HOST_GID" /pkg
+            '
+          PKG="$STAGE/linrdp-$PKGVER-1-x86_64.pkg.tar.zst"
+          test -f "$PKG"
+          sha256sum "$PKG" > "$PKG.sha256"
+          echo "ARCH_PKG=$PKG" >> "$GITHUB_ENV"
+
       - name: Checksum the .deb
         run: |
           DEB=target/debian/linrdp_${{ steps.get_tag.outputs.VERSION }}_amd64.deb
@@ -111,6 +137,8 @@ jobs:
             linrdp-${{ steps.get_tag.outputs.VERSION }}-linux-amd64.tar.gz.sha256
             target/debian/linrdp_${{ steps.get_tag.outputs.VERSION }}_amd64.deb
             target/debian/linrdp_${{ steps.get_tag.outputs.VERSION }}_amd64.deb.sha256
+            ${{ env.ARCH_PKG }}
+            ${{ env.ARCH_PKG }}.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -123,9 +151,15 @@ jobs:
             echo
             echo "- \`linrdp-${{ steps.get_tag.outputs.VERSION }}-linux-amd64.tar.gz\`"
             echo "- \`linrdp_${{ steps.get_tag.outputs.VERSION }}_amd64.deb\`"
+            echo "- \`$(basename "$ARCH_PKG")\`"
             echo
             echo "### Install (Debian/Ubuntu)"
             echo '```bash'
             echo "sudo apt install ./linrdp_${{ steps.get_tag.outputs.VERSION }}_amd64.deb"
+            echo '```'
+            echo
+            echo "### Install (Arch Linux)"
+            echo '```bash'
+            echo "sudo pacman -U ./$(basename "$ARCH_PKG")"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

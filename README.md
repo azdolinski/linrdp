@@ -38,7 +38,8 @@ cargo build --release -p linrdp
 
 ## Install
 
-Prebuilt `.deb` and `.tar.gz` packages for linux/amd64 are attached to each
+Prebuilt `.deb`, Arch Linux `.pkg.tar.zst` and `.tar.gz` packages for
+linux/amd64 are attached to each
 [GitHub Release](https://github.com/azdolinski/linrdp/releases) — built and
 published automatically from `CHANGELOG.md` (see
 `.github/workflows/detect-release.yml` and
@@ -47,7 +48,11 @@ published automatically from `CHANGELOG.md` (see
 ```sh
 sudo apt install ./linrdp_<version>_amd64.deb   # installs the unit, PAM
                                                  # capture line and config
+sudo pacman -U ./linrdp-<version>-1-x86_64.pkg.tar.zst   # the same, on Arch
 ```
+
+pacman has no purge: `pacman -R linrdp` runs `service uninstall`, and
+`/etc/linrdp`, `/var/lib/linrdp` and `/var/log/linrdp` are yours to remove.
 
 From source:
 

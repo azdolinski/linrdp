@@ -1,0 +1,26 @@
+# Arch Linux package for linrdp. The release workflow
+# (.github/workflows/release-packages.yml) stages this file next to the
+# already-built release binary and the docs, sets pkgver from the tag, and
+# runs makepkg in an archlinux container — nothing is compiled here.
+pkgname=linrdp
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="RDP server for Linux — connect to a Linux desktop from any Windows/macOS RDP client"
+arch=('x86_64')
+url="https://github.com/azdolinski/linrdp"
+license=('MIT OR Apache-2.0')
+# The binary links glibc, libgcc_s, libpulse and zlib, and dlopens libpam.
+depends=('glibc' 'gcc-libs' 'pam' 'libpulse' 'zlib' 'systemd')
+# The GNOME case captures through PipeWire; a GNOME desktop already has it.
+optdepends=('pipewire: screen capture for GNOME on Wayland sessions')
+# A release binary with no debug info to split off.
+options=('!debug')
+install=linrdp.install
+source=('linrdp' 'README.md' 'CHANGELOG.md' 'LICENSE-MIT' 'LICENSE-APACHE')
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
+
+package() {
+    install -Dm755 linrdp "$pkgdir/usr/bin/linrdp"
+    install -Dm644 -t "$pkgdir/usr/share/doc/linrdp" README.md CHANGELOG.md
+    install -Dm644 -t "$pkgdir/usr/share/licenses/linrdp" LICENSE-MIT LICENSE-APACHE
+}

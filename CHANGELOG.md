@@ -7,13 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Releasing is driven by this file: a push to `main` that adds a new
 `## [X.Y.Z]` section here creates the matching Git tag, GitHub Release and
-`.deb`/`.tar.gz` packages automatically — see
+`.deb`/`.pkg.tar.zst`/`.tar.gz` packages automatically — see
 `.github/workflows/detect-release.yml` and
 `.github/workflows/release-packages.yml`.
 
 ## [Unreleased]
 
 ### Added
+- Arch Linux package: each release now also carries
+  `linrdp-<version>-1-x86_64.pkg.tar.zst` (install with `pacman -U`), built
+  with makepkg from `linrdp/arch/PKGBUILD`; like the `.deb`, it runs
+  `linrdp service install` on install and upgrade and `service uninstall` on
+  removal.
 - GNOME on Wayland: every login gets a headless GNOME session of its own
   (`gnome-shell --headless` on a private bus, a virtual monitor at the
   client's exact size per connection), kept running and locked between
