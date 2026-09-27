@@ -6848,3 +6848,240 @@ mod soft_sync_tests {
         );
     }
 }
+
+/// The connection sequence end to end: IronRDP's own client
+/// (`ironrdp-connector`), written against the specification apart from this
+/// server, connects over an in-memory stream with standard RDP security and no
+/// encryption.
+#[cfg(test)]
+mod connection_sequence_tests {
+    use ironrdp_async::{NetworkClient, connect_begin, connect_finalize_with_multitransport, mark_as_upgraded};
+    use ironrdp_connector::sspi::generator::NetworkRequest;
+    use ironrdp_connector::{ClientConnector, ConnectorResult, MultitransportResult, ServerName};
+    use ironrdp_pdu::gcc::{ConnectionType, KeyboardType, MultiTransportFlags};
+    use ironrdp_pdu::rdp::capability_sets::{MajorPlatformType, RailSupportLevel};
+    use ironrdp_pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
+
+    use super::*;
+
+    const SOFT_SYNC_UDP: MultiTransportFlags =
+        MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR.union(MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP);
+
+    /// Standard RDP security has no CredSSP, so nothing goes to the network.
+    struct NoNetwork;
+
+    impl NetworkClient for NoNetwork {
+        async fn send(&mut self, _request: &NetworkRequest) -> ConnectorResult<Vec<u8>> {
+            Err(ironrdp_connector::general_err!("no network in this test"))
+        }
+    }
+
+    struct RefuseAll;
+
+    #[async_trait::async_trait]
+    impl CredentialValidator for RefuseAll {
+        async fn validate(&self, _credentials: &Credentials) -> Result<CredentialDecision, CredentialValidationError> {
+            Ok(CredentialDecision::Reject)
+        }
+    }
+
+    fn client_config(multitransport_flags: Option<MultiTransportFlags>) -> ironrdp_connector::Config {
+        ironrdp_connector::Config {
+            desktop_size: DesktopSize {
+                width: 1024,
+                height: 768,
+            },
+            monitor_layout: None,
+            desktop_scale_factor: 0,
+            enable_tls: false,
+            enable_credssp: false,
+            enable_standard_rdp_security: true,
+            credentials: ironrdp_connector::Credentials::UsernamePassword {
+                username: "user".into(),
+                password: "password".into(),
+            },
+            domain: None,
+            client_build: 0,
+            client_name: "test".into(),
+            keyboard_type: KeyboardType::IBM_ENHANCED,
+            keyboard_subtype: 0,
+            keyboard_functional_keys_count: 12,
+            keyboard_layout: 0,
+            connection_type: ConnectionType::Lan,
+            ime_file_name: String::new(),
+            bitmap: None,
+            dig_product_id: String::new(),
+            client_dir: String::new(),
+            alternate_shell: String::new(),
+            work_dir: String::new(),
+            remote_application_mode: false,
+            rail_support_level: RailSupportLevel::empty(),
+            platform: MajorPlatformType::UNIX,
+            hardware_id: None,
+            request_data: None,
+            autologon: false,
+            enable_audio_playback: false,
+            enable_audio_capture: false,
+            performance_flags: PerformanceFlags::default(),
+            license_cache: None,
+            timezone_info: TimezoneInfo::default(),
+            compression_type: None,
+            enable_server_pointer: false,
+            pointer_software_rendering: false,
+            multitransport_flags,
+            support_dyn_vc_gfx_protocol: false,
+        }
+    }
+
+    /// What the client saw of the connection.
+    struct ClientView {
+        connected: ConnectorResult<()>,
+        /// Each Initiate Multitransport Request: requestId, securityCookie,
+        /// and whether Soft-Sync was negotiated.
+        requests: Vec<(u32, [u8; 16], bool)>,
+        /// What the server sent once the client was connected, up to its
+        /// hang-up (only when asked for).
+        after: Vec<Vec<u8>>,
+    }
+
+    /// Connect a client announcing `flags` to `server`, answering every
+    /// Initiate Multitransport Request with S_OK. With `until_closed`, the
+    /// client then reads what the server sends until the server hangs up;
+    /// otherwise it hangs up itself.
+    async fn connect(server: &mut RdpServer, flags: Option<MultiTransportFlags>, until_closed: bool) -> ClientView {
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+
+        let server_side = async {
+            let _ = server.run_connection(server_stream).await;
+        };
+        let client_side = async move {
+            let mut requests = Vec::new();
+            let mut after = Vec::new();
+            let mut framed = TokioFramed::new(client_stream);
+            let mut connector = ClientConnector::new(client_config(flags), SocketAddr::from(([127, 0, 0, 1], 50000)));
+            let connected = async {
+                let should_upgrade = connect_begin(&mut framed, &mut connector).await?;
+                // Standard RDP security: an upgrade with nothing to do.
+                let upgraded = mark_as_upgraded(should_upgrade, &mut connector);
+                connect_finalize_with_multitransport(
+                    upgraded,
+                    connector,
+                    &mut framed,
+                    &mut NoNetwork,
+                    ServerName::new("localhost"),
+                    Vec::new(),
+                    None,
+                    async |request, soft_sync| {
+                        requests.push((request.request_id, request.security_cookie, soft_sync));
+                        Ok(MultitransportResult::Success)
+                    },
+                )
+                .await
+                .map(|_| ())
+            }
+            .await;
+            if until_closed {
+                while let Ok((_, frame)) = framed.read_pdu().await {
+                    after.push(frame.to_vec());
+                }
+            }
+            drop(framed);
+            ClientView {
+                connected,
+                requests,
+                after,
+            }
+        };
+
+        let ((), view) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(server_side, client_side)
+        })
+        .await
+        .expect("the connection sequence finishes");
+        view
+    }
+
+    fn server_offering_the_tunnel() -> RdpServer {
+        RdpServer::builder()
+            .with_addr(([127, 0, 0, 1], 0))
+            .with_no_security()
+            .with_no_input()
+            .with_no_display()
+            .with_multitransport(Some(MultiTransportRequest {
+                request_id: 7,
+                security_cookie: [0x5A; 16],
+            }))
+            .build()
+    }
+
+    /// The Set Error Info PDU in a frame the server sent, with its pduSource.
+    fn set_error_info(frame: &[u8]) -> Option<(u16, ServerSetErrorInfoPdu)> {
+        let X224(indication) = decode::<X224<SendDataIndication<'_>>>(frame).ok()?;
+        let header = decode::<rdp::headers::ShareControlHeader>(indication.user_data.as_ref()).ok()?;
+        match header.share_control_pdu {
+            ShareControlPdu::Data(rdp::headers::ShareDataHeader {
+                share_data_pdu: rdp::headers::ShareDataPdu::ServerSetErrorInfo(pdu),
+                ..
+            }) => Some((header.pdu_source, pdu)),
+            _ => None,
+        }
+    }
+
+    /// MS-RDPBCGR 1.3.1.1: the client finds the Initiate Multitransport
+    /// Request where it looks for it, between Licensing and the Capabilities
+    /// Exchange, with Soft-Sync negotiated by both sides (MS-RDPEDYC 3.1.5.3).
+    /// Its response, sent before the Confirm Active (2.2.15.2), confirms the
+    /// tunnel, and the rest of the sequence completes around it.
+    #[tokio::test]
+    async fn a_soft_sync_client_is_offered_the_tunnel_between_licensing_and_capabilities() {
+        let mut server = server_offering_the_tunnel();
+
+        let view = connect(&mut server, Some(SOFT_SYNC_UDP), false).await;
+
+        view.connected.expect("the client connects");
+        assert_eq!(view.requests, [(7, [0x5A; 16], true)]);
+        assert_eq!(server.multitransport_request_id, Some(7));
+        assert!(server.multitransport_confirmed, "the client's S_OK reached the server");
+    }
+
+    /// MS-RDPEDYC 3.1.5.3: without Soft-Sync on both sides there is no way to
+    /// move a channel to the tunnel, so the client is not offered one.
+    #[tokio::test]
+    async fn a_client_without_soft_sync_connects_without_an_offer() {
+        let mut server = server_offering_the_tunnel();
+
+        let view = connect(&mut server, Some(MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR), false).await;
+
+        view.connected.expect("the client connects");
+        assert!(view.requests.is_empty());
+        assert_eq!(server.multitransport_request_id, None);
+    }
+
+    /// MS-RDPBCGR 2.2.5.1.1: a refused login reaches the client as a whole Set
+    /// Error Info PDU, pduSource 0, carrying ERRINFO_SERVER_DENIED_CONNECTION.
+    #[tokio::test]
+    async fn a_refused_login_reaches_the_client_as_a_set_error_info_pdu() {
+        let mut server = RdpServer::builder()
+            .with_addr(([127, 0, 0, 1], 0))
+            .with_no_security()
+            .with_no_input()
+            .with_no_display()
+            .build();
+        server.set_credential_validator(Some(Arc::new(RefuseAll)));
+
+        let view = connect(&mut server, None, true).await;
+
+        // The validator runs once the connection sequence is complete.
+        view.connected.expect("the client connects");
+        let refusals: Vec<_> = view.after.iter().filter_map(|frame| set_error_info(frame)).collect();
+        assert_eq!(
+            refusals,
+            [(
+                0,
+                ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
+                    ProtocolIndependentCode::ServerDeniedConnection
+                ))
+            )]
+        );
+    }
+}
