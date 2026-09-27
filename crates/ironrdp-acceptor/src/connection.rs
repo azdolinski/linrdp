@@ -18,6 +18,7 @@ use pdu::rdp::server_license::{LicensePdu, LicensingErrorMessage};
 use pdu::{gcc, mcs, nego, rdp};
 use tracing::{debug, warn};
 
+use super::autodetect::{ConnectTimeAutoDetection, NetworkCharacteristics};
 use super::channel_connection::ChannelConnectionSequence;
 use super::finalization::FinalizationSequence;
 use crate::util::{self, wrap_share_data};
@@ -65,6 +66,10 @@ pub struct Acceptor {
     /// What the client sent on the MCS message channel while the acceptor
     /// waited for something else, in order.
     message_channel_pdus: Vec<Vec<u8>>,
+    /// Whether to run the Optional Connect-Time Auto-Detection phase.
+    connect_time_autodetect: bool,
+    /// What it found.
+    network_characteristics: Option<NetworkCharacteristics>,
     /// Domain parameters merged from the client's MCS Connect Initial per
     /// 3.3.5.3.3, echoed back in the Connect Response.
     merged_domain_parameters: mcs::DomainParameters,
@@ -198,6 +203,9 @@ pub struct AcceptorResult {
     /// Multitransport Response (section 2.2.15.2) can arrive then. Each entry
     /// is the user data of one MCS Send Data Request.
     pub message_channel_pdus: Vec<Vec<u8>>,
+    /// What the Optional Connect-Time Auto-Detection phase found, if it ran
+    /// (see [`Acceptor::set_connect_time_autodetect`]).
+    pub network_characteristics: Option<NetworkCharacteristics>,
 }
 
 impl Acceptor {
@@ -247,6 +255,8 @@ impl Acceptor {
             multitransport_request: None,
             multitransport_request_sent: None,
             message_channel_pdus: Vec::new(),
+            connect_time_autodetect: false,
+            network_characteristics: None,
             merged_domain_parameters: mcs::DomainParameters::target(),
         }
     }
@@ -335,6 +345,19 @@ impl Acceptor {
         self.multitransport_request = request;
     }
 
+    /// Run the Optional Connect-Time Auto-Detection phase ([MS-RDPBCGR]
+    /// 1.3.1.1, 1.3.9) between the Secure Settings Exchange and Licensing:
+    /// measure RTT and bandwidth, and send the client a Network
+    /// Characteristics Result, the one message that carries them to it over
+    /// the main connection.
+    ///
+    /// It runs only for a client that set
+    /// RNS_UD_CS_SUPPORT_NETCHAR_AUTODETECT (2.2.1.3.2) and joined a message
+    /// channel, which carries the exchange (2.2.14.3).
+    pub fn set_connect_time_autodetect(&mut self, enabled: bool) {
+        self.connect_time_autodetect = enabled;
+    }
+
     /// The request to send in the Optional Multitransport Bootstrapping phase
     /// of this connection, with the message channel it goes on.
     fn multitransport_bootstrap(&self) -> Option<(MultitransportRequest, u16)> {
@@ -400,6 +423,9 @@ impl Acceptor {
             multitransport_request: None,
             multitransport_request_sent: None,
             message_channel_pdus: Vec::new(),
+            // Like the request, a phase of the connection sequence only.
+            connect_time_autodetect: false,
+            network_characteristics: None,
             merged_domain_parameters: mcs::DomainParameters::target(),
         })
     }
@@ -500,6 +526,7 @@ impl Acceptor {
                 auto_reconnect: self.received_auto_reconnect.take(),
                 multitransport_request_id: self.multitransport_request_sent,
                 message_channel_pdus: mem::take(&mut self.message_channel_pdus),
+                network_characteristics: self.network_characteristics.take(),
             }),
             previous_state => {
                 self.state = previous_state;
@@ -556,6 +583,11 @@ pub enum AcceptorState {
         early_capability: Option<gcc::ClientEarlyCapabilityFlags>,
         channels: Vec<(u16, gcc::ChannelDef)>,
     },
+    ConnectTimeAutoDetection {
+        early_capability: Option<gcc::ClientEarlyCapabilityFlags>,
+        channels: Vec<(u16, gcc::ChannelDef)>,
+        detection: ConnectTimeAutoDetection,
+    },
     LicensingExchange {
         early_capability: Option<gcc::ClientEarlyCapabilityFlags>,
         channels: Vec<(u16, gcc::ChannelDef)>,
@@ -599,6 +631,7 @@ impl State for AcceptorState {
             Self::ChannelConnection { .. } => "ChannelConnection",
             Self::RdpSecurityCommencement { .. } => "RdpSecurityCommencement",
             Self::SecureSettingsExchange { .. } => "SecureSettingsExchange",
+            Self::ConnectTimeAutoDetection { .. } => "ConnectTimeAutoDetection",
             Self::LicensingExchange { .. } => "LicensingExchange",
             Self::MultitransportBootstrapping { .. } => "MultitransportBootstrapping",
             Self::CapabilitiesSendServer { .. } => "CapabilitiesSendServer",
@@ -631,6 +664,13 @@ impl Sequence for Acceptor {
             AcceptorState::ChannelConnection { connection, .. } => connection.next_pdu_hint(),
             AcceptorState::RdpSecurityCommencement { .. } => None,
             AcceptorState::SecureSettingsExchange { .. } => Some(&pdu::X224_HINT),
+            AcceptorState::ConnectTimeAutoDetection { detection, .. } => {
+                if detection.waits_for_input() {
+                    Some(&pdu::X224_HINT)
+                } else {
+                    None
+                }
+            }
             AcceptorState::LicensingExchange { .. } => None,
             AcceptorState::MultitransportBootstrapping { .. } => None,
             AcceptorState::CapabilitiesSendServer { .. } => None,
@@ -1069,13 +1109,49 @@ impl Sequence for Acceptor {
                     self.received_credentials = Some(creds);
                 }
 
-                (
-                    Written::Nothing,
-                    AcceptorState::LicensingExchange {
+                // 1.3.1.1, phase 6: Optional Connect-Time Auto-Detection.
+                let autodetect = self.connect_time_autodetect
+                    && self
+                        .early_capability_flags
+                        .contains(gcc::ClientEarlyCapabilityFlags::SUPPORT_NET_CHAR_AUTODETECT);
+                let next_state = match self.message_channel_id {
+                    Some(message_channel_id) if autodetect => AcceptorState::ConnectTimeAutoDetection {
+                        early_capability,
+                        channels,
+                        detection: ConnectTimeAutoDetection::new(self.user_channel_id, message_channel_id, received_at),
+                    },
+                    _ => AcceptorState::LicensingExchange {
                         early_capability,
                         channels,
                     },
-                )
+                };
+
+                (Written::Nothing, next_state)
+            }
+
+            AcceptorState::ConnectTimeAutoDetection {
+                early_capability,
+                channels,
+                mut detection,
+            } => {
+                let written = detection.step(input, received_at, output)?;
+                let next_state = if detection.is_done() {
+                    let found = detection.found();
+                    debug!(?found, "Connect-Time Auto-Detection done");
+                    self.network_characteristics = Some(found);
+                    AcceptorState::LicensingExchange {
+                        early_capability,
+                        channels,
+                    }
+                } else {
+                    AcceptorState::ConnectTimeAutoDetection {
+                        early_capability,
+                        channels,
+                        detection,
+                    }
+                };
+
+                (written, next_state)
             }
 
             AcceptorState::LicensingExchange {
