@@ -116,6 +116,11 @@ Releasing is driven by this file: a push to `main` that adds a new
 - Network auto-detection probes go only to clients that announce support
   for them. No Network Characteristics Result is sent over TCP during the
   session (MS-RDPBCGR 2.2.1.3.2, 1.3.9) (#7).
+- The server runs Connect-Time Auto-Detection before licensing (MS-RDPBCGR
+  1.3.1.1, phase 6). It measures RTT and bandwidth and sends the client its
+  Network Characteristics Result; over TCP, 1.3.9 allows it only in this
+  phase. With the previous change and no UDP tunnel, mstsc had no connection
+  statistics at all (#7).
 - A Refresh Rect PDU, or resuming output after Suppress Output, redraws the
   requested area even when nothing changed on screen (MS-RDPBCGR 3.3.5.11)
   (#7).

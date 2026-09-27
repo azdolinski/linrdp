@@ -814,6 +814,8 @@ pub struct RdpServer {
     handshake_timeout: Option<Duration>,
     local_addr: Option<SocketAddr>,
     autodetect: Option<AutoDetectManager>,
+    /// What Connect-Time Auto-Detection found on this connection.
+    connect_time_network: Option<ironrdp_acceptor::NetworkCharacteristics>,
     /// Sender half of the UDP multitransport tunnel, installed by
     /// [`ServerEvent::SoftSyncToUdp`] once the embedder's RDP-UDP accept
     /// completed. `None` = no tunnel (all DVC traffic stays on TCP).
@@ -1209,6 +1211,7 @@ impl PendingConnection {
     enable_ainput: bool,
     multitransport: Option<MultiTransportRequest>,
     graphics_pipeline: bool,
+    autodetect: bool,
     ) -> Self {
         let mut acceptor = Acceptor::new_with_resolver(security.flag(), desktop_size, capabilities, creds, credential_resolver);
         acceptor.set_honor_client_desktop_size(honor_client_desktop_size);
@@ -1225,6 +1228,11 @@ impl PendingConnection {
         // RDP_NEG_RSP (2.2.1.2.1): DYNVC_GFX_PROTOCOL_SUPPORTED whenever the
         // embedder offers the graphics pipeline.
         acceptor.set_graphics_pipeline_announce(graphics_pipeline);
+        // MS-RDPBCGR 1.3.9: the Network Characteristics Result reaches the
+        // client over the main connection only in the Optional Connect-Time
+        // Auto-Detection phase (1.3.1.1), so a server that measures the link
+        // runs it.
+        acceptor.set_connect_time_autodetect(autodetect);
         Self { security, acceptor }
     }
 
@@ -1516,6 +1524,8 @@ struct NegotiationContext {
     enable_ainput: bool,
     /// See [`RdpServer::offers_graphics_pipeline`].
     graphics_pipeline: bool,
+    /// Whether auto-detect is enabled ([`RdpServer::enable_autodetect`]).
+    autodetect: bool,
     display: Arc<Mutex<Box<dyn RdpServerDisplay>>>,
 }
 
@@ -1554,6 +1564,7 @@ async fn negotiate_candidate(
         ctx.enable_ainput,
         ctx.opts.multitransport.clone(),
         ctx.graphics_pipeline,
+        ctx.autodetect,
     );
 
     // NOTE: deliberately NO channel attachment here. Building the cliprdr /
@@ -1690,6 +1701,7 @@ impl RdpServer {
             credential_validator: None,
             local_addr: None,
             autodetect: None,
+            connect_time_network: None,
             udp_tunnel_tx: None,
             multitransport_confirmed: false,
             multitransport_request_id: None,
@@ -2346,6 +2358,7 @@ impl RdpServer {
             credential_resolver: self.credential_resolver.clone(),
             enable_ainput: self.enable_ainput,
             graphics_pipeline: self.offers_graphics_pipeline(),
+            autodetect: self.autodetect.is_some(),
             display: Arc::clone(&self.display),
         }
     }
@@ -2526,6 +2539,7 @@ impl RdpServer {
             self.enable_ainput,
             self.opts.multitransport.clone(),
             self.offers_graphics_pipeline(),
+            self.autodetect.is_some(),
         );
 
         self.attach_channels(pending.acceptor_mut());
@@ -4191,6 +4205,14 @@ impl RdpServer {
             if let Some(request_id) = self.multitransport_request_id {
                 info!(request_id, "Sent Initiate Multitransport Request (UDP FECR)");
             }
+            self.connect_time_network = result.network_characteristics;
+            if let Some(found) = result.network_characteristics {
+                info!(
+                    rtt_ms = ?found.rtt_ms,
+                    bandwidth_kbps = ?found.bandwidth_kbps,
+                    "Connect-Time Auto-Detection"
+                );
+            }
         }
         self.static_channels = result.static_channels;
         if !result.reactivation {
@@ -5500,6 +5522,7 @@ mod auto_reconnect_tests {
             }),
             multitransport_request_id: None,
             message_channel_pdus: Vec::new(),
+            network_characteristics: None,
         };
 
         let (_client_reader, server_reader) = tokio::io::duplex(1024);
@@ -5705,6 +5728,7 @@ mod preempt_tests {
             credential_resolver: None,
             enable_ainput: false,
             graphics_pipeline: false,
+            autodetect: false,
             display: Arc::new(Mutex::new(Box::new(NoDisplay))),
         }
     }
@@ -7042,6 +7066,24 @@ mod connection_sequence_tests {
         assert_eq!(view.requests, [(7, [0x5A; 16], true)]);
         assert_eq!(server.multitransport_request_id, Some(7));
         assert!(server.multitransport_confirmed, "the client's S_OK reached the server");
+    }
+
+    /// MS-RDPBCGR 1.3.1.1: a server that measures the link runs the Optional
+    /// Connect-Time Auto-Detection phase before Licensing (1.3.9), and the
+    /// client, which answers its RTT and bandwidth requests (3.2.5.14), goes
+    /// on through Multitransport Bootstrapping to a complete connection.
+    #[tokio::test]
+    async fn a_client_is_measured_before_licensing() {
+        let mut server = server_offering_the_tunnel();
+        server.enable_autodetect();
+
+        let view = connect(&mut server, Some(SOFT_SYNC_UDP), false).await;
+
+        view.connected.expect("the client connects");
+        assert_eq!(view.requests, [(7, [0x5A; 16], true)]);
+        let found = server.connect_time_network.expect("the phase ran");
+        assert!(found.rtt_ms.is_some(), "{found:?}");
+        assert!(found.bandwidth_kbps.is_some(), "{found:?}");
     }
 
     /// MS-RDPEDYC 3.1.5.3: without Soft-Sync on both sides there is no way to

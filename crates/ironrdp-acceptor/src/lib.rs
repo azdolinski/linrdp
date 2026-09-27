@@ -8,6 +8,7 @@ use ironrdp_connector::{ConnectorError, ConnectorResult, ServerName};
 use ironrdp_core::WriteBuf;
 use tracing::{debug, instrument, trace};
 
+mod autodetect;
 mod channel_connection;
 mod connection;
 pub mod credssp;
@@ -17,6 +18,7 @@ mod util;
 pub use ironrdp_connector::DesktopSize;
 use ironrdp_pdu::nego;
 
+pub use self::autodetect::{ConnectTimeAutoDetection, NetworkCharacteristics};
 pub use self::channel_connection::{ChannelConnectionSequence, ChannelConnectionState};
 pub use self::connection::{Acceptor, AcceptorResult, AcceptorState, MultitransportRequest};
 pub use self::finalization::{FinalizationSequence, FinalizationState};
