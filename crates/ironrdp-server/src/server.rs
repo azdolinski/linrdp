@@ -3022,11 +3022,13 @@ impl RdpServer {
             return Ok(());
         };
         let ids = drdynvc.open_channel_ids();
-        if ids.is_empty() {
-            // The client can confirm the tunnel before it has opened a single
-            // dynamic channel. Dropping the Soft-Sync then left the whole
-            // connection on TCP; keep it until a channel is open instead.
-            debug!("Soft-sync ready but no dynamic channel is open yet; waiting for one");
+        // A Soft-Sync moves the channels open at the time, once (MS-RDPEDYC
+        // 3.1.5.3): one still being created would stay on TCP for good. So it
+        // waits until the client has answered every Create Request, and until
+        // a channel is open at all (the client can confirm the tunnel before
+        // it has opened one).
+        if ids.is_empty() || drdynvc.creations_outstanding() {
+            debug!(open = ?ids, "Soft-sync ready but dynamic channels are still being created; waiting");
             self.pending_soft_sync = Some(to_tunnel);
             return Ok(());
         }
@@ -6776,6 +6778,46 @@ mod soft_sync_tests {
                 .all(|frame| drdynvc(&mut server).outgoing_tunnel(frame).is_some())
         );
     }
+    /// MS-RDPEDYC 3.1.5.3: a Soft-Sync moves the channels open at the time,
+    /// once. It waits until the client has answered every Create Request, so
+    /// that all channels of the connection move.
+    ///
+    /// Regression: it went out with the first confirmed channel, and the
+    /// graphics pipeline, confirmed a moment later, stayed on TCP.
+    #[tokio::test]
+    async fn the_soft_sync_waits_for_every_channel_being_created() {
+        let mut server = server();
+        server.multitransport_confirmed = true;
+        let first = open_channel(&mut server);
+        let (second, _) = drdynvc(&mut server)
+            .create_channel_boxed(Box::new(Quiet))
+            .expect("create");
+        let (to_tunnel, _tunnel) = mpsc::channel(16);
+        let (_client, server_side) = tokio::io::duplex(64 * 1024);
+        let mut writer = TokioFramed::new(server_side);
+
+        server.soft_sync(to_tunnel, &mut writer, 1007).await.expect("deferred");
+        assert!(server.pending_soft_sync.is_some());
+        assert!(!drdynvc(&mut server).tunnels_channels());
+
+        let created = encode_vec(&DrdynvcClientPdu::Create(CreateResponsePdu::new(
+            second,
+            CreationStatus::OK,
+        )))
+        .expect("encode");
+        drdynvc(&mut server).process(&created).expect("Create Response");
+        server
+            .resume_soft_sync(&mut writer, 1007)
+            .await
+            .expect("Soft-Sync Request");
+
+        let mut messages = data(first);
+        messages.extend(data(second));
+        let (tunneled, direct) = server.route_dvc_messages(messages).expect("routed");
+        assert_eq!(tunneled.len(), 4, "both channels moved");
+        assert!(direct.is_empty());
+    }
+
     /// MS-RDPEGFX 2.1: the graphics pipeline runs over "a non-lossy dynamic
     /// virtual channel". A full tunnel queue slows the server down; it does
     /// not drop a message.

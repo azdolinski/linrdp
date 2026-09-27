@@ -245,6 +245,14 @@ impl DrdynvcServer {
             .collect()
     }
 
+    /// Whether a channel still waits to be created: its Create Request not
+    /// yet sent (the capability exchange is not over) or not yet answered.
+    pub fn creations_outstanding(&self) -> bool {
+        (&self.dynamic_channels)
+            .into_iter()
+            .any(|(_, c)| matches!(c.state, ChannelState::Pending | ChannelState::Creation))
+    }
+
     /// Registers a dynamic channel with the server.
     ///
     /// # Panics
