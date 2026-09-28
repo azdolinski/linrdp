@@ -126,6 +126,10 @@ Releasing is driven by this file: a push to `main` that adds a new
   It used to go out with the first confirmed channel, and the channels
   confirmed later, the graphics pipeline among them, stayed on TCP
   (MS-RDPEDYC 3.1.5.3) (#7).
+- After the Soft-Sync Request, data of the moved channels waits for the
+  client's Soft-Sync Response before it enters the UDP tunnel; it no longer
+  goes over TCP either. mstsc dropped tunnel data that overtook the request,
+  and the session ended within seconds (MS-RDPEDYC 3.3.5.3.1) (#7).
 - A Refresh Rect PDU, or resuming output after Suppress Output, redraws the
   requested area even when nothing changed on screen (MS-RDPBCGR 3.3.5.11)
   (#7).
