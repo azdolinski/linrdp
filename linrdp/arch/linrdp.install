@@ -1,0 +1,26 @@
+# pacman hooks for linrdp — the Arch counterparts of linrdp/debian/{postinst,prerm}.
+#
+# `linrdp service install` is idempotent: it only writes
+# /etc/linrdp/config.yaml when there is none, and re-running it against an
+# already-installed unit is exactly how an upgrade takes effect (see README).
+
+post_install() {
+    if command -v systemctl >/dev/null 2>&1; then
+        /usr/bin/linrdp service install
+    fi
+}
+
+post_upgrade() {
+    post_install
+}
+
+# Only on a real removal: pacman does not call pre_remove on an upgrade, so
+# the PAM capture line is never stripped between two versions.
+#
+# `linrdp service uninstall` disables and removes the systemd unit and the
+# PAM capture line, but deliberately leaves /etc/linrdp, /etc/linrdp/cert,
+# /var/lib/linrdp and /var/log/linrdp — pacman has no purge, so removing
+# those is left to the administrator (see README).
+pre_remove() {
+    /usr/bin/linrdp service uninstall || true
+}
