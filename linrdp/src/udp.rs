@@ -29,6 +29,11 @@ use tokio_rustls::rustls;
 /// loop. `events` is the RDP server's event channel — once a transport is
 /// established, the loop asks the server to Soft-Sync its dynamic channels to
 /// the tunnel, then pumps DVC frames both directions.
+/// Messages the tunnel queue holds: three full 2880x1800 graphics frames
+/// (the pipeline's in-flight limit) cut into 1600-byte DVC chunks, with room
+/// to spare.
+const TUNNEL_QUEUE: usize = 65_536;
+
 pub(crate) fn spawn(
     bind_addr: SocketAddr,
     identity: &TlsIdentityCtx,
@@ -88,7 +93,16 @@ async fn listen_loop(
                 // Bind the tunnel to the session: the server sends a DVC
                 // Soft-Sync request over TCP; after the client's response,
                 // dynamic-channel traffic flows through these channels.
-                let (to_tunnel, mut from_server) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                //
+                // The server waits for room in this queue rather than drop
+                // data, and while it waits it reads nothing from the client.
+                // A 64-message queue held 100 KB of a graphics frame that can
+                // be 17 MB in 1600-byte chunks: the connection stalled for
+                // seconds on every full frame and mstsc gave up on it. The
+                // graphics pipeline limits itself to a few unacknowledged
+                // frames, so a queue that takes them whole never fills in
+                // practice; the memory is only taken as it is used.
+                let (to_tunnel, mut from_server) = tokio::sync::mpsc::channel::<Vec<u8>>(TUNNEL_QUEUE);
                 let _ = events.send(ironrdp_server::ServerEvent::SoftSyncToUdp { to_tunnel });
 
                 // Pump both directions until the transport closes. Incoming

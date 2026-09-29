@@ -130,6 +130,10 @@ Releasing is driven by this file: a push to `main` that adds a new
   client's Soft-Sync Response before it enters the UDP tunnel; it no longer
   goes over TCP either. mstsc dropped tunnel data that overtook the request,
   and the session ended within seconds (MS-RDPEDYC 3.3.5.3.1) (#7).
+- A full UDP tunnel queue no longer stalls the connection for seconds. The
+  server waited for room in a 64-message queue, a small part of one graphics
+  frame, and read nothing from the client meanwhile; mstsc disconnected
+  (#7).
 - A Refresh Rect PDU, or resuming output after Suppress Output, redraws the
   requested area even when nothing changed on screen (MS-RDPBCGR 3.3.5.11)
   (#7).
