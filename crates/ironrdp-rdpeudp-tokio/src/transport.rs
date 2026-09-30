@@ -18,7 +18,7 @@ use core::time::Duration;
 use std::sync::{Arc, Mutex};
 
 use ironrdp_rdpemt::{RdpemtErrorExt as _, TunnelConfig};
-use ironrdp_rdpeudp::pdu::V1Datagram;
+use ironrdp_rdpeudp::pdu::{V1Datagram, V1Flags};
 use ironrdp_rdpeudp::{ConnectionConfig, RdpeudpConnection, RdpeudpErrorExt as _};
 use ironrdp_tls::{CertificateValidation, CertificateValidationCallback};
 use sha2::{Digest as _, Sha256};
@@ -29,6 +29,7 @@ use tokio::task::JoinHandle;
 
 use crate::driver::Driver;
 use crate::error::{DriverError, DriverErrorExt as _, DriverErrorKind, UdpTransportError, UdpTransportErrorExt as _};
+use crate::port::DatagramPort;
 use crate::stream::{RdpeudpStream, SharedIo};
 use crate::tls::{tls_accept, tls_upgrade};
 use crate::tunnel::{read_tunnel_pdu, tunnel_data_loop, write_tunnel_pdu};
@@ -597,8 +598,56 @@ async fn accept_udp_inner(socket: UdpSocket, config: UdpAcceptConfig) -> Result<
         .await
         .map_err(|error| UdpTransportError::socket("accept udp inner", error))?;
 
+    accept_from_syn(&recv_buf[..n], DatagramPort::from(socket), config).await
+}
+
+/// Accept a UDP transport connection whose datagrams arrive through a
+/// dispatcher rather than a socket of its own.
+///
+/// [MS-RDPEUDP] 2.1: one server port carries every client's RDP-UDP traffic,
+/// and [MS-RDPEMT] 3.2.1: the server hands each incoming multitransport
+/// connection to the main RDP connection that requested it. The dispatcher
+/// reads the shared socket, recognises the client by the cookieHash of its
+/// SYN (see [`syn_cookie_hash`]) and passes that SYN as `syn`, and every later
+/// datagram from the same client, through `port`.
+///
+/// # Errors
+///
+/// Returns `UdpTransportError` if any phase of the accept fails.
+pub async fn accept_udp_dispatched(
+    syn: Vec<u8>,
+    port: DatagramPort,
+    config: UdpAcceptConfig,
+) -> Result<UdpTransport, UdpTransportError> {
+    let timeout = config.accept_timeout;
+    tokio::time::timeout(timeout, accept_from_syn(&syn, port, config))
+        .await
+        .map_err(|_| UdpTransportError::handshake_timeout("accept udp"))?
+}
+
+/// The cookieHash a client's SYN datagram carries, if `datagram` is one.
+///
+/// [MS-RDPEUDP] 3.1.5.1.1: a version 3 SYN MUST carry the SHA-256 hash of the
+/// securityCookie of the Initiate Multitransport Request, so the first
+/// datagram already names the RDP connection it belongs to. Compare it with
+/// [`cookie_hash`] of each outstanding request.
+pub fn syn_cookie_hash(datagram: &[u8]) -> Option<[u8; 32]> {
+    let syn: V1Datagram = ironrdp_core::decode(datagram).ok()?;
+    if !syn.header.flags.contains(V1Flags::SYN) || syn.header.flags.contains(V1Flags::ACK) {
+        return None;
+    }
+    syn.syn_data_ex?.cookie_hash
+}
+
+async fn accept_from_syn(
+    syn: &[u8],
+    port: DatagramPort,
+    config: UdpAcceptConfig,
+) -> Result<UdpTransport, UdpTransportError> {
+    let socket = port;
+
     // Phase 2: Decode the V1 SYN datagram and create a server-side connection
-    let syn_datagram: V1Datagram = ironrdp_core::decode(&recv_buf[..n]).map_err(|_| {
+    let syn_datagram: V1Datagram = ironrdp_core::decode(syn).map_err(|_| {
         UdpTransportError::handshake(
             "accept UDP",
             DriverError::rdpeudp(
@@ -796,7 +845,9 @@ where
 /// integer values where each value is transmitted in network byte order",
 /// and mstsc sends exactly that permutation; the raw digest does not match
 /// and the connection is refused during SYN validation.
-fn cookie_hash(tunnel_config: &TunnelConfig) -> [u8; 32] {
+/// The cookieHash a client puts in its SYN for this request ([MS-RDPEUDP]
+/// 3.1.5.1.1).
+pub fn cookie_hash(tunnel_config: &TunnelConfig) -> [u8; 32] {
     let digest: [u8; 32] = Sha256::digest(tunnel_config.security_cookie).into();
     let mut hash = [0u8; 32];
     for (word, out) in digest.chunks_exact(4).zip(hash.chunks_exact_mut(4)) {

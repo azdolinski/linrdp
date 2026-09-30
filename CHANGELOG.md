@@ -139,6 +139,14 @@ Releasing is driven by this file: a push to `main` that adds a new
   server waited for room in a 64-message queue, a small part of one graphics
   frame, and read nothing from the client meanwhile; mstsc disconnected
   (#7).
+- One UDP port serves every connection (MS-RDPEUDP 2.1): the supervisor holds
+  it and hands each client's datagrams to the worker whose multitransport
+  request the client's SYN names by its cookieHash (MS-RDPEMT 3.2.1,
+  MS-RDPEUDP 3.1.5.1.1). Each worker used to bind the port itself: the
+  worker of one of mstsc's probe connections often held it, the real
+  connection's worker gave up on UDP, and its client, offered a tunnel nobody
+  accepted, answered E_ABORT. Only one of several simultaneous clients could
+  ever have UDP (#7).
 - A Refresh Rect PDU, or resuming output after Suppress Output, redraws the
   requested area even when nothing changed on screen (MS-RDPBCGR 3.3.5.11)
   (#7).

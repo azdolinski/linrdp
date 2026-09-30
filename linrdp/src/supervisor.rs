@@ -29,6 +29,33 @@ pub(crate) struct Bound {
     /// spelling the operator never wrote, which the worker would then fail to
     /// find in the very file it came from.
     bind: String,
+    /// The listener's RDP-UDP port, when `features.udp` is on: one socket for
+    /// every connection it serves ([MS-RDPEUDP] 2.1), read by the supervisor
+    /// and shared with the workers for sending (see `udp_dispatch`).
+    udp: Option<std::net::UdpSocket>,
+}
+
+/// Bind the RDP-UDP port of a listener, on the same address as its TCP port
+/// ([MS-RDPEMT] 3.1.1). A failure costs that listener UDP, not the service.
+fn bind_udp(config: &Config, bind: &str) -> Option<std::net::UdpSocket> {
+    let udp = config
+        .effective(bind)
+        .map(|effective| effective.features.udp)
+        .unwrap_or(false);
+    if !udp {
+        return None;
+    }
+    let socket = std::net::UdpSocket::bind(bind).and_then(|socket| {
+        socket.set_nonblocking(true)?;
+        Ok(socket)
+    });
+    match socket {
+        Ok(socket) => Some(socket),
+        Err(error) => {
+            tracing::warn!(%bind, %error, "RDP-UDP: cannot bind; this listener serves TCP only");
+            None
+        }
+    }
 }
 
 /// Bind every listener the configuration names, or none of them.
@@ -50,6 +77,7 @@ pub(crate) fn bind_all(config: &Config) -> anyhow::Result<Vec<Bound>> {
             Ok(socket) => bound.push(Bound {
                 listener: socket,
                 bind: listener.bind.clone(),
+                udp: bind_udp(config, &listener.bind),
             }),
             Err(error) => failures.push(format!("{}: {error}", listener.bind)),
         }
@@ -121,7 +149,7 @@ impl Workers {
     /// This is why SIGCHLD is no longer `SIG_IGN`: auto-reaping meant a child
     /// vanished without the supervisor ever learning it had, so a registry
     /// would only ever have grown.
-    fn reap(&mut self) {
+    fn reap(&mut self, dispatch: &mut crate::udp_dispatch::Dispatch) {
         loop {
             let mut status = 0;
             // SAFETY: waiting on our own children; WNOHANG never blocks.
@@ -130,6 +158,7 @@ impl Workers {
                 return; // 0 = children but none finished, -1 = no children
             }
             self.live.remove(&dead);
+            dispatch.remove_worker(dead);
         }
     }
 
@@ -182,6 +211,7 @@ impl Workers {
 pub(crate) fn run(mut live: Vec<Bound>, limits: Limits) -> anyhow::Result<()> {
     anyhow::ensure!(!live.is_empty(), "no listeners to accept on");
     let mut workers = Workers::new(limits);
+    let mut dispatch = crate::udp_dispatch::Dispatch::default();
     tracing::info!(
         max_workers = limits.max_workers,
         max_per_client = limits.max_per_client,
@@ -198,7 +228,7 @@ pub(crate) fn run(mut live: Vec<Bound>, limits: Limits) -> anyhow::Result<()> {
             .listener
             .set_nonblocking(true)
             .with_context(|| format!("make {} non-blocking", bound.bind))?;
-        tracing::info!(bind = %bound.bind, "listening");
+        tracing::info!(bind = %bound.bind, udp = bound.udp.is_some(), "listening");
     }
 
     // Children are reaped by hand, not by `SIGCHLD = SIG_IGN`.
@@ -220,17 +250,46 @@ pub(crate) fn run(mut live: Vec<Bound>, limits: Limits) -> anyhow::Result<()> {
     loop {
         // Before polling, so a worker that exited while we were blocked has
         // already given its share back by the time the next client asks.
-        workers.reap();
+        workers.reap(&mut dispatch);
 
+        // The listeners first (their index is the listener's), then each
+        // listener's UDP port, then each worker's UDP channel.
         let mut fds: Vec<libc::pollfd> = live
             .iter()
-            .map(|bound| libc::pollfd {
-                fd: bound.listener.as_raw_fd(),
+            .map(|bound| bound.listener.as_raw_fd())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|fd| libc::pollfd {
+                fd,
                 events: libc::POLLIN,
                 revents: 0,
             })
             .collect();
-        let count = libc::nfds_t::try_from(fds.len()).expect("a handful of listeners");
+        let udp_ports: Vec<(usize, usize)> = live
+            .iter()
+            .enumerate()
+            .filter_map(|(listener, bound)| {
+                let socket = bound.udp.as_ref()?;
+                fds.push(libc::pollfd {
+                    fd: socket.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+                Some((fds.len() - 1, listener))
+            })
+            .collect();
+        let channels: Vec<(usize, i32)> = dispatch
+            .channels()
+            .map(|(pid, channel)| {
+                fds.push(libc::pollfd {
+                    fd: channel.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+                (fds.len() - 1, pid)
+            })
+            .collect();
+        let count = libc::nfds_t::try_from(fds.len()).expect("a descriptor per listener and per worker");
 
         // A timeout rather than an indefinite wait: a child's exit no longer
         // interrupts `poll` (SIGCHLD is SIG_DFL, which is ignored without a
@@ -257,11 +316,24 @@ pub(crate) fn run(mut live: Vec<Bound>, limits: Limits) -> anyhow::Result<()> {
             continue;
         }
 
+        for &(index, listener) in &udp_ports {
+            if fds[index].revents & libc::POLLIN != 0
+                && let Some(socket) = &live[listener].udp
+            {
+                dispatch.read_socket(listener, socket);
+            }
+        }
+        for &(index, pid) in &channels {
+            if fds[index].revents & libc::POLLIN != 0 {
+                dispatch.read_channel(pid);
+            }
+        }
+
         let mut dead = Vec::new();
-        for (index, pollfd) in fds.iter().enumerate() {
+        for (index, pollfd) in fds.iter().enumerate().take(live.len()) {
             match verdict(pollfd.revents) {
                 Verdict::Dead => dead.push(index),
-                Verdict::Ready => accept_all(&live[index], &mut workers),
+                Verdict::Ready => accept_all(index, &live[index], &mut workers, &mut dispatch),
                 Verdict::Idle => {}
             }
         }
@@ -311,13 +383,13 @@ fn verdict(revents: i16) -> Verdict {
 /// Level-triggered poll would report the socket again, but draining keeps one
 /// busy port from having to wait a full poll cycle per connection while a
 /// quiet one is checked.
-fn accept_all(bound: &Bound, workers: &mut Workers) {
+fn accept_all(listener: usize, bound: &Bound, workers: &mut Workers, dispatch: &mut crate::udp_dispatch::Dispatch) {
     loop {
         match bound.listener.accept() {
             Ok((stream, peer)) => {
                 // Anything that finished while this listener was draining
                 // counts against the budget until it is reaped.
-                workers.reap();
+                workers.reap(dispatch);
                 if let Err(reason) = workers.admit(peer.ip()) {
                     // Closing is the refusal. There is nothing to say in RDP
                     // before a connection has negotiated anything, and
@@ -327,6 +399,18 @@ fn accept_all(bound: &Bound, workers: &mut Workers) {
                     drop(stream);
                     continue;
                 }
+                // The worker's line to the UDP port, when this listener has
+                // one. Without it the worker serves TCP only.
+                let udp = bound
+                    .udp
+                    .as_ref()
+                    .and_then(|socket| match crate::udp_dispatch::Dispatch::channel_pair() {
+                        Ok((ours, theirs)) => Some((ours, theirs, socket)),
+                        Err(error) => {
+                            tracing::warn!(%error, "RDP-UDP: no channel for this worker; it serves TCP only");
+                            None
+                        }
+                    });
                 // SAFETY: the supervisor is single-threaded here (no tokio
                 // runtime), so the child inherits a consistent address space.
                 match unsafe { libc::fork() } {
@@ -337,12 +421,19 @@ fn accept_all(bound: &Bound, workers: &mut Workers) {
                     ),
                     0 => {
                         crate::session::keeper::restore_default_sigchld();
-                        exec_worker(stream, &worker_argv(&bound.bind));
+                        let udp_fds = udp
+                            .as_ref()
+                            .map(|(_, theirs, socket)| (theirs.as_raw_fd(), socket.as_raw_fd()));
+                        exec_worker(stream, udp_fds, &worker_argv(&bound.bind));
                         // exec_worker only returns on failure.
                         std::process::exit(1);
                     }
                     pid => {
                         workers.record(pid, peer.ip());
+                        if let Some((ours, theirs, _)) = udp {
+                            dispatch.add_worker(pid, listener, ours);
+                            drop(theirs); // the child has its copy
+                        }
                         tracing::debug!(
                             %peer,
                             pid,
@@ -412,11 +503,38 @@ fn worker_program(exe: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
-/// Move `stream` to fd 3 and exec the worker with `--serve-fd 3`.
-fn exec_worker(stream: std::net::TcpStream, argv: &[String]) {
+/// Move `stream` to fd 3 and exec the worker with `--serve-fd 3`; with
+/// `udp` (the worker's channel and the listener's UDP socket), those go to
+/// fds 4 and 5.
+fn exec_worker(stream: std::net::TcpStream, udp: Option<(i32, i32)>, argv: &[String]) {
     use std::os::fd::IntoRawFd as _;
 
     let fd = stream.into_raw_fd();
+    // Out of the way first: any of the three may already sit on 3, 4 or 5,
+    // and placing one there would close another before it was moved.
+    let high = |fd: i32| {
+        // SAFETY: duplicating a descriptor this process owns.
+        unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10) }
+    };
+    let fd = high(fd);
+    let udp = udp.map(|(channel, socket)| (high(channel), high(socket)));
+    if fd < 0 || udp.is_some_and(|(channel, socket)| channel < 0 || socket < 0) {
+        tracing::error!(error = %std::io::Error::last_os_error(), "worker: cannot move its descriptors");
+        return;
+    }
+    if let Some((channel, socket)) = udp {
+        for (from, to) in [
+            (channel, crate::udp_dispatch::CHANNEL_FD),
+            (socket, crate::udp_dispatch::SOCKET_FD),
+        ] {
+            // SAFETY: dup2 onto a descriptor the child does not otherwise
+            // use; dup2 leaves the copy without close-on-exec.
+            if unsafe { libc::dup2(from, to) } < 0 {
+                tracing::error!(error = %std::io::Error::last_os_error(), "worker: cannot place its UDP descriptors");
+                return;
+            }
+        }
+    }
     // SAFETY: dup2 onto a descriptor the child does not otherwise use.
     if unsafe { libc::dup2(fd, 3) } < 0 {
         tracing::error!(error = %std::io::Error::last_os_error(), "worker: cannot place the socket on fd 3");
@@ -452,8 +570,13 @@ fn exec_worker(stream: std::net::TcpStream, argv: &[String]) {
             cstrings.push(c);
         }
     }
-    for literal in ["--serve-fd", "3"] {
-        if let Ok(c) = std::ffi::CString::new(literal) {
+    let udp_args: &[&str] = if udp.is_some() {
+        &["--udp-channel-fd", "4", "--udp-socket-fd", "5"]
+    } else {
+        &[]
+    };
+    for literal in ["--serve-fd", "3"].iter().chain(udp_args) {
+        if let Ok(c) = std::ffi::CString::new(*literal) {
             cstrings.push(c);
         }
     }

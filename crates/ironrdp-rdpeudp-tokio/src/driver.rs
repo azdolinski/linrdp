@@ -18,10 +18,10 @@ use std::sync::{Arc, Mutex};
 
 use ironrdp_rdpeudp::pdu::{V1Datagram, V1Flags};
 use ironrdp_rdpeudp::{Event, RdpeudpConnection, RdpeudpError, RdpeudpErrorKind, SendError};
-use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 
 use crate::error::{DriverError, DriverErrorExt as _, DriverErrorKind};
+use crate::port::DatagramPort;
 use crate::stream::SharedIo;
 
 /// Maximum UDP datagram size we'll attempt to receive.
@@ -49,7 +49,7 @@ const READ_BUF_HIGH_WATER: usize = 1 << 20;
 
 /// The driver task's internal state.
 pub(crate) struct Driver {
-    socket: UdpSocket,
+    socket: DatagramPort,
     conn: RdpeudpConnection,
     shared: Arc<Mutex<SharedIo>>,
     /// Notified by the driver when Event::Connected fires.
@@ -69,13 +69,13 @@ pub(crate) struct Driver {
 
 impl Driver {
     pub(crate) fn new(
-        socket: UdpSocket,
+        socket: impl Into<DatagramPort>,
         conn: RdpeudpConnection,
         shared: Arc<Mutex<SharedIo>>,
         connected_notify: Arc<Notify>,
     ) -> Self {
         Self {
-            socket,
+            socket: socket.into(),
             conn,
             shared,
             connected_notify,
@@ -477,6 +477,7 @@ mod tests {
     use core::time::Duration;
 
     use ironrdp_rdpeudp::ConnectionConfig;
+    use tokio::net::UdpSocket;
 
     /// `connect` requires the cookie hash a version 3 SYN carries. These tests
     /// never reach a real multitransport request, so any value will do.
