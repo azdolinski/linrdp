@@ -118,10 +118,14 @@ impl Store {
         if let Some(pid) = self.clients.get(&(listener, peer)) {
             return Some(*pid);
         }
-        let (pid, registered_on) = *self.requests.get(&syn_cookie_hash()?)?;
+        let hash = syn_cookie_hash()?;
+        let (pid, registered_on) = *self.requests.get(&hash)?;
         if registered_on != listener {
             return None;
         }
+        // The request is answered: [MS-RDPEMT] 3.2.1 keeps a Connection Store
+        // entry only until its connection is handed off.
+        self.requests.remove(&hash);
         self.clients.insert((listener, peer), pid);
         Some(pid)
     }
@@ -260,6 +264,9 @@ mod tests {
         assert_eq!(store.route(0, a, || Some([1; 32])), Some(100));
         assert_eq!(store.route(0, a, || None), Some(100), "later datagrams follow the SYN");
         assert_eq!(store.route(0, b, || None), Some(200));
+
+        let c = addr("192.168.1.3:50000");
+        assert_eq!(store.route(0, c, || Some([1; 32])), None, "a request is answered once");
     }
 
     /// A worker that exits gives up its request and its clients; a SYN nobody
