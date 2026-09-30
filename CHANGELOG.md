@@ -126,6 +126,19 @@ Releasing is driven by this file: a push to `main` that adds a new
   Network Characteristics Result; over TCP, 1.3.9 allows it only in this
   phase. With the previous change and no UDP tunnel, mstsc had no connection
   statistics at all (#7).
+- The DVC Soft-Sync waits until the client has answered every Create
+  Request, so all of the connection's dynamic channels move to the UDP tunnel.
+  It used to go out with the first confirmed channel, and the channels
+  confirmed later, the graphics pipeline among them, stayed on TCP
+  (MS-RDPEDYC 3.1.5.3) (#7).
+- After the Soft-Sync Request, data of the moved channels waits for the
+  client's Soft-Sync Response before it enters the UDP tunnel; it no longer
+  goes over TCP either. mstsc dropped tunnel data that overtook the request,
+  and the session ended within seconds (MS-RDPEDYC 3.3.5.3.1) (#7).
+- A full UDP tunnel queue no longer stalls the connection for seconds. The
+  server waited for room in a 64-message queue, a small part of one graphics
+  frame, and read nothing from the client meanwhile; mstsc disconnected
+  (#7).
 - A Refresh Rect PDU, or resuming output after Suppress Output, redraws the
   requested area even when nothing changed on screen (MS-RDPBCGR 3.3.5.11)
   (#7).

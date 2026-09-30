@@ -820,6 +820,10 @@ pub struct RdpServer {
     /// [`ServerEvent::SoftSyncToUdp`] once the embedder's RDP-UDP accept
     /// completed. `None` = no tunnel (all DVC traffic stays on TCP).
     udp_tunnel_tx: Option<mpsc::Sender<Vec<u8>>>,
+    /// Data of the channels a Soft-Sync Request moved, written before the
+    /// client's Soft-Sync Response: held back, in order, and sent through the
+    /// tunnel once the response arrives (see `write_dvc_messages`).
+    tunnel_backlog: Vec<Vec<u8>>,
     /// Whether the client has confirmed the multitransport tunnel with a
     /// successful Initiate Multitransport Response (MS-RDPBCGR 2.2.15.2).
     ///
@@ -1703,6 +1707,7 @@ impl RdpServer {
             autodetect: None,
             connect_time_network: None,
             udp_tunnel_tx: None,
+            tunnel_backlog: Vec::new(),
             multitransport_confirmed: false,
             multitransport_request_id: None,
             pending_soft_sync: None,
@@ -3022,11 +3027,13 @@ impl RdpServer {
             return Ok(());
         };
         let ids = drdynvc.open_channel_ids();
-        if ids.is_empty() {
-            // The client can confirm the tunnel before it has opened a single
-            // dynamic channel. Dropping the Soft-Sync then left the whole
-            // connection on TCP; keep it until a channel is open instead.
-            debug!("Soft-sync ready but no dynamic channel is open yet; waiting for one");
+        // A Soft-Sync moves the channels open at the time, once (MS-RDPEDYC
+        // 3.1.5.3): one still being created would stay on TCP for good. So it
+        // waits until the client has answered every Create Request, and until
+        // a channel is open at all (the client can confirm the tunnel before
+        // it has opened one).
+        if ids.is_empty() || drdynvc.creations_outstanding() {
+            debug!(open = ?ids, "Soft-sync ready but dynamic channels are still being created; waiting");
             self.pending_soft_sync = Some(to_tunnel);
             return Ok(());
         }
@@ -3092,9 +3099,33 @@ impl RdpServer {
                 .map_err(|e| ServerError::io("write dvc messages", e))?;
         }
         if !tunneled.is_empty() {
-            self.send_to_tunnel(tunneled).await?;
+            self.tunnel_backlog.extend(tunneled);
         }
-        Ok(())
+        self.flush_tunnel_backlog().await
+    }
+
+    /// Send the held-back tunnel data once the client has answered the
+    /// Soft-Sync Request.
+    ///
+    /// MS-RDPEDYC 3.3.5.3.1: from the request on, data of a moved channel
+    /// never goes over TCP again (SOFT_SYNC_TCP_FLUSHED). Until the response
+    /// it waits here rather than entering the tunnel: the request travels
+    /// over TCP, the data over UDP, and mstsc drops tunnel data that arrives
+    /// before it has processed the request. The session then ends within
+    /// seconds. Held data goes out in its original order, ahead of anything
+    /// written after the response.
+    async fn flush_tunnel_backlog(&mut self) -> ServerResult<()> {
+        if self.tunnel_backlog.is_empty() {
+            return Ok(());
+        }
+        let answered = self
+            .get_svc_processor::<dvc::DrdynvcServer>()
+            .is_some_and(|drdynvc| drdynvc.soft_sync_response_received());
+        if !answered {
+            return Ok(());
+        }
+        let held = core::mem::take(&mut self.tunnel_backlog);
+        self.send_to_tunnel(held).await
     }
 
     /// Split DVC messages into those for the tunnel, encoded unframed, and
@@ -4199,6 +4230,7 @@ impl RdpServer {
         // keeps them.
         if !result.reactivation {
             self.udp_tunnel_tx = None;
+            self.tunnel_backlog.clear();
             self.multitransport_confirmed = false;
             self.pending_soft_sync = None;
             self.multitransport_request_id = result.multitransport_request_id;
@@ -4783,6 +4815,9 @@ impl RdpServer {
                         // After Soft-Sync, DVC responses must follow the
                         // client to the UDP tunnel, not the TCP channel.
                         self.write_dvc_messages(response_pdus, writer, user_channel_id).await?;
+                        // The PDU may have been the Soft-Sync Response that
+                        // releases the held-back tunnel data.
+                        self.flush_tunnel_backlog().await?;
                         // A channel the client just confirmed may be the one
                         // a waiting Soft-Sync needs.
                         self.resume_soft_sync(writer, user_channel_id).await?;
@@ -6639,7 +6674,10 @@ mod tests {
 #[cfg(test)]
 mod soft_sync_tests {
     use ironrdp_core::impl_as_any;
-    use ironrdp_dvc::pdu::{CapabilitiesResponsePdu, CapsVersion, CreateResponsePdu, CreationStatus, DrdynvcClientPdu};
+    use ironrdp_dvc::pdu::{
+        CapabilitiesResponsePdu, CapsVersion, CreateResponsePdu, CreationStatus, DrdynvcClientPdu, SoftSyncResponsePdu,
+        SoftSyncTunnelType,
+    };
     use ironrdp_dvc::{DvcEncode, DvcMessage, DvcProcessor, DvcServerProcessor};
 
     use super::*;
@@ -6738,6 +6776,10 @@ mod soft_sync_tests {
     ///
     /// Regression: nothing took the tunnel until the Soft-Sync Response, and
     /// then everything did.
+    ///
+    /// Until the client's Soft-Sync Response the moved channel's data is
+    /// held back, neither on TCP nor in the tunnel: mstsc drops tunnel data
+    /// that overtakes the request, and the session ended within seconds.
     #[tokio::test]
     async fn after_the_soft_sync_request_only_moved_data_takes_the_tunnel() {
         let mut server = server();
@@ -6765,6 +6807,15 @@ mod soft_sync_tests {
             .write_dvc_messages(data(moved), &mut writer, 1007)
             .await
             .expect("written");
+        assert!(tunnel.try_recv().is_err(), "held until the Soft-Sync Response");
+        assert_eq!(server.tunnel_backlog.len(), 2);
+
+        let response = encode_vec(&DrdynvcClientPdu::SoftSyncResponse(SoftSyncResponsePdu::new(vec![
+            SoftSyncTunnelType::RELIABLE_UDP,
+        ])))
+        .expect("encode");
+        drdynvc(&mut server).process(&response).expect("Soft-Sync Response");
+        server.flush_tunnel_backlog().await.expect("flushed");
         let mut frames = Vec::new();
         while let Ok(frame) = tunnel.try_recv() {
             frames.push(frame);
@@ -6776,6 +6827,46 @@ mod soft_sync_tests {
                 .all(|frame| drdynvc(&mut server).outgoing_tunnel(frame).is_some())
         );
     }
+    /// MS-RDPEDYC 3.1.5.3: a Soft-Sync moves the channels open at the time,
+    /// once. It waits until the client has answered every Create Request, so
+    /// that all channels of the connection move.
+    ///
+    /// Regression: it went out with the first confirmed channel, and the
+    /// graphics pipeline, confirmed a moment later, stayed on TCP.
+    #[tokio::test]
+    async fn the_soft_sync_waits_for_every_channel_being_created() {
+        let mut server = server();
+        server.multitransport_confirmed = true;
+        let first = open_channel(&mut server);
+        let (second, _) = drdynvc(&mut server)
+            .create_channel_boxed(Box::new(Quiet))
+            .expect("create");
+        let (to_tunnel, _tunnel) = mpsc::channel(16);
+        let (_client, server_side) = tokio::io::duplex(64 * 1024);
+        let mut writer = TokioFramed::new(server_side);
+
+        server.soft_sync(to_tunnel, &mut writer, 1007).await.expect("deferred");
+        assert!(server.pending_soft_sync.is_some());
+        assert!(!drdynvc(&mut server).tunnels_channels());
+
+        let created = encode_vec(&DrdynvcClientPdu::Create(CreateResponsePdu::new(
+            second,
+            CreationStatus::OK,
+        )))
+        .expect("encode");
+        drdynvc(&mut server).process(&created).expect("Create Response");
+        server
+            .resume_soft_sync(&mut writer, 1007)
+            .await
+            .expect("Soft-Sync Request");
+
+        let mut messages = data(first);
+        messages.extend(data(second));
+        let (tunneled, direct) = server.route_dvc_messages(messages).expect("routed");
+        assert_eq!(tunneled.len(), 4, "both channels moved");
+        assert!(direct.is_empty());
+    }
+
     /// MS-RDPEGFX 2.1: the graphics pipeline runs over "a non-lossy dynamic
     /// virtual channel". A full tunnel queue slows the server down; it does
     /// not drop a message.
