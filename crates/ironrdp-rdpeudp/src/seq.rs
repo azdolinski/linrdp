@@ -42,6 +42,20 @@ pub fn reconstruct_seq(wire_seq: u16, reference: u64) -> u64 {
     }
 }
 
+/// The ChannelSeqNum after `channel_seq`, skipping every number whose wire
+/// form is zero.
+///
+/// [MS-RDPEUDP2] 3.1.1.2.4.2, product behavior note 1: "In Windows, the
+/// channel sequence number zero (0) is always skipped." A packet whose 16-bit
+/// ChannelSeqNum is 0 is never delivered to the layer above: mstsc lost that
+/// packet's bytes from its TLS stream every 65536 packets and ended the
+/// session with a decryption error (0xC06). Windows skips the number when it
+/// sends, too, so a receiver has to step over it as well.
+pub fn next_channel_seq(channel_seq: u64) -> u64 {
+    let next = channel_seq + 1;
+    if next & 0xFFFF == 0 { next + 1 } else { next }
+}
+
 /// Truncate a full 64-bit sequence number to its 16-bit wire representation.
 ///
 /// # Panics
@@ -120,6 +134,21 @@ pub const TIMESTAMP_STALENESS_LIMIT: u64 = 32_000_000 / TIMESTAMP_UNIT_US; // 8,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MS-RDPEUDP2 3.1.1.2.4.2, note 1: Windows always skips channel
+    /// sequence number zero, so no ChannelSeqNum on the wire is ever 0.
+    #[test]
+    fn the_channel_sequence_skips_wire_zero() {
+        assert_eq!(next_channel_seq(1), 2);
+        assert_eq!(next_channel_seq(0xFFFE), 0xFFFF);
+        assert_eq!(next_channel_seq(0xFFFF), 0x1_0001);
+        assert_eq!(next_channel_seq(0x1_FFFF), 0x2_0001);
+        let mut seq = 1;
+        for _ in 0..200_000 {
+            assert_ne!(truncate_seq(seq), 0);
+            seq = next_channel_seq(seq);
+        }
+    }
 
     // ── Sequence number reconstruction ──
 

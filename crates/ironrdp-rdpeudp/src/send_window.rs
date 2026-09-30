@@ -183,7 +183,7 @@ impl SendWindow {
         self.data_store.push_back((data_seq, data));
 
         self.next_data_seq += 1;
-        self.next_channel_seq += 1;
+        self.next_channel_seq = crate::seq::next_channel_seq(self.next_channel_seq);
         self.bytes_in_flight += u64::try_from(size).expect("packet size fits in u64");
 
         Some((data_seq, channel_seq))
