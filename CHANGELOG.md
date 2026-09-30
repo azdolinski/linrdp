@@ -13,197 +13,202 @@ Releasing is driven by this file: a push to `main` that adds a new
 
 ## [Unreleased]
 
+---
+
+## [0.1.1] - 2026-09-30
+
+GNOME on Wayland, working UDP transport and a round of protocol compliance
+work. The GNOME desktop now gets real sessions: one per account, plus the
+console through `mstsc /admin`. mstsc now stays on UDP, with its connection
+statistics, and several clients can use it at once. The microphone works. The
+server's behaviour on the wire was checked against the Microsoft RDP
+specifications (#7), and the fixes below cite the section each one follows.
+Packages: `.deb`, Arch `.pkg.tar.zst` (new) and `.tar.gz`.
+
+### Highlights
+- **GNOME on Wayland:** a headless GNOME session per login, and the console
+  session through `mstsc /admin`.
+- **UDP transport that holds up with mstsc:**
+  - all dynamic channels move to UDP;
+  - one port serves every client;
+  - a lost packet is recovered within a round trip, not after seconds;
+  - no more 0xC06 or E_ABORT disconnects;
+  - mstsc shows RTT and bandwidth.
+- **Microphone:** it works, and the client's microphone is in use only while
+  an application in the session records.
+- **Graphics pipeline:**
+  - frames in flight are limited by size;
+  - a slow client no longer triggers full-screen repaints;
+  - no more 0xD06 after the client renegotiates.
+- **Arch Linux package** with every release.
+
 ### Added
-- Arch Linux package: each release now also carries
-  `linrdp-<version>-1-x86_64.pkg.tar.zst` (install with `pacman -U`), built
-  with makepkg from `linrdp/arch/PKGBUILD`; like the `.deb`, it runs
-  `linrdp service install` on install and upgrade and `service uninstall` on
-  removal.
-- GNOME on Wayland: every login gets a headless GNOME session of its own
-  (`gnome-shell --headless` on a private bus, a virtual monitor at the
-  client's exact size per connection), kept running and locked between
-  connections — the GNOME counterpart of the per-user X session, and the only
-  way to a desktop on GNOME 49+, which has no X11 session. If the same
-  account is at the console, the console is locked while it is in use
-  remotely. Apps open in the session; the account's keyring is relayed into
-  it (#1).
-- `mstsc /admin` reaches the console's GNOME session — only for the account
-  logged in at the console; anyone else is refused. The console is shown at
-  the client's exact resolution (a virtual monitor replaces the desk's while
-  connected), the desk is kept dark, and afterwards the desk gets its own
-  layout back and the session is locked again (#1).
-- Clipboard (text, images, files) for GNOME sessions, through Mutter's
-  remote-desktop clipboard (#1).
-- `session.backend: auto | x11 | gnome` — which kind of session of its own a
-  login gets. Desktops are cases (`session::backends`) behind one
-  compositor interface (`wayland::compositor`); see `docs/desktop-cases.md`
-  for the cases and the scenario matrix (#1).
-- Containers (distrobox, toolbox, Vanilla OS apx): GNOME sessions are
-  started on the host through `host-spawn`, and the host's buses and PipeWire
-  are reached under `/run/host`; `linrdp doctor` names the container and what
-  it means for passwords and polkit (#1).
-- `linrdp doctor` reports how GNOME sessions are started and who is at the
-  console, and no longer calls a missing X server a blocker where GNOME can
-  serve logins (#1).
-- Client Cluster Data (MS-RDPBCGR 2.2.1.3.5) reaches the connection handler
-  (`ConnectionInfo::client_cluster`, `requests_console`), so a request for
-  the console session (`mstsc /admin`) can be recognised (#1).
+- **GNOME on Wayland** (#1):
+  - **Sessions:** every login gets a headless GNOME session of its own
+    (`gnome-shell --headless` on a private bus, with a virtual monitor at the
+    client's exact size).
+    - It is kept running and locked between connections.
+    - It is the GNOME counterpart of the per-user X session, and the only way
+      to a desktop on GNOME 49+, which has no X11 session.
+    - The account's keyring is relayed into the session.
+    - If the same account is at the console, the console is locked while the
+      account is in use remotely.
+  - **Console:** `mstsc /admin` reaches the console's GNOME session.
+    - Only the account logged in at the console can use it; anyone else is
+      refused.
+    - It is shown at the client's exact resolution, and the desk stays dark
+      while connected.
+    - Afterwards the desk gets its own layout back and is locked again.
+  - **Clipboard:** text, images and files, through Mutter's remote-desktop
+    clipboard.
+  - **Session type:** `session.backend: auto | x11 | gnome` chooses the kind
+    of session a login gets. See `docs/desktop-cases.md` for the scenario
+    matrix.
+  - **Containers** (distrobox, toolbox, Vanilla OS apx):
+    - GNOME sessions are started on the host through `host-spawn`;
+    - the host's buses and PipeWire are reached under `/run/host`;
+    - `linrdp doctor` explains what the container means for passwords and
+      polkit.
+  - **`linrdp doctor`:**
+    - reports how GNOME sessions are started and who is at the console;
+    - no longer calls a missing X server a blocker where GNOME can serve
+      logins.
+- **Arch Linux package:** each release carries
+  `linrdp-<version>-1-x86_64.pkg.tar.zst` (install with `pacman -U`). Like
+  the `.deb`, it runs `linrdp service install` on install and upgrade, and
+  `service uninstall` on removal.
+- **Console requests:** Client Cluster Data (MS-RDPBCGR 2.2.1.3.5) reaches
+  the connection handler, so a request for the console session is recognised
+  (#1).
 
 ### Fixed
-- Sound: a microphone source the sound server refuses no longer takes the
-  session's sound with it; the FIFO path is given to a host's sound server in
-  the host's own spelling (linrdp in a distrobox/apx container); a sound
-  server shared with another session gets its default output back on
-  disconnect (#1).
-- PipeWire capture (`features.wayland`) never worked: `pw_init` was never
-  called, `spa_hook` was one pointer short (heap corruption), four SPA
-  constants were hand-counted wrong (`pw_stream_connect` → `-EPROTO`),
-  `Choice`-wrapped format values were not parsed, the stream error state was
-  compared against the wrong value, a format without a frame yet produced an
-  empty grab, and a padded stride was not honoured. Every constant is now the
-  value the C headers give (#1).
-- An occasional disconnect right after login (`Connection reset by peer`
-  from mstsc, under half a second in): the DVC Soft-Sync to the UDP transport
-  was sent before the client's Initiate Multitransport Response, which
-  MS-RDPEDYC 3.3.5.3.1 forbids; it now waits for it. A disconnect's cause is
-  logged with it (#1).
-- PipeWire capture on machines without a system `client.conf` (a container
-  with only the library installed): linrdp brings a minimal one (#1).
-- A dynamic channel the server opens during a session is requested only after
-  the client has answered the DVC Capabilities Request (MS-RDPEDYC 2.2.1), and
-  closing one works in every state: a channel the client never heard of is
-  simply dropped, and one whose creation is still unanswered is closed as soon
-  as the client confirms it (#7).
-- The microphone works. The server now plays the recording side of
-  MS-RDPEAI: it sends Version, Sound Formats and Open first (3.3.5.1). The
-  AUDIO_INPUT channel is open only while an application in the session
-  records from `linrdp_mic`, and closes 2 s after the last one stops, so the
-  client's microphone is in use only then (3.1.4.1). The client's audio is
-  converted to the 48 kHz stereo that the session's microphone source reads
-  (#7).
-- UDP multitransport follows the rules for moving dynamic channels
-  (Soft-Sync, MS-RDPEDYC 3.1.5.3). The tunnel is offered only when both sides
-  announce `SOFTSYNC_TCP_TO_UDP`. The Initiate Multitransport Request goes out
-  during the connection sequence, after licensing (MS-RDPBCGR 1.3.1.1). It
-  used to go out after the connection finalization, and again on every
-  reactivation (#7).
-- Only the channels open at the Soft-Sync Request move to the tunnel, from the
-  request on. Control PDUs and channels opened later stay on TCP. Tunnel data
-  that arrives before the Soft-Sync Response waits for it; it used to end the
-  session, as did any other unexpected PDU on the tunnel (MS-RDPEDYC
-  3.3.5.3.1–2) (#7).
-- The UDP tunnel no longer drops graphics data when its queue is full
-  (MS-RDPEGFX 2.1). Losing the tunnel after channels moved to it ends the
+
+#### UDP transport (MS-RDPEUDP, MS-RDPEUDP2, MS-RDPEMT, MS-RDPEDYC) (#7)
+- **One UDP port serves every connection** (MS-RDPEUDP 2.1).
+  - The supervisor holds the port. It hands each client's datagrams to the
+    connection whose multitransport request the client's SYN names by its
+    cookieHash. This is the Connection Store of MS-RDPEMT 3.2.1.
+  - Before, each connection bound the port itself. One of mstsc's short
+    probe connections often held it, and the real session failed with
+    E_ABORT. Only one of several simultaneous clients could ever have UDP.
+- **All dynamic channels move to UDP, graphics included** (MS-RDPEDYC
+  3.1.5.3, 3.3.5.3).
+  - The Soft-Sync is offered only when both sides announce it.
+  - It waits for the client's Multitransport Response and for every channel
+    to be created.
+  - Data for the moved channels is held until the client's Soft-Sync
+    Response.
+  - Channels opened later stay on TCP.
+  - Unexpected tunnel data no longer ends the session.
+- **Throughput:**
+  - RDP-UDP sends as much as the client's announced window allows
+    (MS-RDPEUDP2 2.2.1.1), not a fixed 64 packets, which used to cap a LAN
+    at about 45 Mbit/s.
+  - A full tunnel queue neither drops graphics data (MS-RDPEGFX 2.1) nor
+    stalls the connection.
+- **Loss recovery:** when the retransmit timer fires, every packet that is
+  overdue is declared lost, not just the oldest (MS-RDPEUDP2 3.1.1.2.3).
+  - The retransmit timeout starts at 100 ms and drops back once the client
+    acknowledges again.
+  - Keepalives go out every 4 s.
+  - A few lost packets used to freeze the screen for seconds.
+- **No more 0xC06 (decryption error):** channel sequence number 0 is skipped,
+  as Windows does (MS-RDPEUDP2 3.1.1.2.4.2). Before, a busy session
+  disconnected after about 65,536 packets.
+- **Connection statistics:** mstsc shows RTT and bandwidth.
+  - Connect-Time Auto-Detection runs before licensing (MS-RDPBCGR 1.3.1.1).
+  - On UDP, the Network Characteristics Result travels in the tunnel's
+    sub-header (MS-RDPBCGR 1.3.9, MS-RDPEMT 2.2.1.1.1).
+  - Probes go only to clients that announce support for them.
+- **Tunnel lifetime:** losing the tunnel after channels moved to it ends the
   session, so the client reconnects instead of keeping silent channels
-  (MS-RDPEMT 1.3.3). A reactivation keeps the tunnel (#7).
-- The graphics pipeline (#7):
-  - A client that re-advertises its capabilities no longer receives frames
-    for the surfaces it has just discarded, which caused protocol error
-    0xD06 (MS-RDPEGFX 3.2.5.18).
-  - A client that suspends frame acknowledgements no longer freezes the
-    display when it resumes them (3.2.5.13).
-  - A ClearCodec glyph dropped under backpressure is no longer referenced
-    later as a cache hit, which could garble small bitmaps (2.2.4.1).
-  - ResetGraphics describes the monitor with inclusive bounds and never as an
-    empty list (2.2.2.14).
-  - A malformed capability set is skipped instead of stalling the
-    negotiation. With no set in common, the channel is closed and the session
-    falls back to bitmaps; the server used to confirm a version the client
-    never offered (3.2.5.18–19).
-  - The negotiation response announces the graphics pipeline
-    (`DYNVC_GFX_PROTOCOL_SUPPORTED`, MS-RDPBCGR 2.2.1.2.1).
-- A refused login, such as a wrong password over TLS, reaches the client as a
-  proper Set Error Info PDU (MS-RDPBCGR 2.2.5.1.1). It used to arrive as four
-  bytes that no client can parse (#7).
-- An auto-reconnect cookie that does not verify, typically after a server
-  restart, no longer refuses the connection. The client's credentials are
-  checked as for any logon (MS-RDPBCGR 3.3.5.3.11) (#7).
-- Network auto-detection probes go only to clients that announce support
-  for them. No Network Characteristics Result is sent over TCP during the
-  session (MS-RDPBCGR 2.2.1.3.2, 1.3.9) (#7).
-- The server runs Connect-Time Auto-Detection before licensing (MS-RDPBCGR
-  1.3.1.1, phase 6). It measures RTT and bandwidth and sends the client its
-  Network Characteristics Result; over TCP, 1.3.9 allows it only in this
-  phase. With the previous change and no UDP tunnel, mstsc had no connection
-  statistics at all (#7).
-- The DVC Soft-Sync waits until the client has answered every Create
-  Request, so all of the connection's dynamic channels move to the UDP tunnel.
-  It used to go out with the first confirmed channel, and the channels
-  confirmed later, the graphics pipeline among them, stayed on TCP
-  (MS-RDPEDYC 3.1.5.3) (#7).
-- After the Soft-Sync Request, data of the moved channels waits for the
-  client's Soft-Sync Response before it enters the UDP tunnel; it no longer
-  goes over TCP either. mstsc dropped tunnel data that overtook the request,
-  and the session ended within seconds (MS-RDPEDYC 3.3.5.3.1) (#7).
-- A full UDP tunnel queue no longer stalls the connection for seconds. The
-  server waited for room in a 64-message queue, a small part of one graphics
-  frame, and read nothing from the client meanwhile; mstsc disconnected
-  (#7).
-- One UDP port serves every connection (MS-RDPEUDP 2.1): the supervisor holds
-  it and hands each client's datagrams to the worker whose multitransport
-  request the client's SYN names by its cookieHash (MS-RDPEMT 3.2.1,
-  MS-RDPEUDP 3.1.5.1.1). Each worker used to bind the port itself: the
-  worker of one of mstsc's probe connections often held it, the real
-  connection's worker gave up on UDP, and its client, offered a tunnel nobody
-  accepted, answered E_ABORT. Only one of several simultaneous clients could
-  ever have UDP (#7).
-- RDP-UDP sends as much as the client's announced receive window allows
-  (MS-RDPEUDP2 2.2.1.1, LogWindowSize) instead of this server's own 64
-  packets, and takes up to 1024 packets itself. With 64 packets in flight a
-  graphics stream crawled at about 45 Mbit/s on a LAN, frames piled up and
-  mstsc dropped the connection within seconds (#7).
-- RDP-UDP never sends, and steps over, channel sequence number 0: Windows
-  always skips it (MS-RDPEUDP2 3.1.1.2.4.2, note 1). The packet carrying
-  wire ChannelSeqNum 0 never reached mstsc's TLS layer, and about 65536
-  packets into a busy session mstsc disconnected with a decryption error
-  (0xC06) (#7).
-- RDP-UDP recovers a lost burst in one round trip: when the retransmit timer
-  fires, every packet sent longer than a timeout ago counts as lost
-  (MS-RDPEUDP2 3.1.1.2.3), not only the oldest one. The timeout no longer
-  starts above 100 ms or keeps its backoff after the client acknowledges
-  again, and keepalives go out every 4 s. A few lost packets used to freeze
-  the screen for seconds (#7).
-- The graphics pipeline limits what is in flight by bytes (at most about
-  2 MB of unacknowledged frames), not only by frame count and the client's
-  queue depth (MS-RDPEGFX 3.2.5.13). A client reporting no queue depth is
-  treated as busy, not idle. A slow client no longer triggers a whole-screen
-  lossless repaint; only the damaged area is sent again, and an area whose
-  H.264 frame failed to send is not forgotten (#7).
-- mstsc shows the connection's round-trip time and bandwidth when on UDP:
-  in continuous auto-detection the Network Characteristics Result travels in
-  the UDP tunnel's sub-header, the only place MS-RDPBCGR 1.3.9 and MS-RDPEMT
-  2.2.1.1.1 allow it. Sub-header types the tunnel does not know are skipped
-  instead of failing the tunnel (#7).
-- Every PDU the server sends names the MCS server channel (0x03EA) as its
-  initiator, as MS-RDPBCGR 2.2.6.1 requires, not the user's channel (#7).
-- A Refresh Rect PDU, or resuming output after Suppress Output, redraws the
-  requested area even when nothing changed on screen (MS-RDPBCGR 3.3.5.11)
-  (#7).
-- Display Control (MS-RDPEDISP 3.1.5.2, 1.3) (#7):
-  - Invalid monitor layouts are ignored; they used to be applied or to end
-    the session.
-  - The primary monitor is used, not the first one listed.
-  - The advertised maximum matches the largest session screen (3840x2160).
-  - A resize without the graphics pipeline runs the
-    Deactivation-Reactivation Sequence, so the client sees the new size.
-- Clients without fast-path output get slow-path output in the form
-  MS-RDPBCGR 2.2.9.1.1 defines (#7):
-  - bitmap updates without a duplicated update type,
-  - pointers as Pointer PDUs,
-  - no surface commands or large pointers, which have no slow-path form,
-  - updates small enough for one PDU.
-- RDP-UDP: a client that offers only protocol version 1 or 2 stays on TCP;
-  it used to get a version 3 answer. The SYN+ACK carries the negotiated MTUs
-  (MS-RDPEUDP 3.1.5.1.3, 3.1.1.3) (#7).
-- Relative mouse movement, which the server announces, works on X11 and
-  libei (#7).
+  (MS-RDPEMT 1.3.3). A reactivation keeps the tunnel.
+- **Protocol negotiation:**
+  - A client that offers only RDP-UDP version 1 or 2 stays on TCP.
+  - The SYN+ACK carries the negotiated MTUs (MS-RDPEUDP 3.1.5.1.3,
+    3.1.1.3).
+  - The Initiate Multitransport Request goes out during the connection
+    sequence, after licensing, once (MS-RDPBCGR 1.3.1.1).
+
+#### Graphics (MS-RDPEGFX, MS-RDPEDISP, MS-RDPBCGR) (#7)
+- **Throttling:** frames in flight are limited by size, about 2 MB of
+  unacknowledged frames, not only by count (3.2.5.13).
+  - A client that reports no queue depth is treated as busy.
+  - A slow client gets only the changed area again, never a whole-screen
+    lossless repaint.
+  - An area whose H.264 frame failed to send is not forgotten.
+- **Renegotiation:** a client that renegotiates its capabilities no longer
+  receives frames for surfaces it has just discarded, which caused protocol
+  error 0xD06 (3.2.5.18).
+- **Capability negotiation:**
+  - A malformed capability set is skipped.
+  - With no set in common, the session falls back to bitmaps (3.2.5.18–19).
+  - The negotiation response announces the graphics pipeline (MS-RDPBCGR
+    2.2.1.2.1).
+- **Frame acknowledgements:** suspending and resuming them no longer freezes
+  the display (3.2.5.13).
+- **ClearCodec:** a glyph dropped under backpressure is no longer used later
+  as a cache hit, which could garble small bitmaps (2.2.4.1).
+- **ResetGraphics:** the monitor is described with inclusive bounds, and never
+  as an empty list (2.2.2.14).
+- **Display Control** (MS-RDPEDISP 3.1.5.2, 1.3):
+  - Invalid monitor layouts are ignored.
+  - The primary monitor is used.
+  - The advertised maximum is 3840x2160.
+  - A resize without the graphics pipeline runs the Deactivation-Reactivation
+    Sequence.
+- **Redraw requests:** Refresh Rect and resuming after Suppress Output redraw
+  the requested area (MS-RDPBCGR 3.3.5.11).
+- **Slow-path output:** clients without fast-path output get it in the form
+  MS-RDPBCGR 2.2.9.1.1 defines:
+  - bitmap updates without a duplicated update type;
+  - pointers as Pointer PDUs;
+  - no surface commands.
+- **PipeWire capture** (`features.wayland`) never worked. It does now (#1):
+  - `pw_init` is called;
+  - the `spa_hook` layout is correct;
+  - the SPA constants are the ones the C headers give;
+  - format parsing handles `Choice`-wrapped values;
+  - padded strides are honoured.
+  - On machines without a system `client.conf`, linrdp supplies a minimal
+    one.
+
+#### Audio (MS-RDPEAI) (#1, #7)
+- **Microphone:** the server now plays the recording side of MS-RDPEAI
+  (3.3.5.1).
+  - The AUDIO_INPUT channel opens only while an application in the session
+    records from `linrdp_mic`, and closes 2 s after the last one stops
+    (3.1.4.1).
+  - The client's audio is converted to the 48 kHz stereo the session reads.
+- **Sound server:**
+  - A microphone source the sound server refuses no longer takes the
+    session's sound with it.
+  - The FIFO path is given in the host's spelling when linrdp runs in a
+    container.
+  - A sound server shared with another session gets its default output back
+    on disconnect.
+
+#### Connection and input (MS-RDPBCGR, MS-RDPEDYC) (#1, #7)
+- **Server PDUs:** every PDU the server sends names the MCS server channel
+  (0x03EA) as its initiator (2.2.6.1).
+- **Refused logins:** a refused login, such as a wrong password over TLS,
+  reaches the client as a proper Set Error Info PDU (2.2.5.1.1). It used to
+  be four bytes no client could parse.
+- **Auto-reconnect:** a cookie that does not verify, typically after a server
+  restart, no longer refuses the connection. The credentials are checked as
+  for any logon (3.3.5.3.11).
+- **Dynamic channels opened by the server** wait for the client's
+  Capabilities Response. Closing one works in any state (MS-RDPEDYC 2.2.1).
+- **Early disconnect:** an occasional disconnect right after login no longer
+  happens. The Soft-Sync was sent before the client's Multitransport
+  Response.
+- **Relative mouse movement**, which the server announces, works on X11 and
+  libei.
 
 ### Changed
 - The `wayland` cargo feature is on by default. It adds no build-time
-  dependency: PipeWire is loaded at runtime. The `.deb` recommends
+  dependency, because PipeWire is loaded at runtime. The `.deb` recommends
   `libpipewire-0.3-modules` (#1).
-
----
 
 ## [0.1.0] - 2026-09-22
 
@@ -240,5 +245,6 @@ Releasing is driven by this file: a push to `main` that adds a new
   consistently to console mode, and clipboard file transfers that open under
   the session's own user rather than root.
 
-[Unreleased]: https://github.com/azdolinski/linrdp/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/azdolinski/linrdp/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/azdolinski/linrdp/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/azdolinski/linrdp/releases/tag/v0.1.0
