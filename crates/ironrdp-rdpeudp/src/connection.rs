@@ -2258,6 +2258,56 @@ mod tests {
         assert_eq!(conn.rtt.srtt(), None);
     }
 
+    /// A client and a server that completed the handshake at `now`.
+    fn established_pair(now: MonotonicInstant) -> (RdpeudpConnection, RdpeudpConnection) {
+        let mut client = RdpeudpConnection::connect(test_config(), now).expect("connect");
+        let syn = client.poll_transmit(now).expect("SYN queued").contents;
+        let decoded = decode::<V1Datagram>(&syn).expect("decode SYN");
+        let mut server = RdpeudpConnection::accept(test_config(), &decoded, now).expect("accepted");
+        for _ in 0..8 {
+            while let Some(mut t) = server.poll_transmit(now) {
+                client.handle_datagram(&mut t.contents, now).expect("client input");
+            }
+            while let Some(mut t) = client.poll_transmit(now) {
+                server.handle_datagram(&mut t.contents, now).expect("server input");
+            }
+            if client.is_established() && server.is_established() {
+                return (client, server);
+            }
+        }
+        panic!("handshake did not complete");
+    }
+
+    /// [MS-RDPEUDP2] 3.1.1.2.3: a packet is lost once "a set time has passed
+    /// since the sending of the packet", each packet on its own. When the
+    /// retransmit timer fires on a whole burst the peer never saw, every
+    /// packet of it is declared lost at once; one per expiry, with the
+    /// timeout doubling each time, took seconds to recover a burst.
+    #[test]
+    fn a_retransmit_timeout_declares_the_whole_overdue_burst_lost() {
+        let start = MonotonicInstant::from_millis(0);
+        let (_client, mut server) = established_pair(start);
+        for i in 0..5u8 {
+            server.send(vec![i; 100]).expect("send");
+        }
+        let sent = start + Duration::from_millis(10);
+        let mut dropped = 0;
+        while server.poll_transmit(sent).is_some() {
+            dropped += 1;
+        }
+        assert!(dropped >= 5, "the burst went out: {dropped}");
+        let pending = |server: &RdpeudpConnection| {
+            server.send_window.as_ref().map_or(0, |w| w.pending_entries().count())
+        };
+        assert_eq!(pending(&server), 5);
+
+        let deadline = server.poll_timeout().expect("retransmit timer armed");
+        server.handle_timeout(deadline.max(sent + server.rto()));
+
+        assert_eq!(pending(&server), 0, "one expiry declares every overdue packet lost");
+        assert_eq!(server.stats().retransmit_timeouts, 1);
+    }
+
     /// A client SYN as `connect` builds it, decoded so a test can alter it.
     fn client_syn(config: ConnectionConfig) -> V1Datagram {
         let now = MonotonicInstant::from_millis(0);
