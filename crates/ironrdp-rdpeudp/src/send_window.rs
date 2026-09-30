@@ -111,6 +111,18 @@ impl SendWindow {
         }
     }
 
+    /// Follow the receive window the peer announces in its packets.
+    ///
+    /// [MS-RDPEUDP2] 2.2.1.1: LogWindowSize "specifies the logarithm base 2
+    /// of the maximum buffer size in multiples of the MTU. This variable is
+    /// imposed on the Receiver of the Sender endpoint". Each endpoint
+    /// announces how much it can take, so what may be in flight towards it
+    /// is its figure, not ours. A smaller figure only stops new packets;
+    /// those already sent stay.
+    pub(crate) fn set_peer_window(&mut self, log_window_size: u8) {
+        self.max_entries = 1usize << usize::from(log_window_size.min(15));
+    }
+
     /// Whether the window has room for another packet.
     pub(crate) fn has_capacity(&self) -> bool {
         self.entries.len() < self.max_entries
@@ -355,6 +367,26 @@ mod tests {
 
     fn later(base: MonotonicInstant, ms: u64) -> MonotonicInstant {
         base + Duration::from_millis(ms)
+    }
+
+    /// MS-RDPEUDP2 2.2.1.1: the peer's LogWindowSize bounds what may be in
+    /// flight towards it, whatever this endpoint announces for itself.
+    ///
+    /// Regression: the window stayed at this endpoint's own 64 packets, and
+    /// a graphics stream to mstsc crawled at a few megabytes a second.
+    #[test]
+    fn the_peer_announced_window_bounds_what_is_in_flight() {
+        let mut w = SendWindow::new(1, 1, 6);
+        w.set_peer_window(12);
+        for _ in 0..4096 {
+            assert!(w.has_capacity());
+            w.push(vec![0; 10], now()).expect("room");
+        }
+        assert!(!w.has_capacity(), "4096 packets, the peer's window");
+
+        w.set_peer_window(4);
+        assert!(!w.has_capacity(), "a smaller window stops new packets");
+        assert_eq!(w.len(), 4096, "and keeps those already sent");
     }
 
     #[test]

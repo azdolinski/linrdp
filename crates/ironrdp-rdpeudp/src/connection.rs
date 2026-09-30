@@ -139,7 +139,10 @@ impl Default for ConnectionConfig {
     fn default() -> Self {
         Self {
             initial_sequence_number: 0,
-            log_window_size: 6,
+            // What this endpoint can take: 1024 packets, about 1.2 MB. The
+            // peer holds its sending to it (MS-RDPEUDP2 2.2.1.1); 64 packets
+            // kept a client's uploads to a few megabits.
+            log_window_size: 10,
             upstream_mtu: 1232,
             downstream_mtu: 1232,
             idle_timeout: Duration::from_secs(65),
@@ -285,6 +288,31 @@ struct NegotiatedParams {
 /// }
 /// conn.handle_timeout(now);
 /// ```
+/// What a connection has done so far, for diagnostics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// Datagrams handed to `handle_datagram`.
+    pub datagrams_in: u64,
+    /// Datagrams handed out by `poll_transmit`.
+    pub datagrams_out: u64,
+    /// New data packets sent.
+    pub data_sent: u64,
+    /// Data packets sent again.
+    pub retransmits: u64,
+    /// Retransmit timer expiries.
+    pub retransmit_timeouts: u64,
+    /// Bytes sent and not yet acknowledged, at the time of the snapshot.
+    pub bytes_in_flight: u64,
+    /// Congestion window, at the time of the snapshot.
+    pub congestion_window: u64,
+    /// Messages waiting to be sent, at the time of the snapshot.
+    pub send_queue: u64,
+    /// Current retransmission timeout, in milliseconds.
+    pub rto_ms: u64,
+    /// Smoothed round-trip time, in milliseconds.
+    pub srtt_ms: Option<u64>,
+}
+
 pub struct RdpeudpConnection {
     /// Which side we are.
     side: Side,
@@ -355,6 +383,9 @@ pub struct RdpeudpConnection {
     /// sent, for sampling the handshake round trip as the connection's
     /// first RTT estimate. `None` until the first SYN or SYN+ACK goes out.
     handshake_sent_at: Option<MonotonicInstant>,
+
+    /// Counters for diagnostics; see [`RdpeudpConnection::stats`].
+    stats: Stats,
 
     /// When the earliest currently-unacknowledged data arrived, `None` when
     /// nothing is owed an acknowledgment.
@@ -539,6 +570,7 @@ impl RdpeudpConnection {
             handshake_datagram: None,
             handshake_retransmits: 0,
             handshake_sent_at: None,
+            stats: Stats::default(),
             ack_delay_started_at: None,
             remote_timestamp_ref: 0,
             wire_buf: Vec::with_capacity(1400),
@@ -642,6 +674,7 @@ impl RdpeudpConnection {
     /// The `wire` slice must be mutable because `decode_with_prefix`
     /// performs an in-place byte swap.
     pub fn handle_datagram(&mut self, wire: &mut [u8], now: MonotonicInstant) -> Result<(), RdpeudpError> {
+        self.stats.datagrams_in += 1;
         if self.state == State::Closed {
             return Err(RdpeudpError::connection_closed("handle datagram"));
         }
@@ -725,6 +758,26 @@ impl RdpeudpConnection {
     /// buffer when congestion window budget is available, processes
     /// retransmissions, and sends standalone ACKs.
     pub fn poll_transmit(&mut self, now: MonotonicInstant) -> Option<Transmit> {
+        let transmit = self.poll_transmit_inner(now);
+        if transmit.is_some() {
+            self.stats.datagrams_out += 1;
+        }
+        transmit
+    }
+
+    /// What this connection has done so far, with its current windows.
+    pub fn stats(&self) -> Stats {
+        Stats {
+            bytes_in_flight: self.send_window.as_ref().map_or(0, |window| window.bytes_in_flight()),
+            congestion_window: self.congestion.window(),
+            send_queue: u64::try_from(self.send_buffer.len()).unwrap_or(u64::MAX),
+            rto_ms: u64::try_from(self.rtt.rto().as_millis()).unwrap_or(u64::MAX),
+            srtt_ms: self.rtt.srtt().map(|srtt| u64::try_from(srtt.as_millis()).unwrap_or(u64::MAX)),
+            ..self.stats
+        }
+    }
+
+    fn poll_transmit_inner(&mut self, now: MonotonicInstant) -> Option<Transmit> {
         // A closed connection has nothing left to say. Returning early also
         // keeps the handshake branch below from arming the keep-alive timer
         // after `close` cleared it: `handle_timeout` returns early once closed,
@@ -1204,6 +1257,11 @@ impl RdpeudpConnection {
 
         let packet: V2Packet = decode(packet_bytes).map_err(RdpeudpError::decode)?;
 
+        // The window the peer can take, announced in every header.
+        if let Some(send_window) = self.send_window.as_mut() {
+            send_window.set_peer_window(packet.header.log_window_size);
+        }
+
         // Process ACK payload (cumulative acknowledgment)
         if let Some(ref ack) = packet.ack {
             self.process_ack(ack, &packet.header, now);
@@ -1605,6 +1663,7 @@ impl RdpeudpConnection {
         let transmit = self.build_data_packet(new_data_seq, entry.channel_seq, entry.data, now);
 
         if transmit.is_some() {
+            self.stats.retransmits += 1;
             // Reset retransmit timer
             self.timers.set(Timer::Retransmit, now + self.rtt.rto());
         }
@@ -1637,6 +1696,7 @@ impl RdpeudpConnection {
         let transmit = self.build_data_packet(data_seq, channel_seq, data, now);
 
         if transmit.is_some() {
+            self.stats.data_sent += 1;
             // Set retransmit timer if not already running
             if !self.timers.is_set(Timer::Retransmit) {
                 self.timers.set(Timer::Retransmit, now + self.rtt.rto());
@@ -1885,6 +1945,7 @@ impl RdpeudpConnection {
     /// Handle retransmit timer expiry.
     fn handle_retransmit_timeout(&mut self, now: MonotonicInstant) {
         self.timers.clear(Timer::Retransmit);
+        self.stats.retransmit_timeouts += 1;
 
         if self.state != State::Established {
             self.rtt.on_timeout();

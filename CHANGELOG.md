@@ -147,6 +147,11 @@ Releasing is driven by this file: a push to `main` that adds a new
   connection's worker gave up on UDP, and its client, offered a tunnel nobody
   accepted, answered E_ABORT. Only one of several simultaneous clients could
   ever have UDP (#7).
+- RDP-UDP sends as much as the client's announced receive window allows
+  (MS-RDPEUDP2 2.2.1.1, LogWindowSize) instead of this server's own 64
+  packets, and takes up to 1024 packets itself. With 64 packets in flight a
+  graphics stream crawled at about 45 Mbit/s on a LAN, frames piled up and
+  mstsc dropped the connection within seconds (#7).
 - A Refresh Rect PDU, or resuming output after Suppress Output, redraws the
   requested area even when nothing changed on screen (MS-RDPBCGR 3.3.5.11)
   (#7).
