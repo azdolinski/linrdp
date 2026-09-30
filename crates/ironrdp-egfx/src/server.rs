@@ -93,6 +93,15 @@ const SUSPEND_FRAME_ACK_QUEUE_DEPTH: u32 = 0xFFFFFFFF;
 /// is demonstrably behind, and pushing further kills it.
 pub const CLIENT_QUEUE_BACKOFF: u32 = 250_000;
 
+/// Encoded bytes of unacknowledged frames at which the server stops sending
+/// (while at least one frame is outstanding).
+///
+/// MS-RDPEGFX 2.2.2.13 reports the client's backlog in bytes and 3.2.5.13
+/// asks the server to throttle by it; counting frames alone let a 15 MB
+/// ClearCodec repaint weigh as much as a 5 KB cursor update. A single frame
+/// always goes out, however large, so nothing can be stuck behind this.
+pub const MAX_BYTES_IN_FLIGHT: usize = 2_000_000;
+
 /// How long a reported client queue depth stays evidence about *now*.
 ///
 /// `client_queue_depth` is only ever refreshed by an RDPGFX_FRAME_ACKNOWLEDGE_PDU,
@@ -104,8 +113,10 @@ pub const CLIENT_QUEUE_BACKOFF: u32 = 250_000;
 /// MS-RDPEGFX 3.2.5.13 says the server SHOULD use `queueDepth` "to determine how
 /// far the client is lagging" — a value from an ack seconds ago says nothing about
 /// how far it is lagging now, and sending one probe frame is the only way to find
-/// out. After this long the sample is ignored and the in-flight count (which does
-/// decay, because frames time out of `unacknowledged`) is the sole limiter.
+/// out. After this long, with nothing in flight, the sample is ignored and the
+/// next frame goes out as the probe. While frames are in flight it stays valid:
+/// 3.2.5.13 says the server "MUST expect that RDPGFX_FRAME_ACKNOWLEDGE_PDU
+/// messages will continue to be sent", so a fresher sample is on its way.
 const CLIENT_QUEUE_DEPTH_STALE_AFTER: Duration = Duration::from_millis(1000);
 
 /// Pre-encoded ZGFX-wrapped bytes for DVC transmission.
@@ -647,6 +658,11 @@ impl FrameTracker {
         frame_id
     }
 
+    /// Encoded bytes of the frames not yet acknowledged.
+    pub fn bytes_in_flight(&self) -> usize {
+        self.unacknowledged.values().map(|info| info.size_bytes).sum()
+    }
+
     /// Update frame size after encoding
     pub fn set_frame_size(&mut self, frame_id: u32, size_bytes: usize) {
         if let Some(info) = self.unacknowledged.get_mut(&frame_id) {
@@ -712,7 +728,11 @@ impl FrameTracker {
         if self.client_queue_depth >= CLIENT_QUEUE_BACKOFF && !self.queue_depth_is_stale() {
             return true;
         }
-        !self.ack_suspended && self.in_flight() >= self.max_in_flight
+        if self.ack_suspended {
+            return false;
+        }
+        self.in_flight() >= self.max_in_flight
+            || (self.in_flight() > 0 && self.bytes_in_flight() >= MAX_BYTES_IN_FLIGHT)
     }
 
     /// Whether the last reported queue depth is too old to gate sending.
@@ -720,8 +740,9 @@ impl FrameTracker {
     /// No ack yet (`None`) counts as stale: at session start there is nothing to
     /// throttle against, and the in-flight count already bounds the first burst.
     fn queue_depth_is_stale(&self) -> bool {
-        self.client_queue_depth_at
-            .is_none_or(|at| at.elapsed() >= CLIENT_QUEUE_DEPTH_STALE_AFTER)
+        self.client_queue_depth_at.is_none_or(|at| {
+            self.unacknowledged.is_empty() && at.elapsed() >= CLIENT_QUEUE_DEPTH_STALE_AFTER
+        })
     }
 
     /// Get client queue depth
@@ -735,7 +756,8 @@ impl FrameTracker {
     /// `None` means "no usable measurement" — no ack has arrived yet, the client
     /// suspended acknowledgements (MS-RDPEGFX 3.2.5.13: the server MUST NOT then
     /// wait on unacknowledged frames), or the last sample has expired.
-    /// `Some(0)` is the client explicitly reporting an empty decode queue.
+    /// `Some(0)` is QUEUE_DEPTH_UNAVAILABLE (MS-RDPEGFX 2.2.2.13): "no
+    /// information is available" — not an empty queue.
     pub fn fresh_client_queue_depth(&self) -> Option<u32> {
         if self.ack_suspended || self.queue_depth_is_stale() {
             return None;
@@ -2124,9 +2146,26 @@ impl GraphicsPipelineServer {
         let mut total_compressed: usize = 0;
         let pdu_count = pdus.len();
 
+        // The encoded bytes of each frame, from its StartFrame to its
+        // EndFrame, for the byte limit in `should_backpressure`.
+        let mut frame: Option<(u32, usize)> = None;
+        let mut frame_sizes = Vec::new();
+
         let messages: Vec<DvcMessage> = pdus
             .into_iter()
             .map(|pdu| {
+                match &pdu {
+                    GfxPdu::StartFrame(start) => frame = Some((start.frame_id, 0)),
+                    GfxPdu::EndFrame(end) => {
+                        if let Some((frame_id, bytes)) = frame.take().filter(|(id, _)| *id == end.frame_id) {
+                            frame_sizes.push((frame_id, bytes + pdu.size()));
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some((_, bytes)) = frame.as_mut() {
+                    *bytes += pdu.size();
+                }
                 let pdu_name = pdu.name();
                 let pdu_size = pdu.size();
                 let mut pdu_bytes = vec![0u8; pdu_size];
@@ -2148,6 +2187,9 @@ impl GraphicsPipelineServer {
                 }) as DvcMessage
             })
             .collect();
+        for (frame_id, bytes) in frame_sizes {
+            self.frames.set_frame_size(frame_id, bytes);
+        }
 
         // D2: log batch timing. INFO threshold at 10ms — anything above is
         // significant for the per-frame budget. Always log at DEBUG so the
@@ -2609,7 +2651,16 @@ mod capability_negotiation_tests {
 
 #[cfg(test)]
 mod queue_depth_tests {
-    use super::{CLIENT_QUEUE_BACKOFF, CLIENT_QUEUE_DEPTH_STALE_AFTER, FrameTracker, Instant};
+    use core::time::Duration;
+
+    use super::{CLIENT_QUEUE_BACKOFF, CLIENT_QUEUE_DEPTH_STALE_AFTER, FrameTracker, Instant, Timestamp};
+
+    const T0: Timestamp = Timestamp {
+        milliseconds: 0,
+        seconds: 0,
+        minutes: 0,
+        hours: 0,
+    };
 
     /// A client backlog above the cut-off stops the server sending — but only
     /// for as long as that reading still describes the present.
@@ -2656,6 +2707,42 @@ mod queue_depth_tests {
         tracker.acknowledge(0, 0);
         assert_eq!(tracker.fresh_client_queue_depth(), Some(0));
         assert!(!tracker.should_backpressure());
+    }
+
+    /// MS-RDPEGFX 2.2.2.13 counts the client's backlog in bytes: a large
+    /// frame in flight holds the next one back; a single frame always goes.
+    ///
+    /// Regression: only frames were counted, so three 15 MB repaints could be
+    /// in flight at once.
+    #[test]
+    fn a_large_frame_in_flight_holds_the_next() {
+        let mut tracker = FrameTracker::new();
+        tracker.acknowledge(0, 0);
+        assert!(!tracker.should_backpressure(), "nothing in flight");
+
+        let frame = tracker.begin_frame(T0);
+        tracker.set_frame_size(frame, super::MAX_BYTES_IN_FLIGHT);
+        assert!(tracker.should_backpressure());
+
+        tracker.acknowledge(frame, 0);
+        assert!(!tracker.should_backpressure());
+    }
+
+    /// MS-RDPEGFX 3.2.5.13: with frames unacknowledged the server "MUST expect"
+    /// further acknowledgements, so a high queue depth keeps holding sending
+    /// back however old it is; only with nothing in flight does it expire.
+    #[test]
+    fn a_high_depth_holds_while_frames_are_in_flight() {
+        let mut tracker = FrameTracker::new();
+        let first = tracker.begin_frame(T0);
+        tracker.begin_frame(T0);
+        tracker.acknowledge(first, CLIENT_QUEUE_BACKOFF);
+        tracker.client_queue_depth_at =
+            Some(Instant::now() - CLIENT_QUEUE_DEPTH_STALE_AFTER - Duration::from_millis(1));
+        assert!(tracker.should_backpressure(), "a frame is still in flight");
+
+        tracker.unacknowledged.clear();
+        assert!(!tracker.should_backpressure(), "nothing in flight: the next frame probes");
     }
 
     /// A client that suspended acknowledgements reports no depth at all —

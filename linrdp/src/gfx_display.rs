@@ -291,10 +291,11 @@ enum DebtCause {
     NoEncoder,
     H264SendFailed,
     ClientRefresh,
+    FoldedDamage,
 }
 
 impl DebtCause {
-    const COUNT: usize = 11;
+    const COUNT: usize = 12;
 
     fn idx(self) -> usize {
         match self {
@@ -309,6 +310,7 @@ impl DebtCause {
             Self::NoEncoder => 8,
             Self::H264SendFailed => 9,
             Self::ClientRefresh => 10,
+            Self::FoldedDamage => 11,
         }
     }
 
@@ -324,6 +326,7 @@ impl DebtCause {
         "no_encoder",
         "h264_send_failed",
         "client_refresh",
+        "folded_damage",
     ];
 }
 
@@ -1367,6 +1370,9 @@ impl EgfxUpdates {
         // alternates the whole screen between exact and 4:2:0 looks at the
         // H.264 cadence (~6.5 Hz), which is exactly the visible flicker.
         if self.pending_full && !self.in_motion {
+            // This grab's changes are consumed from the damage tracker: fold
+            // them into the debt, or those outside the owed region are lost.
+            self.owe_region(damage.0, damage.1, damage.2, damage.3, DebtCause::FoldedDamage);
             let (x, y, w, h) = self.debt_region(width, height);
             self.repay_debt(handle, data, width, height, x, y, w, h).await;
             return;
@@ -1409,7 +1415,7 @@ impl EgfxUpdates {
             // Motion mode only if the frame actually shipped: it suppresses
             // the lossless partial path below, so entering it on a dropped
             // frame strands the pixels nothing else will deliver.
-            if self.send_h264(handle, data, width, height).await {
+            if self.send_h264(handle, data, width, height, (dx, dy, dw, dh)).await {
                 self.in_motion = true;
                 self.motion_until = Instant::now() + MOTION_LINGER;
             }
@@ -1489,9 +1495,13 @@ impl EgfxUpdates {
         // a few lines later in the caller.
         let depth = Self::lock_handle(handle).fresh_client_queue_depth();
         let headroom_bytes = match depth {
-            // No usable measurement (no ack yet, acks suspended, or the sample
-            // has expired) or a client reporting zero backlog: no throttle.
-            None | Some(0) => return u32::MAX,
+            // No usable measurement: no ack yet, acks suspended, a sample that
+            // expired, or QUEUE_DEPTH_UNAVAILABLE (0), which MS-RDPEGFX
+            // 2.2.2.13 defines as "no information is available", not as an
+            // empty queue. Not knowing is no licence to send a whole
+            // 2880x1800 repaint as one message: budget as if the client's
+            // queue were empty, one CLIENT_QUEUE_BACKOFF's worth per band.
+            None | Some(0) => CLIENT_QUEUE_BACKOFF,
             Some(depth) => CLIENT_QUEUE_BACKOFF.saturating_sub(depth),
         };
         let px = f64::from(headroom_bytes) / self.clear_bytes_per_px;
@@ -1878,7 +1888,14 @@ impl EgfxUpdates {
     /// rejected. Motion mode suppresses the lossless partial path, so claiming
     /// it after a frame that never shipped strands those pixels until some
     /// later repaint — with AVC disabled, permanently.
-    async fn send_h264(&mut self, handle: &GfxHandle, data: Vec<u8>, w: u16, h: u16) -> bool {
+    async fn send_h264(
+        &mut self,
+        handle: &GfxHandle,
+        data: Vec<u8>,
+        w: u16,
+        h: u16,
+        damage: (u16, u16, u16, u16),
+    ) -> bool {
         let Some(surface) = self.surface else { return false };
 
         if self.avc_disabled {
@@ -2071,7 +2088,13 @@ impl EgfxUpdates {
             if let Some(Encoders { h264: Some(enc), .. }) = self.encoders.as_mut() {
                 enc.force_intra();
             }
-            self.owe_everything(DebtCause::H264SendFailed);
+            // What this frame changed is owed, not the whole screen: the
+            // forced IDR above repaints everything with the next motion frame
+            // anyway, and a full lossless repaint here was a 15 MB ClearCodec
+            // message sent to a client that had just been found behind
+            // (MS-RDPEGFX 3.2.5.13 asks the server to send less).
+            let (x, y, dw, dh) = damage;
+            self.owe_region(x, y, dw, dh, DebtCause::H264SendFailed);
             // A rejected send IS the strain signal. Counting only the
             // pre-encode `should_backpressure()` polls misses exactly the
             // drops that matter, so the adaptive quality loop never learns
