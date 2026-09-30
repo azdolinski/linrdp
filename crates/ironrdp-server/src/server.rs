@@ -27,6 +27,7 @@ use ironrdp_pdu::geometry::InclusiveRectangle;
 use ironrdp_pdu::input::InputEventPdu;
 use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
 use ironrdp_pdu::mcs::{SendDataIndication, SendDataRequest};
+use ironrdp_pdu::rdp::capability_sets::SERVER_CHANNEL_ID;
 use ironrdp_pdu::rdp::capability_sets::{
     BitmapCodecs, CapabilitySet, CmdFlags, CodecProperty, EntropyBits, GeneralExtraFlags, LargePointerSupportFlags,
 };
@@ -1939,7 +1940,7 @@ impl RdpServer {
                 errors_info: None,
             }),
         });
-        let data = encode_share_data_pdu(pdu, user_channel_id, io_channel_id, user_channel_id)?;
+        let data = encode_share_data_pdu(pdu, user_channel_id, io_channel_id)?;
         writer
             .write_all(&data)
             .await
@@ -3027,12 +3028,7 @@ impl RdpServer {
 
     /// Bind the UDP tunnel and ask the client (via TCP DVC Soft-Sync) to move
     /// every open dynamic channel to it. A channel opened later stays on TCP.
-    async fn soft_sync(
-        &mut self,
-        to_tunnel: mpsc::Sender<Vec<u8>>,
-        writer: &mut impl FramedWrite,
-        user_channel_id: u16,
-    ) -> ServerResult<()> {
+    async fn soft_sync(&mut self, to_tunnel: mpsc::Sender<Vec<u8>>, writer: &mut impl FramedWrite) -> ServerResult<()> {
         let Some(drdynvc) = self.get_svc_processor::<dvc::DrdynvcServer>() else {
             warn!("Soft-sync requested but DRDYNVC channel is gone; ignoring");
             return Ok(());
@@ -3053,7 +3049,7 @@ impl RdpServer {
             .map_err_kind("request reliable udp", ServerErrorKind::Pdu)?;
         self.udp_tunnel_tx = Some(to_tunnel);
         info!(channels = ?ids, "Sending DVC Soft-Sync request (TCP→UDP migration)");
-        self.write_dvc_messages(vec![request], writer, user_channel_id).await
+        self.write_dvc_messages(vec![request], writer).await
     }
 
     /// Record the client's Initiate Multitransport Response.
@@ -3077,11 +3073,11 @@ impl RdpServer {
     }
 
     /// Send a Soft-Sync that was waiting for the client's confirmation.
-    async fn resume_soft_sync(&mut self, writer: &mut impl FramedWrite, user_channel_id: u16) -> ServerResult<()> {
+    async fn resume_soft_sync(&mut self, writer: &mut impl FramedWrite) -> ServerResult<()> {
         if self.multitransport_confirmed
             && let Some(to_tunnel) = self.pending_soft_sync.take()
         {
-            self.soft_sync(to_tunnel, writer, user_channel_id).await?;
+            self.soft_sync(to_tunnel, writer).await?;
         }
         Ok(())
     }
@@ -3096,14 +3092,14 @@ impl RdpServer {
         &mut self,
         messages: Vec<SvcMessage>,
         writer: &mut impl FramedWrite,
-        user_channel_id: u16,
     ) -> ServerResult<()> {
         let (tunneled, direct) = self.route_dvc_messages(messages)?;
         if !direct.is_empty() {
             let channel_id = self
                 .get_channel_id_by_type::<dvc::DrdynvcServer>()
                 .ok_or_else(|| ServerError::channel("DRDYNVC channel not found"))?;
-            let data = server_encode_svc_messages(direct, channel_id, user_channel_id).map_err(ServerError::encode)?;
+            let data =
+                server_encode_svc_messages(direct, channel_id, SERVER_CHANNEL_ID).map_err(ServerError::encode)?;
             writer
                 .write_all(&data)
                 .await
@@ -3211,7 +3207,6 @@ impl RdpServer {
     async fn dispatch_display_update(
         update: DisplayUpdate,
         writer: &mut impl FramedWrite,
-        user_channel_id: u16,
         io_channel_id: u16,
         fastpath_output: bool,
         buffer: &mut Vec<u8>,
@@ -3221,7 +3216,7 @@ impl RdpServer {
         if let DisplayUpdate::Resize(desktop_size) = update {
             debug!(?desktop_size, "Display resize");
             encoder.set_desktop_size(desktop_size);
-            deactivate_all(io_channel_id, user_channel_id, writer).await?;
+            deactivate_all(io_channel_id, writer).await?;
             return Ok((RunState::DeactivationReactivation { desktop_size }, encoder));
         }
 
@@ -3254,7 +3249,7 @@ impl RdpServer {
                     warn!(update_code = code.as_u8(), "update has no slow-path form; dropping");
                     continue;
                 };
-                let data = encode_share_data_pdu(pdu, io_channel_id, io_channel_id, user_channel_id)?;
+                let data = encode_share_data_pdu(pdu, io_channel_id, io_channel_id)?;
                 budget.acquire(data.len()).await;
                 writer
                     .write_all(&data)
@@ -3330,7 +3325,7 @@ impl RdpServer {
                     // either way, and the caller falls back to cancelling it.
                     // pduSource=0, not user_channel_id -- MS-RDPBCGR 2.2.5.1.1
                     // requires it for TS_SET_ERROR_INFO_PDU specifically.
-                    match encode_share_data_pdu(pdu, 0, io_channel_id, user_channel_id) {
+                    match encode_share_data_pdu(pdu, 0, io_channel_id) {
                         Ok(bytes) => {
                             if let Err(error) = writer.write_all(&bytes).await {
                                 debug!(%error, "could not send the eviction reason; disconnecting anyway");
@@ -3357,7 +3352,7 @@ impl RdpServer {
                     // arm above; upstream's original call here (before this
                     // merge) predated that parameter and used
                     // user_channel_id, which this fixes to match.
-                    let data = encode_share_data_pdu(pdu, 0, io_channel_id, user_channel_id)?;
+                    let data = encode_share_data_pdu(pdu, 0, io_channel_id)?;
                     writer
                         .write_all(&data)
                         .await
@@ -3399,7 +3394,7 @@ impl RdpServer {
                     let channel_id = self
                         .get_channel_id_by_type::<RdpsndServer>()
                         .ok_or_else(|| ServerError::channel("SVC channel not found"))?;
-                    let data = server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)
+                    let data = server_encode_svc_messages(msgs.into(), channel_id, SERVER_CHANNEL_ID)
                         .map_err(ServerError::encode)?;
                     writer
                         .write_all(&data)
@@ -3421,7 +3416,7 @@ impl RdpServer {
                     }
                     self.udp_autodetect_tx = autodetect_to_tunnel;
                     if self.multitransport_confirmed {
-                        self.soft_sync(to_tunnel, writer, user_channel_id).await?;
+                        self.soft_sync(to_tunnel, writer).await?;
                     } else {
                         info!("RDP-UDP tunnel ready before the client confirmed it; deferring Soft-Sync");
                         self.pending_soft_sync = Some(to_tunnel);
@@ -3447,7 +3442,7 @@ impl RdpServer {
                         let _ = reply.send(Some(channel_id));
                     }
                     if let Some(request) = request {
-                        self.write_dvc_messages(vec![request], writer, user_channel_id).await?;
+                        self.write_dvc_messages(vec![request], writer).await?;
                     }
                 }
                 ServerEvent::CloseDynamicChannel { channel_id } => {
@@ -3456,7 +3451,7 @@ impl RdpServer {
                     };
                     debug!(channel_id, "closing a dynamic channel");
                     if let Some(close) = drdynvc.close_channel(channel_id) {
-                        self.write_dvc_messages(vec![close], writer, user_channel_id).await?;
+                        self.write_dvc_messages(vec![close], writer).await?;
                     }
                 }
                 ServerEvent::UdpTunnelClosed => {
@@ -3489,7 +3484,7 @@ impl RdpServer {
                     // Answers follow their channel: through the tunnel for a
                     // channel the Soft-Sync moved, over TCP otherwise.
                     if !responses.is_empty() {
-                        self.write_dvc_messages(responses, writer, user_channel_id).await?;
+                        self.write_dvc_messages(responses, writer).await?;
                     }
                 }
                 ServerEvent::Rdpdr(msg) => {
@@ -3586,7 +3581,7 @@ impl RdpServer {
                         .get_channel_id_by_type::<RdpdrServer>()
                         .ok_or_else(|| ServerError::channel("SVC channel not found"))?;
                     let data =
-                        server_encode_svc_messages(msgs, channel_id, user_channel_id).map_err(ServerError::encode)?;
+                        server_encode_svc_messages(msgs, channel_id, SERVER_CHANNEL_ID).map_err(ServerError::encode)?;
                     writer
                         .write_all(&data)
                         .await
@@ -3613,7 +3608,7 @@ impl RdpServer {
                     let channel_id = self
                         .get_channel_id_by_type::<CliprdrServer>()
                         .ok_or_else(|| ServerError::channel("SVC channel not found"))?;
-                    let data = server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)
+                    let data = server_encode_svc_messages(msgs.into(), channel_id, SERVER_CHANNEL_ID)
                         .map_err(ServerError::encode)?;
                     writer
                         .write_all(&data)
@@ -3644,7 +3639,7 @@ impl RdpServer {
                             dvc::encode_dvc_messages(echo_channel_id, vec![request], ChannelFlags::SHOW_PROTOCOL)
                                 .map_err(ServerError::encode)?;
 
-                        self.write_dvc_messages(messages, writer, user_channel_id).await?;
+                        self.write_dvc_messages(messages, writer).await?;
                     }
                 },
                 #[cfg(feature = "usb")]
@@ -3696,8 +3691,7 @@ impl RdpServer {
                         // `None`: the capability exchange is still running, and
                         // the request goes out with its answer.
                         if let Some(create_dvc_msg) = create_dvc_msg {
-                            self.write_dvc_messages(vec![create_dvc_msg], writer, user_channel_id)
-                                .await?;
+                            self.write_dvc_messages(vec![create_dvc_msg], writer).await?;
                         }
                     }
                     UrbdrcServerMessage::Device { dvc_id, dev_msg } => {
@@ -3803,7 +3797,7 @@ impl RdpServer {
                             messages.push(close_message);
                         }
 
-                        self.write_dvc_messages(messages, writer, user_channel_id).await?;
+                        self.write_dvc_messages(messages, writer).await?;
                     }
                     UrbdrcServerMessage::DeviceClosed { dvc_id } => {
                         self.remove_usb_device(dvc_id);
@@ -3813,7 +3807,7 @@ impl RdpServer {
                 ServerEvent::Egfx(msg) => match msg {
                     EgfxServerMessage::SendMessages { messages, generation } => {
                         if self.egfx_output_is_current(generation) {
-                            self.write_dvc_messages(messages, writer, user_channel_id).await?;
+                            self.write_dvc_messages(messages, writer).await?;
                         } else {
                             debug!(
                                 generation,
@@ -3840,7 +3834,7 @@ impl RdpServer {
                         let now_ms = monotonic_now_ms();
                         ad.expire_stale_probes(now_ms, crate::autodetect::RTT_PROBE_MAX_AGE_MS);
                         let request = ad.send_rtt_request(now_ms);
-                        let data = encode_autodetect_request(request, message_channel_id, user_channel_id)?;
+                        let data = encode_autodetect_request(request, message_channel_id)?;
                         writer
                             .write_all(&data)
                             .await
@@ -3868,7 +3862,7 @@ impl RdpServer {
                         // ticks later, with ordinary traffic in between counted by the
                         // client, then a Bandwidth Measure Results PDU in reply.
                         if let Some(pdu) = ad.build_bandwidth_measure() {
-                            let data = encode_autodetect_request(pdu, message_channel_id, user_channel_id)?;
+                            let data = encode_autodetect_request(pdu, message_channel_id)?;
                             writer
                                 .write_all(&data)
                                 .await
@@ -4010,7 +4004,6 @@ impl RdpServer {
                         match Self::dispatch_display_update(
                             update,
                             &mut display_writer,
-                            user_channel_id,
                             io_channel_id,
                             client_fastpath_output,
                             &mut buffer,
@@ -4138,7 +4131,7 @@ impl RdpServer {
                     writes_at_last_tick = writes_now;
                     continue;
                 }
-                let data = encode_heartbeat(&config, message_channel_id, user_channel_id)?;
+                let data = encode_heartbeat(&config, message_channel_id)?;
                 heartbeat_writer
                     .write_all(&data)
                     .await
@@ -4289,7 +4282,7 @@ impl RdpServer {
                     continue;
                 };
                 let svc_responses = channel.start().map_err_kind("svc start", ServerErrorKind::Pdu)?;
-                let response = server_encode_svc_messages(svc_responses, channel_id, result.user_channel_id)
+                let response = server_encode_svc_messages(svc_responses, channel_id, SERVER_CHANNEL_ID)
                     .map_err(ServerError::encode)?;
                 writer
                     .write_all(&response)
@@ -4829,13 +4822,13 @@ impl RdpServer {
                 );
                 if data.channel_id == io_channel_id {
                     let result = self.handle_io_channel_data(data).await;
-                    self.resume_soft_sync(writer, user_channel_id).await?;
+                    self.resume_soft_sync(writer).await?;
                     return result;
                 }
 
                 if message_channel_id == Some(data.channel_id) {
                     self.handle_message_channel_data(data);
-                    self.resume_soft_sync(writer, user_channel_id).await?;
+                    self.resume_soft_sync(writer).await?;
                     return Ok(false);
                 }
 
@@ -4849,15 +4842,15 @@ impl RdpServer {
                     if is_drdynvc {
                         // After Soft-Sync, DVC responses must follow the
                         // client to the UDP tunnel, not the TCP channel.
-                        self.write_dvc_messages(response_pdus, writer, user_channel_id).await?;
+                        self.write_dvc_messages(response_pdus, writer).await?;
                         // The PDU may have been the Soft-Sync Response that
                         // releases the held-back tunnel data.
                         self.flush_tunnel_backlog().await?;
                         // A channel the client just confirmed may be the one
                         // a waiting Soft-Sync needs.
-                        self.resume_soft_sync(writer, user_channel_id).await?;
+                        self.resume_soft_sync(writer).await?;
                     } else {
-                        let response = server_encode_svc_messages(response_pdus, data.channel_id, user_channel_id)
+                        let response = server_encode_svc_messages(response_pdus, data.channel_id, SERVER_CHANNEL_ID)
                             .map_err(ServerError::encode)?;
                         writer
                             .write_all(&response)
@@ -5122,14 +5115,15 @@ mod autodetect_tests {
 fn encode_autodetect_request(
     request: rdp::autodetect::AutoDetectRequest,
     message_channel_id: u16,
-    user_channel_id: u16,
 ) -> ServerResult<Vec<u8>> {
     // Auto-detect rides the MCS message channel framed by a Basic Security
     // Header (SEC_AUTODETECT_REQ), not a Share Control / Share Data header.
     let pdu = rdp::autodetect::AutoDetectReqPdu::new(request);
     let user_data = encode_vec(&pdu).map_err(ServerError::encode)?.into();
     let mcs_pdu = SendDataIndication {
-        initiator_id: user_channel_id,
+        // MS-RDPBCGR 2.2.6.1 and 3.3.5.x: a server-to-client PDU names the
+        // MCS server channel (0x03EA) as its initiator.
+        initiator_id: SERVER_CHANNEL_ID,
         channel_id: message_channel_id,
         user_data,
     };
@@ -5193,7 +5187,7 @@ mod graphics_pipeline_tests {
 /// by a Basic Security Header (SEC_HEARTBEAT) and ride the message channel,
 /// not a Share Control / Share Data header on the I/O channel
 /// (MS-RDPBCGR 2.2.16.1).
-fn encode_heartbeat(config: &HeartbeatConfig, message_channel_id: u16, user_channel_id: u16) -> ServerResult<Vec<u8>> {
+fn encode_heartbeat(config: &HeartbeatConfig, message_channel_id: u16) -> ServerResult<Vec<u8>> {
     let pdu = rdp::heartbeat::HeartbeatPdu {
         security_header: rdp::headers::BasicSecurityHeader {
             flags: rdp::headers::BasicSecurityHeaderFlags::HEARTBEAT,
@@ -5204,7 +5198,9 @@ fn encode_heartbeat(config: &HeartbeatConfig, message_channel_id: u16, user_chan
     };
     let user_data = encode_vec(&pdu).map_err(ServerError::encode)?.into();
     let mcs_pdu = SendDataIndication {
-        initiator_id: user_channel_id,
+        // MS-RDPBCGR 2.2.6.1 and 3.3.5.x: a server-to-client PDU names the
+        // MCS server channel (0x03EA) as its initiator.
+        initiator_id: SERVER_CHANNEL_ID,
         channel_id: message_channel_id,
         user_data,
     };
@@ -5504,7 +5500,6 @@ fn encode_share_data_pdu(
     share_data_pdu: rdp::headers::ShareDataPdu,
     pdu_source: u16,
     io_channel_id: u16,
-    user_channel_id: u16,
 ) -> ServerResult<Vec<u8>> {
     let header = rdp::headers::ShareDataHeader {
         share_data_pdu,
@@ -5519,7 +5514,9 @@ fn encode_share_data_pdu(
     };
     let user_data = encode_vec(&pdu).map_err(ServerError::encode)?.into();
     let mcs_pdu = SendDataIndication {
-        initiator_id: user_channel_id,
+        // MS-RDPBCGR 2.2.6.1 and 3.3.5.x: a server-to-client PDU names the
+        // MCS server channel (0x03EA) as its initiator.
+        initiator_id: SERVER_CHANNEL_ID,
         channel_id: io_channel_id,
         user_data,
     };
@@ -5617,7 +5614,7 @@ mod auto_reconnect_tests {
     }
 }
 
-async fn deactivate_all(io_channel_id: u16, user_channel_id: u16, writer: &mut impl FramedWrite) -> ServerResult<()> {
+async fn deactivate_all(io_channel_id: u16, writer: &mut impl FramedWrite) -> ServerResult<()> {
     let pdu = ShareControlPdu::ServerDeactivateAll(ServerDeactivateAll);
     let pdu = rdp::headers::ShareControlHeader {
         share_id: 0,
@@ -5626,7 +5623,9 @@ async fn deactivate_all(io_channel_id: u16, user_channel_id: u16, writer: &mut i
     };
     let user_data = encode_vec(&pdu).map_err(ServerError::encode)?.into();
     let pdu = SendDataIndication {
-        initiator_id: user_channel_id,
+        // MS-RDPBCGR 2.2.6.1 and 3.3.5.x: a server-to-client PDU names the
+        // MCS server channel (0x03EA) as its initiator.
+        initiator_id: SERVER_CHANNEL_ID,
         channel_id: io_channel_id,
         user_data,
     };
@@ -5654,7 +5653,7 @@ async fn send_access_denied(
         debug!("client did not announce SUPPORT_ERRINFO_PDU; denying the connection without a reason PDU");
         return Ok(());
     }
-    let msg = encode_access_denied(io_channel_id, user_channel_id)?;
+    let msg = encode_access_denied(io_channel_id)?;
     writer
         .write_all(&msg)
         .await
@@ -5670,11 +5669,11 @@ async fn send_access_denied(
 /// its `pduSource` MUST be 0. The bare four-byte `errorInfo` this used to send
 /// on its own was not a PDU the client could parse, so a refused login read
 /// as a protocol error instead of "access denied".
-fn encode_access_denied(io_channel_id: u16, user_channel_id: u16) -> ServerResult<Vec<u8>> {
+fn encode_access_denied(io_channel_id: u16) -> ServerResult<Vec<u8>> {
     let pdu = rdp::headers::ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(
         ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::ServerDeniedConnection),
     ));
-    encode_share_data_pdu(pdu, 0, io_channel_id, user_channel_id)
+    encode_share_data_pdu(pdu, 0, io_channel_id)
 }
 
 struct SharedWriter<'w, W: FramedWrite> {
@@ -5866,7 +5865,7 @@ mod preempt_tests {
         // pdu_source=0 here: unlike the Save Session Info sender (which
         // echoes the client's own user_channel_id), MS-RDPBCGR 2.2.5.1.1
         // requires pduSource to be zero for TS_SET_ERROR_INFO_PDU.
-        let bytes = encode_share_data_pdu(pdu, 0, 1003, 1002).expect("encode eviction notice");
+        let bytes = encode_share_data_pdu(pdu, 0, 1003).expect("encode eviction notice");
 
         let x224: X224<mcs::McsMessage<'_>> = decode(&bytes).expect("decode X.224/MCS");
         let mcs::McsMessage::SendDataIndication(data) = x224.0 else {
@@ -5896,7 +5895,7 @@ mod preempt_tests {
     /// ERRINFO_SERVER_DENIED_CONNECTION, not the bare error value.
     #[test]
     fn a_refused_login_is_a_share_data_pdu_with_the_denied_code() {
-        let bytes = encode_access_denied(1003, 1002).expect("encode access denied");
+        let bytes = encode_access_denied(1003).expect("encode access denied");
 
         let x224: X224<mcs::McsMessage<'_>> = decode(&bytes).expect("decode X.224/MCS");
         let mcs::McsMessage::SendDataIndication(data) = x224.0 else {
@@ -6824,7 +6823,7 @@ mod soft_sync_tests {
         let mut writer = TokioFramed::new(server_side);
 
         server
-            .soft_sync(to_tunnel, &mut writer, 1007)
+            .soft_sync(to_tunnel, &mut writer)
             .await
             .expect("Soft-Sync Request");
         assert!(tunnel.try_recv().is_err(), "the request itself goes over TCP");
@@ -6839,7 +6838,7 @@ mod soft_sync_tests {
         assert_eq!(direct.len(), 3, "the later channel's data and the Close");
 
         server
-            .write_dvc_messages(data(moved), &mut writer, 1007)
+            .write_dvc_messages(data(moved), &mut writer)
             .await
             .expect("written");
         assert!(tunnel.try_recv().is_err(), "held until the Soft-Sync Response");
@@ -6880,7 +6879,7 @@ mod soft_sync_tests {
         let (_client, server_side) = tokio::io::duplex(64 * 1024);
         let mut writer = TokioFramed::new(server_side);
 
-        server.soft_sync(to_tunnel, &mut writer, 1007).await.expect("deferred");
+        server.soft_sync(to_tunnel, &mut writer).await.expect("deferred");
         assert!(server.pending_soft_sync.is_some());
         assert!(!drdynvc(&mut server).tunnels_channels());
 
@@ -6890,10 +6889,7 @@ mod soft_sync_tests {
         )))
         .expect("encode");
         drdynvc(&mut server).process(&created).expect("Create Response");
-        server
-            .resume_soft_sync(&mut writer, 1007)
-            .await
-            .expect("Soft-Sync Request");
+        server.resume_soft_sync(&mut writer).await.expect("Soft-Sync Request");
 
         let mut messages = data(first);
         messages.extend(data(second));
@@ -6939,7 +6935,7 @@ mod soft_sync_tests {
         let (_client, server_side) = tokio::io::duplex(64 * 1024);
         let mut writer = TokioFramed::new(server_side);
         server
-            .soft_sync(to_tunnel, &mut writer, 1007)
+            .soft_sync(to_tunnel, &mut writer)
             .await
             .expect("Soft-Sync Request");
 
@@ -6979,7 +6975,7 @@ mod soft_sync_tests {
         let (_client, server_side) = tokio::io::duplex(64 * 1024);
         let mut writer = TokioFramed::new(server_side);
         server
-            .soft_sync(first.clone(), &mut writer, 1007)
+            .soft_sync(first.clone(), &mut writer)
             .await
             .expect("Soft-Sync Request");
 

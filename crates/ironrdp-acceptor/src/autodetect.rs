@@ -65,7 +65,6 @@ enum Step {
 #[derive(Debug, Clone)]
 pub struct ConnectTimeAutoDetection {
     step: Step,
-    user_channel_id: u16,
     message_channel_id: u16,
     /// When the RTT Measure Request went out: the arrival of the PDU that
     /// preceded it, since the request follows it without waiting.
@@ -74,10 +73,9 @@ pub struct ConnectTimeAutoDetection {
 }
 
 impl ConnectTimeAutoDetection {
-    pub(crate) fn new(user_channel_id: u16, message_channel_id: u16, started_at: Option<MonotonicInstant>) -> Self {
+    pub(crate) fn new(message_channel_id: u16, started_at: Option<MonotonicInstant>) -> Self {
         Self {
             step: Step::SendRttRequest,
-            user_channel_id,
             message_channel_id,
             rtt_sent_at: started_at,
             found: NetworkCharacteristics::default(),
@@ -217,7 +215,7 @@ impl ConnectTimeAutoDetection {
 
     fn send(&self, request: AutoDetectRequest, output: &mut WriteBuf) -> ConnectorResult<usize> {
         util::encode_send_data_indication(
-            self.user_channel_id,
+            ironrdp_pdu::rdp::capability_sets::SERVER_CHANNEL_ID,
             self.message_channel_id,
             &AutoDetectReqPdu::new(request),
             output,
@@ -319,8 +317,7 @@ mod tests {
     /// connect-time request types (2.2.14.1).
     #[test]
     fn the_link_is_measured_and_the_result_sent() {
-        let mut detection =
-            ConnectTimeAutoDetection::new(1007, MESSAGE_CHANNEL, Some(MonotonicInstant::from_millis(1000)));
+        let mut detection = ConnectTimeAutoDetection::new(MESSAGE_CHANNEL, Some(MonotonicInstant::from_millis(1000)));
 
         let sent = requests(&step(&mut detection, &[], 1000));
         assert_eq!(sent.len(), 1);
@@ -386,8 +383,7 @@ mod tests {
     /// stops measuring and uses the client's values.
     #[test]
     fn a_sync_ends_the_measurement() {
-        let mut detection =
-            ConnectTimeAutoDetection::new(1007, MESSAGE_CHANNEL, Some(MonotonicInstant::from_millis(0)));
+        let mut detection = ConnectTimeAutoDetection::new(MESSAGE_CHANNEL, Some(MonotonicInstant::from_millis(0)));
         step(&mut detection, &[], 0);
 
         let sync = response(AutoDetectResponse::NetworkCharacteristicsSync {
@@ -411,7 +407,7 @@ mod tests {
     /// leaves the exchange waiting.
     #[test]
     fn other_pdus_are_not_taken_for_the_response() {
-        let mut detection = ConnectTimeAutoDetection::new(1007, MESSAGE_CHANNEL, None);
+        let mut detection = ConnectTimeAutoDetection::new(MESSAGE_CHANNEL, None);
         step(&mut detection, &[], 0);
 
         let elsewhere = encode_vec(&X224(SendDataRequest {
