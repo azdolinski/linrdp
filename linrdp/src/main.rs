@@ -913,7 +913,7 @@ async fn serve() -> anyhow::Result<()> {
             match udp::spawn(channel_fd, socket_fd, &identity, server.event_sender().clone()) {
                 Ok(request) => Some(request),
                 Err(error) => {
-                    tracing::warn!(%error, "RDP-UDP unavailable; serving TCP-only");
+                    tracing::warn!(error = format!("{error:#}"), "RDP-UDP unavailable; serving TCP-only");
                     None
                 }
             }

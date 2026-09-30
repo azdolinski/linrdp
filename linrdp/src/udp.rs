@@ -74,11 +74,6 @@ fn spawn_on(
     identity: &TlsIdentityCtx,
     events: mpsc::UnboundedSender<ironrdp_server::ServerEvent>,
 ) -> anyhow::Result<MultiTransportRequest> {
-    channel.set_nonblocking(true).context("RDP-UDP channel")?;
-    let channel = UnixDatagram::from_std(channel).context("RDP-UDP channel")?;
-    socket.set_nonblocking(true).context("RDP-UDP socket")?;
-    let socket = Arc::new(UdpSocket::from_std(socket).context("RDP-UDP socket")?);
-
     let mut cookie = [0u8; 16];
     fill_random(&mut cookie)?;
     let request = MultiTransportRequest {
@@ -91,10 +86,18 @@ fn spawn_on(
         security_cookie: request.security_cookie,
     };
 
-    // Before the request can reach the client, so its SYN finds us.
+    // Before the request can reach the client, so its SYN finds us. On the
+    // plain socket, while it still blocks: a freshly registered tokio socket
+    // reports WouldBlock to `try_send` until the reactor has seen it
+    // writable, and the registration was lost that way on the live server.
     channel
-        .try_send(&encode_register(&cookie_hash(&tunnel_config)))
+        .send(&encode_register(&cookie_hash(&tunnel_config)))
         .context("registering the multitransport request with the supervisor")?;
+
+    channel.set_nonblocking(true).context("RDP-UDP channel")?;
+    let channel = UnixDatagram::from_std(channel).context("RDP-UDP channel")?;
+    socket.set_nonblocking(true).context("RDP-UDP socket")?;
+    let socket = Arc::new(UdpSocket::from_std(socket).context("RDP-UDP socket")?);
 
     let server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
