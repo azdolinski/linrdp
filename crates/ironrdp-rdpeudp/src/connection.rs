@@ -45,7 +45,7 @@ use crate::pdu::{V1Datagram, V2Packet};
 use crate::recv_window::RecvWindow;
 use crate::reliability::ReliabilityController;
 use crate::rtt::RttEstimator;
-use crate::send_window::SendWindow;
+use crate::send_window::{SendEntryState, SendWindow};
 use crate::seq;
 use crate::timer::{Timer, TimerTable};
 
@@ -139,11 +139,17 @@ impl Default for ConnectionConfig {
     fn default() -> Self {
         Self {
             initial_sequence_number: 0,
-            log_window_size: 6,
+            // What this endpoint can take: 1024 packets, about 1.2 MB. The
+            // peer holds its sending to it (MS-RDPEUDP2 2.2.1.1); 64 packets
+            // kept a client's uploads to a few megabits.
+            log_window_size: 10,
             upstream_mtu: 1232,
             downstream_mtu: 1232,
             idle_timeout: Duration::from_secs(65),
-            keep_alive_interval: Duration::from_secs(8),
+            // [MS-RDPEUDP2] 3.1.1.3, note 2: "In Windows, the keepalive
+            // datagram time interval is 4 seconds." A peer that hears
+            // nothing for 16 s may close the connection.
+            keep_alive_interval: Duration::from_secs(4),
             cookie_hash: None,
         }
     }
@@ -160,6 +166,9 @@ impl Default for ConnectionConfig {
 /// negotiates `uUpStreamMtu` and `uDownStreamMtu` in the range 1132 to 1232,
 /// so the effective limit is whichever of the two is smaller.
 const RDPEUDP2_MTU: usize = 1232;
+
+/// A SendAckTimeGap that carries no time ([MS-RDPEUDP2] 2.2.1.2.1).
+const INVALID_ACK_TIME_GAP: u8 = 255;
 
 /// The range MS-RDPEUDP 3.1.1.3 allows for `uUpStreamMtu`/`uDownStreamMtu`.
 const MTU_RANGE: core::ops::RangeInclusive<u16> = 1132..=1232;
@@ -285,6 +294,31 @@ struct NegotiatedParams {
 /// }
 /// conn.handle_timeout(now);
 /// ```
+/// What a connection has done so far, for diagnostics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// Datagrams handed to `handle_datagram`.
+    pub datagrams_in: u64,
+    /// Datagrams handed out by `poll_transmit`.
+    pub datagrams_out: u64,
+    /// New data packets sent.
+    pub data_sent: u64,
+    /// Data packets sent again.
+    pub retransmits: u64,
+    /// Retransmit timer expiries.
+    pub retransmit_timeouts: u64,
+    /// Bytes sent and not yet acknowledged, at the time of the snapshot.
+    pub bytes_in_flight: u64,
+    /// Congestion window, at the time of the snapshot.
+    pub congestion_window: u64,
+    /// Messages waiting to be sent, at the time of the snapshot.
+    pub send_queue: u64,
+    /// Current retransmission timeout, in milliseconds.
+    pub rto_ms: u64,
+    /// Smoothed round-trip time, in milliseconds.
+    pub srtt_ms: Option<u64>,
+}
+
 pub struct RdpeudpConnection {
     /// Which side we are.
     side: Side,
@@ -355,6 +389,9 @@ pub struct RdpeudpConnection {
     /// sent, for sampling the handshake round trip as the connection's
     /// first RTT estimate. `None` until the first SYN or SYN+ACK goes out.
     handshake_sent_at: Option<MonotonicInstant>,
+
+    /// Counters for diagnostics; see [`RdpeudpConnection::stats`].
+    stats: Stats,
 
     /// When the earliest currently-unacknowledged data arrived, `None` when
     /// nothing is owed an acknowledgment.
@@ -539,6 +576,7 @@ impl RdpeudpConnection {
             handshake_datagram: None,
             handshake_retransmits: 0,
             handshake_sent_at: None,
+            stats: Stats::default(),
             ack_delay_started_at: None,
             remote_timestamp_ref: 0,
             wire_buf: Vec::with_capacity(1400),
@@ -642,6 +680,7 @@ impl RdpeudpConnection {
     /// The `wire` slice must be mutable because `decode_with_prefix`
     /// performs an in-place byte swap.
     pub fn handle_datagram(&mut self, wire: &mut [u8], now: MonotonicInstant) -> Result<(), RdpeudpError> {
+        self.stats.datagrams_in += 1;
         if self.state == State::Closed {
             return Err(RdpeudpError::connection_closed("handle datagram"));
         }
@@ -725,6 +764,26 @@ impl RdpeudpConnection {
     /// buffer when congestion window budget is available, processes
     /// retransmissions, and sends standalone ACKs.
     pub fn poll_transmit(&mut self, now: MonotonicInstant) -> Option<Transmit> {
+        let transmit = self.poll_transmit_inner(now);
+        if transmit.is_some() {
+            self.stats.datagrams_out += 1;
+        }
+        transmit
+    }
+
+    /// What this connection has done so far, with its current windows.
+    pub fn stats(&self) -> Stats {
+        Stats {
+            bytes_in_flight: self.send_window.as_ref().map_or(0, |window| window.bytes_in_flight()),
+            congestion_window: self.congestion.window(),
+            send_queue: u64::try_from(self.send_buffer.len()).unwrap_or(u64::MAX),
+            rto_ms: u64::try_from(self.rtt.rto().as_millis()).unwrap_or(u64::MAX),
+            srtt_ms: self.rtt.srtt().map(|srtt| u64::try_from(srtt.as_millis()).unwrap_or(u64::MAX)),
+            ..self.stats
+        }
+    }
+
+    fn poll_transmit_inner(&mut self, now: MonotonicInstant) -> Option<Transmit> {
         // A closed connection has nothing left to say. Returning early also
         // keeps the handshake branch below from arming the keep-alive timer
         // after `close` cleared it: `handle_timeout` returns early once closed,
@@ -1204,6 +1263,11 @@ impl RdpeudpConnection {
 
         let packet: V2Packet = decode(packet_bytes).map_err(RdpeudpError::decode)?;
 
+        // The window the peer can take, announced in every header.
+        if let Some(send_window) = self.send_window.as_mut() {
+            send_window.set_peer_window(packet.header.log_window_size);
+        }
+
         // Process ACK payload (cumulative acknowledgment)
         if let Some(ref ack) = packet.ack {
             self.process_ack(ack, &packet.header, now);
@@ -1268,14 +1332,15 @@ impl RdpeudpConnection {
         // Karn's algorithm: only packets that went out once can be timed.
         let elapsed = send_window
             .get_by_data_seq(acked_seq)
-            .filter(|entry| entry.transmit_count == 1)
+            .filter(|entry| entry.transmit_count == 1 && entry.state == SendEntryState::Pending)
             .map(|entry| now.duration_since(entry.sent_at));
 
         // The ACK seq_num is the highest sequentially received DataSeqNum, so
         // everything at or below it is acknowledged.
         let newly_acked_bytes = send_window.mark_received_through(acked_seq);
 
-        if let Some(elapsed) = elapsed {
+        // 2.2.1.2.1: a SendAckTimeGap of 255 is invalid and "MUST NOT be used".
+        if let Some(elapsed) = elapsed.filter(|_| ack.send_ack_time_gap != INVALID_ACK_TIME_GAP) {
             let ack_gap = Duration::from_millis(u64::from(ack.send_ack_time_gap));
             if let Some(rtt_sample) = elapsed.checked_sub(ack_gap) {
                 self.rtt.update(rtt_sample);
@@ -1298,6 +1363,10 @@ impl RdpeudpConnection {
         // peer from postponing loss detection indefinitely by repeating one.
         if newly_acked_bytes > 0 {
             self.timers.clear(Timer::Retransmit);
+            // The peer is receiving again: the backoff was for a silence
+            // that is over (3.1.1.2.3, a timeout "dynamically variable,
+            // depending on the current network conditions").
+            self.rtt.reset_backoff();
         }
         self.update_retransmit_timer(now);
 
@@ -1331,7 +1400,7 @@ impl RdpeudpConnection {
                         if *received {
                             if let Some(sample) = send_window
                                 .get_by_data_seq(current_seq)
-                                .filter(|entry| entry.transmit_count == 1)
+                                .filter(|entry| entry.transmit_count == 1 && entry.state == SendEntryState::Pending)
                                 .map(|entry| now.duration_since(entry.sent_at))
                             {
                                 elapsed = Some(sample);
@@ -1356,7 +1425,7 @@ impl RdpeudpConnection {
                         if received {
                             if let Some(sample) = send_window
                                 .get_by_data_seq(current_seq)
-                                .filter(|entry| entry.transmit_count == 1)
+                                .filter(|entry| entry.transmit_count == 1 && entry.state == SendEntryState::Pending)
                                 .map(|entry| now.duration_since(entry.sent_at))
                             {
                                 elapsed = Some(sample);
@@ -1373,7 +1442,10 @@ impl RdpeudpConnection {
         }
 
         // RTT estimation from ACKVEC timing
-        if let (Some(elapsed), Some(gap_ms)) = (elapsed, ack_vector.send_ack_time_gap_ms) {
+        if let (Some(elapsed), Some(gap_ms)) = (
+            elapsed,
+            ack_vector.send_ack_time_gap_ms.filter(|gap| *gap != INVALID_ACK_TIME_GAP),
+        ) {
             let ack_gap = Duration::from_millis(u64::from(gap_ms));
             if let Some(rtt_sample) = elapsed.checked_sub(ack_gap) {
                 self.rtt.update(rtt_sample);
@@ -1390,6 +1462,10 @@ impl RdpeudpConnection {
         // progress only, so a duplicate ACK cannot postpone the deadline.
         if newly_acked_bytes > 0 {
             self.timers.clear(Timer::Retransmit);
+            // The peer is receiving again: the backoff was for a silence
+            // that is over (3.1.1.2.3, a timeout "dynamically variable,
+            // depending on the current network conditions").
+            self.rtt.reset_backoff();
         }
         self.update_retransmit_timer(now);
 
@@ -1542,6 +1618,24 @@ impl RdpeudpConnection {
     /// threshold in `LossDetector` is computed from an RTO that
     /// `RttEstimator::on_timeout` has already doubled and so always sits
     /// ahead of the elapsed time.
+    fn declare_overdue_lost(&mut self, now: MonotonicInstant) {
+        let rto = self.rtt.rto();
+        let overdue: Vec<u64> = self.send_window.as_ref().map_or_else(Vec::new, |window| {
+            window
+                .pending_entries()
+                .filter(|entry| now.duration_since(entry.sent_at) >= rto)
+                .map(|entry| entry.data_seq)
+                .collect()
+        });
+        if overdue.is_empty() {
+            self.declare_oldest_pending_lost();
+            return;
+        }
+        for data_seq in overdue {
+            self.declare_lost(data_seq);
+        }
+    }
+
     fn declare_oldest_pending_lost(&mut self) {
         let Some(send_window) = self.send_window.as_ref() else {
             return;
@@ -1605,6 +1699,7 @@ impl RdpeudpConnection {
         let transmit = self.build_data_packet(new_data_seq, entry.channel_seq, entry.data, now);
 
         if transmit.is_some() {
+            self.stats.retransmits += 1;
             // Reset retransmit timer
             self.timers.set(Timer::Retransmit, now + self.rtt.rto());
         }
@@ -1637,6 +1732,7 @@ impl RdpeudpConnection {
         let transmit = self.build_data_packet(data_seq, channel_seq, data, now);
 
         if transmit.is_some() {
+            self.stats.data_sent += 1;
             // Set retransmit timer if not already running
             if !self.timers.is_set(Timer::Retransmit) {
                 self.timers.set(Timer::Retransmit, now + self.rtt.rto());
@@ -1885,6 +1981,7 @@ impl RdpeudpConnection {
     /// Handle retransmit timer expiry.
     fn handle_retransmit_timeout(&mut self, now: MonotonicInstant) {
         self.timers.clear(Timer::Retransmit);
+        self.stats.retransmit_timeouts += 1;
 
         if self.state != State::Established {
             self.rtt.on_timeout();
@@ -1892,9 +1989,14 @@ impl RdpeudpConnection {
             return;
         }
 
-        // Before the backoff, which moves the threshold this would be
-        // measured against out of reach. See `declare_oldest_pending_lost`.
-        self.declare_oldest_pending_lost();
+        // [MS-RDPEUDP2] 3.1.1.2.3: a packet is lost when "a set time has
+        // passed since the sending of the packet" — each packet, not only
+        // the oldest. Declaring one per expiry, with the timeout doubling
+        // each time, left a burst of losses to be recovered one packet per
+        // 300, 600, 1200 ... ms: seconds of stall on the live server.
+        // Measured before the backoff, which would move the threshold out of
+        // reach.
+        self.declare_overdue_lost(now);
 
         // Apply exponential backoff
         self.rtt.on_timeout();
@@ -2154,6 +2256,56 @@ mod tests {
         conn.sample_handshake_rtt(sent_at + Duration::from_millis(40));
 
         assert_eq!(conn.rtt.srtt(), None);
+    }
+
+    /// A client and a server that completed the handshake at `now`.
+    fn established_pair(now: MonotonicInstant) -> (RdpeudpConnection, RdpeudpConnection) {
+        let mut client = RdpeudpConnection::connect(test_config(), now).expect("connect");
+        let syn = client.poll_transmit(now).expect("SYN queued").contents;
+        let decoded = decode::<V1Datagram>(&syn).expect("decode SYN");
+        let mut server = RdpeudpConnection::accept(test_config(), &decoded, now).expect("accepted");
+        for _ in 0..8 {
+            while let Some(mut t) = server.poll_transmit(now) {
+                client.handle_datagram(&mut t.contents, now).expect("client input");
+            }
+            while let Some(mut t) = client.poll_transmit(now) {
+                server.handle_datagram(&mut t.contents, now).expect("server input");
+            }
+            if client.is_established() && server.is_established() {
+                return (client, server);
+            }
+        }
+        panic!("handshake did not complete");
+    }
+
+    /// [MS-RDPEUDP2] 3.1.1.2.3: a packet is lost once "a set time has passed
+    /// since the sending of the packet", each packet on its own. When the
+    /// retransmit timer fires on a whole burst the peer never saw, every
+    /// packet of it is declared lost at once; one per expiry, with the
+    /// timeout doubling each time, took seconds to recover a burst.
+    #[test]
+    fn a_retransmit_timeout_declares_the_whole_overdue_burst_lost() {
+        let start = MonotonicInstant::from_millis(0);
+        let (_client, mut server) = established_pair(start);
+        for i in 0..5u8 {
+            server.send(vec![i; 100]).expect("send");
+        }
+        let sent = start + Duration::from_millis(10);
+        let mut dropped = 0;
+        while server.poll_transmit(sent).is_some() {
+            dropped += 1;
+        }
+        assert!(dropped >= 5, "the burst went out: {dropped}");
+        let pending = |server: &RdpeudpConnection| {
+            server.send_window.as_ref().map_or(0, |w| w.pending_entries().count())
+        };
+        assert_eq!(pending(&server), 5);
+
+        let deadline = server.poll_timeout().expect("retransmit timer armed");
+        server.handle_timeout(deadline.max(sent + server.rto()));
+
+        assert_eq!(pending(&server), 0, "one expiry declares every overdue packet lost");
+        assert_eq!(server.stats().retransmit_timeouts, 1);
     }
 
     /// A client SYN as `connect` builds it, decoded so a test can alter it.

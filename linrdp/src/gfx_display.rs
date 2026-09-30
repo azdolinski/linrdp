@@ -280,7 +280,6 @@ fn full_quality_kbit(pixels: f64) -> f64 {
 /// a specific line of code.
 #[derive(Clone, Copy)]
 enum DebtCause {
-    ProducerBackpressure,
     ProcessStall,
     Generation,
     SurfaceVanished,
@@ -292,6 +291,7 @@ enum DebtCause {
     NoEncoder,
     H264SendFailed,
     ClientRefresh,
+    FoldedDamage,
 }
 
 impl DebtCause {
@@ -299,23 +299,22 @@ impl DebtCause {
 
     fn idx(self) -> usize {
         match self {
-            Self::ProducerBackpressure => 0,
-            Self::ProcessStall => 1,
-            Self::Generation => 2,
-            Self::SurfaceVanished => 3,
-            Self::PreFrameBackpressure => 4,
-            Self::LingerExit => 5,
-            Self::H264Skip => 6,
-            Self::MotionPartial => 7,
-            Self::ClearSendFailed => 8,
-            Self::NoEncoder => 9,
-            Self::H264SendFailed => 10,
-            Self::ClientRefresh => 11,
+            Self::ProcessStall => 0,
+            Self::Generation => 1,
+            Self::SurfaceVanished => 2,
+            Self::PreFrameBackpressure => 3,
+            Self::LingerExit => 4,
+            Self::H264Skip => 5,
+            Self::MotionPartial => 6,
+            Self::ClearSendFailed => 7,
+            Self::NoEncoder => 8,
+            Self::H264SendFailed => 9,
+            Self::ClientRefresh => 10,
+            Self::FoldedDamage => 11,
         }
     }
 
     const NAMES: [&'static str; Self::COUNT] = [
-        "producer_bp",
         "process_stall",
         "generation",
         "surface_vanished",
@@ -327,6 +326,7 @@ impl DebtCause {
         "no_encoder",
         "h264_send_failed",
         "client_refresh",
+        "folded_damage",
     ];
 }
 
@@ -825,14 +825,20 @@ impl RdpServerDisplayUpdates for EgfxUpdates {
             // Producer backpressure (KRdp pauses its encoder; our poll loop
             // IS the producer): while the EGFX pipeline reports the client
             // behind, skip the expensive part — the YUV conversion and encode
-            // — not just the send. No new grab is started either; whatever
-            // landed already updated the damage baseline, so `pending_full`
-            // makes a later full repaint deliver those pixels.
+            // — not just the send. MS-RDPEGFX 3.2.5.13: the server throttles.
+            // No new grab is started, and one already in flight is kept in
+            // `pending_grab` and processed, damage and all, once the client
+            // catches up, so no pixel is owed here.
+            //
+            // This used to owe a lossless repaint of the whole screen on every
+            // such tick: on a photographic desktop that is ~15 MB of
+            // ClearCodec per repaint, which put the client further behind and
+            // armed the next one. Measured on the live server: 480 of these in
+            // 10 s and 283 MB sent over the UDP tunnel.
             if let Some(handle) = self.session.handle() {
                 if self.session.ready()
                     && Self::lock_handle(&handle).should_backpressure()
                 {
-                    self.owe_everything(DebtCause::ProducerBackpressure);
                     self.backpressure_events += 1;
                     tokio::time::sleep(POLL_INTERVAL).await;
                     continue;
@@ -1293,9 +1299,13 @@ impl EgfxUpdates {
         }
 
         // Backpressure (MS-RDPEGFX 2.2.4.3): the client is behind — skip the
-        // frame entirely; the full-frame send that follows covers this grab.
+        // frame entirely. Its pixels are consumed from the damage tracker, so
+        // what changed is owed a lossless paint later: that area, not the
+        // whole screen.
         if handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).should_backpressure() {
-            self.owe_everything(DebtCause::PreFrameBackpressure);
+            if let Some((x, y, w, h)) = grab.damage {
+                self.owe_region(x, y, w, h, DebtCause::PreFrameBackpressure);
+            }
             self.backpressure_events += 1;
             return;
         }
@@ -1360,6 +1370,9 @@ impl EgfxUpdates {
         // alternates the whole screen between exact and 4:2:0 looks at the
         // H.264 cadence (~6.5 Hz), which is exactly the visible flicker.
         if self.pending_full && !self.in_motion {
+            // This grab's changes are consumed from the damage tracker: fold
+            // them into the debt, or those outside the owed region are lost.
+            self.owe_region(damage.0, damage.1, damage.2, damage.3, DebtCause::FoldedDamage);
             let (x, y, w, h) = self.debt_region(width, height);
             self.repay_debt(handle, data, width, height, x, y, w, h).await;
             return;
@@ -1402,7 +1415,7 @@ impl EgfxUpdates {
             // Motion mode only if the frame actually shipped: it suppresses
             // the lossless partial path below, so entering it on a dropped
             // frame strands the pixels nothing else will deliver.
-            if self.send_h264(handle, data, width, height).await {
+            if self.send_h264(handle, data, width, height, (dx, dy, dw, dh)).await {
                 self.in_motion = true;
                 self.motion_until = Instant::now() + MOTION_LINGER;
             }
@@ -1482,9 +1495,13 @@ impl EgfxUpdates {
         // a few lines later in the caller.
         let depth = Self::lock_handle(handle).fresh_client_queue_depth();
         let headroom_bytes = match depth {
-            // No usable measurement (no ack yet, acks suspended, or the sample
-            // has expired) or a client reporting zero backlog: no throttle.
-            None | Some(0) => return u32::MAX,
+            // No usable measurement: no ack yet, acks suspended, a sample that
+            // expired, or QUEUE_DEPTH_UNAVAILABLE (0), which MS-RDPEGFX
+            // 2.2.2.13 defines as "no information is available", not as an
+            // empty queue. Not knowing is no licence to send a whole
+            // 2880x1800 repaint as one message: budget as if the client's
+            // queue were empty, one CLIENT_QUEUE_BACKOFF's worth per band.
+            None | Some(0) => CLIENT_QUEUE_BACKOFF,
             Some(depth) => CLIENT_QUEUE_BACKOFF.saturating_sub(depth),
         };
         let px = f64::from(headroom_bytes) / self.clear_bytes_per_px;
@@ -1871,7 +1888,14 @@ impl EgfxUpdates {
     /// rejected. Motion mode suppresses the lossless partial path, so claiming
     /// it after a frame that never shipped strands those pixels until some
     /// later repaint — with AVC disabled, permanently.
-    async fn send_h264(&mut self, handle: &GfxHandle, data: Vec<u8>, w: u16, h: u16) -> bool {
+    async fn send_h264(
+        &mut self,
+        handle: &GfxHandle,
+        data: Vec<u8>,
+        w: u16,
+        h: u16,
+        damage: (u16, u16, u16, u16),
+    ) -> bool {
         let Some(surface) = self.surface else { return false };
 
         if self.avc_disabled {
@@ -2064,7 +2088,13 @@ impl EgfxUpdates {
             if let Some(Encoders { h264: Some(enc), .. }) = self.encoders.as_mut() {
                 enc.force_intra();
             }
-            self.owe_everything(DebtCause::H264SendFailed);
+            // What this frame changed is owed, not the whole screen: the
+            // forced IDR above repaints everything with the next motion frame
+            // anyway, and a full lossless repaint here was a 15 MB ClearCodec
+            // message sent to a client that had just been found behind
+            // (MS-RDPEGFX 3.2.5.13 asks the server to send less).
+            let (x, y, dw, dh) = damage;
+            self.owe_region(x, y, dw, dh, DebtCause::H264SendFailed);
             // A rejected send IS the strain signal. Counting only the
             // pre-encode `should_backpressure()` polls misses exactly the
             // drops that matter, so the adaptive quality loop never learns

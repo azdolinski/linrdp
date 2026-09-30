@@ -18,7 +18,7 @@ use core::time::Duration;
 use std::sync::{Arc, Mutex};
 
 use ironrdp_rdpemt::{RdpemtErrorExt as _, TunnelConfig};
-use ironrdp_rdpeudp::pdu::V1Datagram;
+use ironrdp_rdpeudp::pdu::{V1Datagram, V1Flags};
 use ironrdp_rdpeudp::{ConnectionConfig, RdpeudpConnection, RdpeudpErrorExt as _};
 use ironrdp_tls::{CertificateValidation, CertificateValidationCallback};
 use sha2::{Digest as _, Sha256};
@@ -29,6 +29,7 @@ use tokio::task::JoinHandle;
 
 use crate::driver::Driver;
 use crate::error::{DriverError, DriverErrorExt as _, DriverErrorKind, UdpTransportError, UdpTransportErrorExt as _};
+use crate::port::DatagramPort;
 use crate::stream::{RdpeudpStream, SharedIo};
 use crate::tls::{tls_accept, tls_upgrade};
 use crate::tunnel::{read_tunnel_pdu, tunnel_data_loop, write_tunnel_pdu};
@@ -224,6 +225,9 @@ pub struct UdpTransport {
     /// Sends higher-layer data into the tunnel for encryption and transmission.
     data_tx: mpsc::Sender<Vec<u8>>,
 
+    /// Sends RDP_TUNNEL_SUBHEADERs (MS-RDPEMT 2.2.1.1.1) into the tunnel.
+    sub_header_tx: mpsc::Sender<ironrdp_rdpemt::TunnelSubHeader>,
+
     /// Shared I/O bridge between the driver and the TLS/RDPEMT layer.
     /// Held here so `shutdown()` can signal closure to both the
     /// driver (via `write_waker`) and the read pump (via `read_waker`).
@@ -270,6 +274,23 @@ impl UdpTransport {
         Ok(())
     }
 
+    /// Send an RDP_TUNNEL_SUBHEADER (MS-RDPEMT 2.2.1.1.1), such as the
+    /// auto-detect structures [MS-RDPBCGR] 1.3.9 carries over sideband
+    /// channels during Continuous Auto-Detection.
+    ///
+    /// It rides in the header of the next Tunnel Data PDU, or goes out in one
+    /// of its own when no data follows shortly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the transport is closed.
+    pub async fn send_sub_header(&self, sub_header: ironrdp_rdpemt::TunnelSubHeader) -> Result<(), UdpTransportError> {
+        self.sub_header_tx
+            .send(sub_header)
+            .await
+            .map_err(|_| UdpTransportError::driver("send", DriverError::connection_closed("send sub-header")))
+    }
+
     /// Shut down the transport, closing the RDPEUDP2 connection.
     ///
     /// Signals the shared I/O bridge as closed, which propagates to
@@ -280,6 +301,7 @@ impl UdpTransport {
     pub async fn shutdown(mut self) -> Result<(), UdpTransportError> {
         // Drop the send channel to signal the write pump to stop
         drop(self.data_tx);
+        drop(self.sub_header_tx);
         drop(self.data_rx);
 
         // Signal the shared I/O bridge as closed so the driver
@@ -337,6 +359,7 @@ impl UdpTransport {
         Self {
             data_rx,
             data_tx,
+            sub_header_tx: mpsc::channel(1).0,
             shared: Arc::new(Mutex::new(SharedIo::new())),
             driver_handle: AbortOnDrop::new(tokio::spawn(async { Ok(()) })),
             pump_handle: AbortOnDrop::new(tokio::spawn(async { Ok(()) })),
@@ -486,6 +509,7 @@ pub async fn connect_udp(config: UdpTransportConfig) -> Result<UdpTransport, Udp
     // Phase 5: Set up data channels and spawn the read pump
     let (incoming_tx, incoming_rx) = mpsc::channel::<Vec<u8>>(64);
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (sub_header_tx, mut sub_header_rx) = mpsc::channel::<ironrdp_rdpemt::TunnelSubHeader>(16);
 
     // Read pump: TLS → RDPEMT decode → channel
     let pump_handle = AbortOnDrop::new(tokio::spawn(async move {
@@ -494,12 +518,13 @@ pub async fn connect_udp(config: UdpTransportConfig) -> Result<UdpTransport, Udp
 
     // Write pump: channel → RDPEMT encode → TLS
     let write_pump_handle = AbortOnDrop::new(tokio::spawn(async move {
-        write_pump(&mut tls_write, &mut outgoing_rx).await
+        write_pump(&mut tls_write, &mut outgoing_rx, &mut sub_header_rx).await
     }));
 
     Ok(UdpTransport {
         data_rx: incoming_rx,
         data_tx: outgoing_tx,
+        sub_header_tx,
         shared,
         driver_handle,
         pump_handle,
@@ -597,8 +622,56 @@ async fn accept_udp_inner(socket: UdpSocket, config: UdpAcceptConfig) -> Result<
         .await
         .map_err(|error| UdpTransportError::socket("accept udp inner", error))?;
 
+    accept_from_syn(&recv_buf[..n], DatagramPort::from(socket), config).await
+}
+
+/// Accept a UDP transport connection whose datagrams arrive through a
+/// dispatcher rather than a socket of its own.
+///
+/// [MS-RDPEUDP] 2.1: one server port carries every client's RDP-UDP traffic,
+/// and [MS-RDPEMT] 3.2.1: the server hands each incoming multitransport
+/// connection to the main RDP connection that requested it. The dispatcher
+/// reads the shared socket, recognises the client by the cookieHash of its
+/// SYN (see [`syn_cookie_hash`]) and passes that SYN as `syn`, and every later
+/// datagram from the same client, through `port`.
+///
+/// # Errors
+///
+/// Returns `UdpTransportError` if any phase of the accept fails.
+pub async fn accept_udp_dispatched(
+    syn: Vec<u8>,
+    port: DatagramPort,
+    config: UdpAcceptConfig,
+) -> Result<UdpTransport, UdpTransportError> {
+    let timeout = config.accept_timeout;
+    tokio::time::timeout(timeout, accept_from_syn(&syn, port, config))
+        .await
+        .map_err(|_| UdpTransportError::handshake_timeout("accept udp"))?
+}
+
+/// The cookieHash a client's SYN datagram carries, if `datagram` is one.
+///
+/// [MS-RDPEUDP] 3.1.5.1.1: a version 3 SYN MUST carry the SHA-256 hash of the
+/// securityCookie of the Initiate Multitransport Request, so the first
+/// datagram already names the RDP connection it belongs to. Compare it with
+/// [`cookie_hash`] of each outstanding request.
+pub fn syn_cookie_hash(datagram: &[u8]) -> Option<[u8; 32]> {
+    let syn: V1Datagram = ironrdp_core::decode(datagram).ok()?;
+    if !syn.header.flags.contains(V1Flags::SYN) || syn.header.flags.contains(V1Flags::ACK) {
+        return None;
+    }
+    syn.syn_data_ex?.cookie_hash
+}
+
+async fn accept_from_syn(
+    syn: &[u8],
+    port: DatagramPort,
+    config: UdpAcceptConfig,
+) -> Result<UdpTransport, UdpTransportError> {
+    let socket = port;
+
     // Phase 2: Decode the V1 SYN datagram and create a server-side connection
-    let syn_datagram: V1Datagram = ironrdp_core::decode(&recv_buf[..n]).map_err(|_| {
+    let syn_datagram: V1Datagram = ironrdp_core::decode(syn).map_err(|_| {
         UdpTransportError::handshake(
             "accept UDP",
             DriverError::rdpeudp(
@@ -684,6 +757,7 @@ async fn accept_udp_inner(socket: UdpSocket, config: UdpAcceptConfig) -> Result<
     // Phase 6: Set up data channels and spawn pumps (identical to client side)
     let (incoming_tx, incoming_rx) = mpsc::channel::<Vec<u8>>(64);
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (sub_header_tx, mut sub_header_rx) = mpsc::channel::<ironrdp_rdpemt::TunnelSubHeader>(16);
 
     let pump_handle = AbortOnDrop::new(tokio::spawn(async move {
         tunnel_data_loop(&mut tls_read, &mut tunnel, &incoming_tx).await
@@ -691,12 +765,13 @@ async fn accept_udp_inner(socket: UdpSocket, config: UdpAcceptConfig) -> Result<
 
     // Write pump: channel → RDPEMT encode → TLS
     let write_pump_handle = AbortOnDrop::new(tokio::spawn(async move {
-        write_pump(&mut tls_write, &mut outgoing_rx).await
+        write_pump(&mut tls_write, &mut outgoing_rx, &mut sub_header_rx).await
     }));
 
     Ok(UdpTransport {
         data_rx: incoming_rx,
         data_tx: outgoing_tx,
+        sub_header_tx,
         shared,
         driver_handle,
         pump_handle,
@@ -757,14 +832,47 @@ where
 /// Shared by both `connect_udp` and `accept_udp`. Returns the first failure
 /// encountered rather than only logging it, so `shutdown()` can surface it
 /// to the caller instead of the pump silently going quiet.
-async fn write_pump<W>(tls_write: &mut W, outgoing_rx: &mut mpsc::Receiver<Vec<u8>>) -> Result<(), UdpTransportError>
+async fn write_pump<W>(
+    tls_write: &mut W,
+    outgoing_rx: &mut mpsc::Receiver<Vec<u8>>,
+    sub_header_rx: &mut mpsc::Receiver<ironrdp_rdpemt::TunnelSubHeader>,
+) -> Result<(), UdpTransportError>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    while let Some(data) = outgoing_rx.recv().await {
+    // Sub-headers wait for the next data PDU to ride on (MS-RDPEMT 2.2.1.1),
+    // but no longer than this.
+    const SUB_HEADER_WAIT: Duration = Duration::from_millis(20);
+
+    let mut pending: Vec<ironrdp_rdpemt::TunnelSubHeader> = Vec::new();
+    let mut deadline: Option<tokio::time::Instant> = None;
+    let mut sub_headers_open = true;
+
+    loop {
+        let (sub_headers, higher_layer_data) = tokio::select! {
+            data = outgoing_rx.recv() => {
+                let Some(data) = data else { break };
+                deadline = None;
+                (core::mem::take(&mut pending), data)
+            }
+            sub_header = sub_header_rx.recv(), if sub_headers_open => {
+                match sub_header {
+                    Some(sub_header) => {
+                        pending.push(sub_header);
+                        deadline.get_or_insert_with(|| tokio::time::Instant::now() + SUB_HEADER_WAIT);
+                    }
+                    None => sub_headers_open = false,
+                }
+                continue;
+            }
+            () = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {
+                deadline = None;
+                (core::mem::take(&mut pending), Vec::new())
+            }
+        };
         let pdu = ironrdp_rdpemt::TunnelData {
-            sub_headers: Vec::new(),
-            higher_layer_data: data,
+            sub_headers,
+            higher_layer_data,
         };
         let encoded = ironrdp_core::encode_vec(&pdu)
             .map_err(|error| UdpTransportError::rdpemt("write pump", ironrdp_rdpemt::RdpemtError::encode(error)))?;
@@ -796,7 +904,9 @@ where
 /// integer values where each value is transmitted in network byte order",
 /// and mstsc sends exactly that permutation; the raw digest does not match
 /// and the connection is refused during SYN validation.
-fn cookie_hash(tunnel_config: &TunnelConfig) -> [u8; 32] {
+/// The cookieHash a client puts in its SYN for this request ([MS-RDPEUDP]
+/// 3.1.5.1.1).
+pub fn cookie_hash(tunnel_config: &TunnelConfig) -> [u8; 32] {
     let digest: [u8; 32] = Sha256::digest(tunnel_config.security_cookie).into();
     let mut hash = [0u8; 32];
     for (word, out) in digest.chunks_exact(4).zip(hash.chunks_exact_mut(4)) {
@@ -898,6 +1008,7 @@ mod tests {
         let transport = UdpTransport {
             data_rx: incoming_rx,
             data_tx: outgoing_tx,
+            sub_header_tx: mpsc::channel(1).0,
             shared: Arc::new(Mutex::new(SharedIo::new())),
             driver_handle: AbortOnDrop::new(tokio::spawn(async {
                 loop {

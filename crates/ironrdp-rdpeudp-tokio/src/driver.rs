@@ -18,10 +18,10 @@ use std::sync::{Arc, Mutex};
 
 use ironrdp_rdpeudp::pdu::{V1Datagram, V1Flags};
 use ironrdp_rdpeudp::{Event, RdpeudpConnection, RdpeudpError, RdpeudpErrorKind, SendError};
-use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 
 use crate::error::{DriverError, DriverErrorExt as _, DriverErrorKind};
+use crate::port::DatagramPort;
 use crate::stream::SharedIo;
 
 /// Maximum UDP datagram size we'll attempt to receive.
@@ -49,7 +49,7 @@ const READ_BUF_HIGH_WATER: usize = 1 << 20;
 
 /// The driver task's internal state.
 pub(crate) struct Driver {
-    socket: UdpSocket,
+    socket: DatagramPort,
     conn: RdpeudpConnection,
     shared: Arc<Mutex<SharedIo>>,
     /// Notified by the driver when Event::Connected fires.
@@ -69,13 +69,13 @@ pub(crate) struct Driver {
 
 impl Driver {
     pub(crate) fn new(
-        socket: UdpSocket,
+        socket: impl Into<DatagramPort>,
         conn: RdpeudpConnection,
         shared: Arc<Mutex<SharedIo>>,
         connected_notify: Arc<Notify>,
     ) -> Self {
         Self {
-            socket,
+            socket: socket.into(),
             conn,
             shared,
             connected_notify,
@@ -125,7 +125,30 @@ impl Driver {
         // Send any initial transmits (the SYN packet for client-side connections)
         self.drain_transmits().await?;
 
+        let mut last_report = tokio::time::Instant::now();
+        let mut reported = ironrdp_rdpeudp::Stats::default();
+
         loop {
+            // Once a second, what the connection did since the last report.
+            if last_report.elapsed() >= core::time::Duration::from_secs(1) {
+                let stats = self.conn.stats();
+                tracing::debug!(
+                    datagrams_in = stats.datagrams_in - reported.datagrams_in,
+                    datagrams_out = stats.datagrams_out - reported.datagrams_out,
+                    data_sent = stats.data_sent - reported.data_sent,
+                    retransmits = stats.retransmits - reported.retransmits,
+                    retransmit_timeouts = stats.retransmit_timeouts - reported.retransmit_timeouts,
+                    bytes_in_flight = stats.bytes_in_flight,
+                    congestion_window = stats.congestion_window,
+                    send_queue = stats.send_queue,
+                    rto_ms = stats.rto_ms,
+                    srtt_ms = ?stats.srtt_ms,
+                    "RDP-UDP connection (last second)"
+                );
+                reported = stats;
+                last_report = tokio::time::Instant::now();
+            }
+
             let timeout = self
                 .conn
                 .poll_timeout()
@@ -477,12 +500,15 @@ mod tests {
     use core::time::Duration;
 
     use ironrdp_rdpeudp::ConnectionConfig;
+    use tokio::net::UdpSocket;
 
     /// `connect` requires the cookie hash a version 3 SYN carries. These tests
     /// never reach a real multitransport request, so any value will do.
     fn test_connection_config() -> ConnectionConfig {
         ConnectionConfig {
             cookie_hash: Some([0x5A; 32]),
+            // 64 slots, which the send-buffer tests below count on.
+            log_window_size: 6,
             ..ConnectionConfig::default()
         }
     }

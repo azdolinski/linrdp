@@ -16,7 +16,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 use ironrdp_core::{
-    Decode, DecodeResult, Encode, EncodeResult, InvalidFieldErr as _, ReadCursor, UnexpectedMessageTypeErr as _,
+    Decode, DecodeResult, Encode, EncodeResult, InvalidFieldErr as _, ReadCursor,
     WriteCursor,
 };
 
@@ -25,28 +25,34 @@ use ironrdp_core::{
 ///
 /// MS-RDPEMT Section 2.2.1.1.1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
 pub enum SubHeaderType {
     /// Bandwidth measurement request from server.
-    AutoDetectRequest = 0x00,
+    AutoDetectRequest,
     /// Bandwidth measurement response from client.
-    AutoDetectResponse = 0x01,
+    AutoDetectResponse,
+    /// A type this implementation does not know. MS-RDPEMT 3.1.5.3 presents
+    /// sub-headers as "a provision ... enabling client and server extensions
+    /// of the protocol", and SubHeaderLength says how far to skip one.
+    Unknown(u8),
 }
 
 impl SubHeaderType {
     /// Parse from wire byte.
-    pub fn from_u8(value: u8) -> Option<Self> {
+    pub fn from_u8(value: u8) -> Self {
         match value {
-            0x00 => Some(Self::AutoDetectRequest),
-            0x01 => Some(Self::AutoDetectResponse),
-            _ => None,
+            0x00 => Self::AutoDetectRequest,
+            0x01 => Self::AutoDetectResponse,
+            other => Self::Unknown(other),
         }
     }
 
     /// Wire representation.
-    #[expect(clippy::as_conversions, reason = "repr(u8) enum to u8 is safe")]
     pub fn to_u8(self) -> u8 {
-        self as u8
+        match self {
+            Self::AutoDetectRequest => 0x00,
+            Self::AutoDetectResponse => 0x01,
+            Self::Unknown(value) => value,
+        }
     }
 }
 
@@ -116,9 +122,7 @@ impl Decode<'_> for TunnelSubHeader {
             ));
         }
 
-        let type_raw = src.read_u8();
-        let sub_header_type = SubHeaderType::from_u8(type_raw)
-            .ok_or_else(|| ironrdp_core::DecodeError::unexpected_message_type(Self::NAME, type_raw, Some(src.pos())))?;
+        let sub_header_type = SubHeaderType::from_u8(src.read_u8());
 
         let data_len = usize::from(sub_header_length) - Self::MIN_WIRE_SIZE;
         ironrdp_core::ensure_size!(in: src, size: data_len);

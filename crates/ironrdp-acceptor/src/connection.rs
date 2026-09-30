@@ -1094,7 +1094,7 @@ impl Sequence for Acceptor {
                                 // and pduSource MUST be 0.
                                 let share_data = wrap_share_data(info, 0);
                                 util::encode_send_data_indication(
-                                    self.user_channel_id,
+                                    rdp::capability_sets::SERVER_CHANNEL_ID,
                                     self.io_channel_id,
                                     &share_data,
                                     output,
@@ -1118,7 +1118,7 @@ impl Sequence for Acceptor {
                     Some(message_channel_id) if autodetect => AcceptorState::ConnectTimeAutoDetection {
                         early_capability,
                         channels,
-                        detection: ConnectTimeAutoDetection::new(self.user_channel_id, message_channel_id, received_at),
+                        detection: ConnectTimeAutoDetection::new(message_channel_id, received_at),
                     },
                     _ => AcceptorState::LicensingExchange {
                         early_capability,
@@ -1164,8 +1164,12 @@ impl Sequence for Acceptor {
 
                 debug!(message = ?license, "Send");
 
-                let written =
-                    util::encode_send_data_indication(self.user_channel_id, self.io_channel_id, &license, output)?;
+                let written = util::encode_send_data_indication(
+                    rdp::capability_sets::SERVER_CHANNEL_ID,
+                    self.io_channel_id,
+                    &license,
+                    output,
+                )?;
 
                 // A reactivation starts over at the Capabilities Exchange:
                 // licensing and multitransport bootstrapping belong to the
@@ -1216,8 +1220,12 @@ impl Sequence for Acceptor {
                     "Send Initiate Multitransport Request (UDP FECR)"
                 );
 
-                let written =
-                    util::encode_send_data_indication(self.user_channel_id, message_channel_id, &pdu, output)?;
+                let written = util::encode_send_data_indication(
+                    rdp::capability_sets::SERVER_CHANNEL_ID,
+                    message_channel_id,
+                    &pdu,
+                    output,
+                )?;
                 self.multitransport_request_sent = Some(request.request_id);
 
                 (
@@ -1247,7 +1255,7 @@ impl Sequence for Acceptor {
                 debug!(message = ?demand_active, "Send");
 
                 let written = util::encode_send_data_indication(
-                    self.user_channel_id,
+                    rdp::capability_sets::SERVER_CHANNEL_ID,
                     self.io_channel_id,
                     &demand_active,
                     output,
@@ -1279,8 +1287,12 @@ impl Sequence for Acceptor {
 
                 let share_data = wrap_share_data(monitor_layout, self.io_channel_id);
 
-                let written =
-                    util::encode_send_data_indication(self.user_channel_id, self.io_channel_id, &share_data, output)?;
+                let written = util::encode_send_data_indication(
+                    rdp::capability_sets::SERVER_CHANNEL_ID,
+                    self.io_channel_id,
+                    &share_data,
+                    output,
+                )?;
 
                 (
                     Written::from_size(written)?,

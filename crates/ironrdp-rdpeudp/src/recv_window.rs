@@ -185,7 +185,7 @@ impl RecvWindow {
 
         while let Some(data) = self.reorder_buf.remove(&self.next_channel_seq) {
             delivered.push(data);
-            self.next_channel_seq += 1;
+            self.next_channel_seq = crate::seq::next_channel_seq(self.next_channel_seq);
         }
 
         delivered
@@ -306,6 +306,19 @@ impl RecvWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sender following Windows never uses wire ChannelSeqNum 0
+    /// (MS-RDPEUDP2 3.1.1.2.4.2, note 1): the stream goes on past it instead
+    /// of waiting for it forever.
+    #[test]
+    fn delivery_steps_over_wire_channel_zero() {
+        let mut w = RecvWindow::new(1, 0xFFFE, 6);
+        assert!(w.receive(1, 0xFFFE, vec![1]));
+        assert!(w.receive(2, 0xFFFF, vec![2]));
+        assert!(w.receive(3, 0x1_0001, vec![3]));
+        assert_eq!(w.drain_ordered(), vec![vec![1], vec![2], vec![3]]);
+        assert_eq!(w.next_channel_seq(), 0x1_0002);
+    }
 
     #[test]
     fn new_window_state() {

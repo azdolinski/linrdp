@@ -31,6 +31,7 @@ mod sound_real;
 mod tls;
 mod x264_encoder;
 mod udp;
+mod udp_dispatch;
 mod usb;
 mod session;
 mod supervisor;
@@ -485,6 +486,11 @@ async fn serve() -> anyhow::Result<()> {
     // the configuration this process is, and is the only thing a worker is
     // ever told — every setting comes from the file both processes read.
     let serve_fd: Option<i32> = args.opt_value_from_str("--serve-fd")?;
+    // The listener's RDP-UDP port, held by the supervisor: this worker's
+    // channel to it and the shared socket to answer through (see
+    // `udp_dispatch`). Absent when the listener serves TCP only.
+    let udp_channel_fd: Option<i32> = args.opt_value_from_str("--udp-channel-fd")?;
+    let udp_socket_fd: Option<i32> = args.opt_value_from_str("--udp-socket-fd")?;
     let listener: String = args
         .opt_value_from_str("--listener")?
         .context("--listener <ADDRESS:PORT> says which listener from the configuration to serve")?;
@@ -899,22 +905,27 @@ async fn serve() -> anyhow::Result<()> {
     // With those fixed, UDP was verified working end to end — mstsc reports
     // "transport protocol: UDP" over a 100 s session with no recovery and no
     // reset. Do not disable UDP to chase a graphics fault.
-    let multitransport = if effective.features.udp {
-        // The UDP socket has to carry the same port as the TCP connection the
-        // client arrived on (MS-RDPEMT 3.1.1), and each worker binds its own —
-        // so a worker forked from the 3390 listener binds UDP 3390. Getting
-        // that wrong fails quietly: the error below is a warning and the
-        // session simply runs over TCP.
-        match udp::spawn(bind_addr, &identity, server.event_sender().clone()) {
-            Ok(request) => Some(request),
-            Err(error) => {
-                tracing::warn!(%error, "RDP-UDP listener unavailable; serving TCP-only");
-                None
+    let multitransport = match (effective.features.udp, udp_channel_fd, udp_socket_fd) {
+        // The UDP port is the listener's, on the address the client reached
+        // over TCP (MS-RDPEMT 3.1.1), and held by the supervisor for every
+        // connection at once (MS-RDPEUDP 2.1).
+        (true, Some(channel_fd), Some(socket_fd)) => {
+            match udp::spawn(channel_fd, socket_fd, &identity, server.event_sender().clone()) {
+                Ok(request) => Some(request),
+                Err(error) => {
+                    tracing::warn!(error = format!("{error:#}"), "RDP-UDP unavailable; serving TCP-only");
+                    None
+                }
             }
         }
-    } else {
-        tracing::info!("features.udp is off — serving TCP-only");
-        None
+        (true, ..) => {
+            tracing::info!("the supervisor holds no UDP port for this listener; serving TCP-only");
+            None
+        }
+        (false, ..) => {
+            tracing::info!("features.udp is off; serving TCP-only");
+            None
+        }
     };
     server.set_multitransport(multitransport);
 
