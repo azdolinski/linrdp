@@ -157,6 +157,25 @@ Releasing is driven by this file: a push to `main` that adds a new
   wire ChannelSeqNum 0 never reached mstsc's TLS layer, and about 65536
   packets into a busy session mstsc disconnected with a decryption error
   (0xC06) (#7).
+- RDP-UDP recovers a lost burst in one round trip: when the retransmit timer
+  fires, every packet sent longer than a timeout ago counts as lost
+  (MS-RDPEUDP2 3.1.1.2.3), not only the oldest one. The timeout no longer
+  starts above 100 ms or keeps its backoff after the client acknowledges
+  again, and keepalives go out every 4 s. A few lost packets used to freeze
+  the screen for seconds (#7).
+- The graphics pipeline limits what is in flight by bytes (at most about
+  2 MB of unacknowledged frames), not only by frame count and the client's
+  queue depth (MS-RDPEGFX 3.2.5.13). A client reporting no queue depth is
+  treated as busy, not idle. A slow client no longer triggers a whole-screen
+  lossless repaint; only the damaged area is sent again, and an area whose
+  H.264 frame failed to send is not forgotten (#7).
+- mstsc shows the connection's round-trip time and bandwidth when on UDP:
+  in continuous auto-detection the Network Characteristics Result travels in
+  the UDP tunnel's sub-header, the only place MS-RDPBCGR 1.3.9 and MS-RDPEMT
+  2.2.1.1.1 allow it. Sub-header types the tunnel does not know are skipped
+  instead of failing the tunnel (#7).
+- Every PDU the server sends names the MCS server channel (0x03EA) as its
+  initiator, as MS-RDPBCGR 2.2.6.1 requires, not the user's channel (#7).
 - A Refresh Rect PDU, or resuming output after Suppress Output, redraws the
   requested area even when nothing changed on screen (MS-RDPBCGR 3.3.5.11)
   (#7).
