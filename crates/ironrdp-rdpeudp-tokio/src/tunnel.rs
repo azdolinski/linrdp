@@ -141,6 +141,9 @@ where
                 // 2.2.14) are not consumed here; this driver only wires the DVC
                 // payload through. A future auto-detect integration would need to
                 // dispatch them instead of discarding them.
+                // A PDU can carry sub-headers and no data (MS-RDPEMT
+                // 2.2.1.1.1): there is nothing for the layer above then.
+                TunnelEvent::Data { data, .. } if data.is_empty() => {}
                 TunnelEvent::Data { data, .. } => {
                     if data_tx.send(data).await.is_err() {
                         // Application dropped the receiver

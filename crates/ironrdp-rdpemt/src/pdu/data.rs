@@ -110,3 +110,40 @@ impl Decode<'_> for TunnelData {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use ironrdp_core::{decode, encode_vec};
+
+    use super::*;
+    use crate::pdu::subheader::SubHeaderType;
+
+    /// MS-RDPEMT 2.2.1.1.1 and 3.1.5.3: sub-headers ride in the header ahead
+    /// of the payload, and one of a type this side does not know is skipped by
+    /// its SubHeaderLength instead of failing the tunnel.
+    #[test]
+    fn a_data_pdu_with_an_unknown_sub_header_decodes() {
+        let pdu = TunnelData {
+            sub_headers: vec![
+                TunnelSubHeader {
+                    sub_header_type: SubHeaderType::Unknown(0x7F),
+                    data: vec![1, 2, 3],
+                },
+                TunnelSubHeader {
+                    sub_header_type: SubHeaderType::AutoDetectRequest,
+                    data: vec![0, 0, 0xC0, 0x08],
+                },
+            ],
+            higher_layer_data: b"dvc".to_vec(),
+        };
+        let wire = encode_vec(&pdu).expect("encode");
+        // Action 0x2, PayloadLength 3, HeaderLength 4 + 5 + 6.
+        assert_eq!(&wire[..4], &[0x02, 0x03, 0x00, 15]);
+        assert_eq!(&wire[4..6], &[5, 0x7F]);
+
+        let decoded = decode::<TunnelData>(&wire).expect("decode");
+        assert_eq!(decoded, pdu);
+    }
+}

@@ -230,7 +230,13 @@ async fn serve_tunnel(
     // so a queue that takes them whole never fills in practice; the memory is
     // only taken as it is used.
     let (to_tunnel, mut from_server) = mpsc::channel::<Vec<u8>>(TUNNEL_QUEUE);
-    let _ = events.send(ironrdp_server::ServerEvent::SoftSyncToUdp { to_tunnel });
+    // Auto-detect structures for the tunnel's sub-headers (MS-RDPBCGR 1.3.9,
+    // MS-RDPEMT 2.2.1.1.1): a handful a second at most.
+    let (autodetect_to_tunnel, mut autodetect_from_server) = mpsc::channel::<Vec<u8>>(16);
+    let _ = events.send(ironrdp_server::ServerEvent::SoftSyncToUdp {
+        to_tunnel,
+        autodetect_to_tunnel: Some(autodetect_to_tunnel),
+    });
 
     // Incoming frames are unframed DVC PDUs; outgoing likewise.
     loop {
@@ -242,6 +248,16 @@ async fn serve_tunnel(
                         let _ = events.send(ironrdp_server::ServerEvent::UdpTunnelData(frame));
                     }
                     None => break,
+                }
+            }
+            Some(structure) = autodetect_from_server.recv() => {
+                match sub_header(&structure) {
+                    Some(sub_header) => {
+                        if transport.send_sub_header(sub_header).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => tracing::debug!(bytes = structure.len(), "UDP tunnel: malformed auto-detect structure; not sent"),
                 }
             }
             outgoing = from_server.recv() => {
@@ -262,6 +278,20 @@ async fn serve_tunnel(
     // The dynamic channels moved to it cannot come back to TCP, so the
     // server decides whether the connection goes on.
     let _ = events.send(ironrdp_server::ServerEvent::UdpTunnelClosed);
+}
+
+/// The RDP_TUNNEL_SUBHEADER carrying an encoded auto-detect structure.
+///
+/// MS-RDPEMT 2.2.1.1.1: SubHeaderLength counts itself and SubHeaderType, and
+/// the structures of [MS-RDPBCGR] 2.2.14 open with exactly those two bytes,
+/// headerLength and headerTypeId, so the rest is the SubHeaderData.
+fn sub_header(structure: &[u8]) -> Option<ironrdp_rdpemt::TunnelSubHeader> {
+    let (&length, rest) = structure.split_first()?;
+    let (&kind, data) = rest.split_first()?;
+    (usize::from(length) == structure.len()).then(|| ironrdp_rdpemt::TunnelSubHeader {
+        sub_header_type: ironrdp_rdpemt::SubHeaderType::from_u8(kind),
+        data: data.to_vec(),
+    })
 }
 
 /// Render an error and its whole `source()` chain on one line: the wrapper
@@ -363,7 +393,7 @@ mod tests {
             .await
             .expect("the client's tunnel");
 
-            let ServerEvent::SoftSyncToUdp { to_tunnel } = next_event(events).await else {
+            let ServerEvent::SoftSyncToUdp { to_tunnel, .. } = next_event(events).await else {
                 panic!("the worker binds its tunnel to its own session");
             };
             let greeting = format!("session {index}").into_bytes();
@@ -385,5 +415,26 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         supervisor.join().expect("supervisor thread");
+    }
+
+    /// MS-RDPEMT 2.2.1.1.1: an encoded auto-detect structure becomes a
+    /// sub-header whose length and type are its first two bytes.
+    #[test]
+    fn an_auto_detect_structure_maps_onto_a_sub_header() {
+        use ironrdp_pdu::rdp::autodetect::AutoDetectRequest;
+
+        let structure =
+            ironrdp_core::encode_vec(&AutoDetectRequest::netchar_result(1, 2, 30_000, 3)).expect("encode");
+        let sub_header = sub_header(&structure).expect("a sub-header");
+        assert_eq!(sub_header.sub_header_type, ironrdp_rdpemt::SubHeaderType::AutoDetectRequest);
+        assert_eq!(ironrdp_core::encode_vec(&sub_header).expect("encode"), structure);
+
+        assert!(sub_header_bytes_mismatch(&structure));
+    }
+
+    fn sub_header_bytes_mismatch(structure: &[u8]) -> bool {
+        let mut wrong = structure.to_vec();
+        wrong[0] += 1;
+        super::sub_header(&wrong).is_none()
     }
 }

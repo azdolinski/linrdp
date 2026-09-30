@@ -262,3 +262,43 @@ where
     assert_eq!(received, FRAMES);
     drop(sender.await.expect("sender"));
 }
+
+/// MS-RDPEMT 2.2.1.1.1: a sub-header rides in a Tunnel Data PDU's header, on
+/// its own when no data follows; the receiving side delivers only data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sub_header_alone_reaches_no_one_and_data_follows() {
+    let server_socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+    let server_addr: SocketAddr = server_socket.local_addr().expect("local addr");
+    let tunnel = TunnelConfig {
+        request_id: 42,
+        security_cookie: [0xA5; 16],
+    };
+    let accept = tokio::spawn(accept_udp(
+        server_socket,
+        UdpAcceptConfig {
+            tls_config: server_tls_config(),
+            tunnel_config: tunnel.clone(),
+            connection_config: Default::default(),
+            accept_timeout: Duration::from_secs(15),
+        },
+    ));
+    let mut client = connect_udp(UdpTransportConfig::new(server_addr, "localhost".to_owned(), tunnel))
+        .await
+        .expect("client connect");
+    let server = accept.await.expect("accept task").expect("accept");
+
+    server
+        .send_sub_header(ironrdp_rdpemt::TunnelSubHeader {
+            sub_header_type: ironrdp_rdpemt::SubHeaderType::AutoDetectRequest,
+            data: vec![0, 0, 0xC0, 0x08, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0],
+        })
+        .await
+        .expect("sub-header");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    server.send(b"after".to_vec()).await.expect("data");
+
+    let frame = tokio::time::timeout(Duration::from_secs(5), client.recv())
+        .await
+        .expect("in time");
+    assert_eq!(frame.as_deref(), Some(&b"after"[..]));
+}

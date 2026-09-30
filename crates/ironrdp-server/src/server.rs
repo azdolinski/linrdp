@@ -820,6 +820,9 @@ pub struct RdpServer {
     /// [`ServerEvent::SoftSyncToUdp`] once the embedder's RDP-UDP accept
     /// completed. `None` = no tunnel (all DVC traffic stays on TCP).
     udp_tunnel_tx: Option<mpsc::Sender<Vec<u8>>>,
+    /// Where auto-detect structures for the tunnel go (see
+    /// `ServerEvent::SoftSyncToUdp`).
+    udp_autodetect_tx: Option<mpsc::Sender<Vec<u8>>>,
     /// Data of the channels a Soft-Sync Request moved, written before the
     /// client's Soft-Sync Response: held back, in order, and sent through the
     /// tunnel once the response arrives (see `write_dvc_messages`).
@@ -1056,6 +1059,13 @@ pub enum ServerEvent {
     /// over the UDP tunnel — the embedder pumps it into its `UdpTransport`.
     SoftSyncToUdp {
         to_tunnel: mpsc::Sender<Vec<u8>>,
+        /// Auto-detect structures ([MS-RDPBCGR] 2.2.14) the embedder sends
+        /// as RDP_TUNNEL_SUBHEADERs (MS-RDPEMT 2.2.1.1.1): what Continuous
+        /// Auto-Detection carries over sideband channels (1.3.9). Each
+        /// message is one encoded structure; its first two bytes, the
+        /// structure's headerLength and headerTypeId, are the sub-header's
+        /// SubHeaderLength and SubHeaderType.
+        autodetect_to_tunnel: Option<mpsc::Sender<Vec<u8>>>,
     },
     /// A DVC frame received over the UDP tunnel (unframed DVC PDU bytes from
     /// the embedder's `UdpTransport::recv()`). Fed into the DRDYNVC
@@ -1707,6 +1717,7 @@ impl RdpServer {
             autodetect: None,
             connect_time_network: None,
             udp_tunnel_tx: None,
+            udp_autodetect_tx: None,
             tunnel_backlog: Vec::new(),
             multitransport_confirmed: false,
             multitransport_request_id: None,
@@ -3395,7 +3406,10 @@ impl RdpServer {
                         .await
                         .map_err(|e| ServerError::io("write_all", e))?;
                 }
-                ServerEvent::SoftSyncToUdp { to_tunnel } => {
+                ServerEvent::SoftSyncToUdp {
+                    to_tunnel,
+                    autodetect_to_tunnel,
+                } => {
                     // MS-RDPEMT 1.3.3: a tunnel lasts as long as the main
                     // connection, so a connection has one.
                     let moved = self
@@ -3405,6 +3419,7 @@ impl RdpServer {
                         warn!("a second UDP tunnel for this connection; ignoring it");
                         continue;
                     }
+                    self.udp_autodetect_tx = autodetect_to_tunnel;
                     if self.multitransport_confirmed {
                         self.soft_sync(to_tunnel, writer, user_channel_id).await?;
                     } else {
@@ -3460,6 +3475,7 @@ impl RdpServer {
                     }
                     info!("the UDP tunnel closed before any channel moved to it; staying on TCP");
                     self.udp_tunnel_tx = None;
+                    self.udp_autodetect_tx = None;
                     self.pending_soft_sync = None;
                 }
                 ServerEvent::UdpTunnelData(frame) => {
@@ -3808,6 +3824,11 @@ impl RdpServer {
                     }
                 },
                 ServerEvent::AutoDetectRttRequest => {
+                    // Whether the dynamic channels are on the tunnel, which
+                    // decides where a Network Characteristics Result goes.
+                    let tunnel_in_use = self
+                        .get_svc_processor::<dvc::DrdynvcServer>()
+                        .is_some_and(|drdynvc| drdynvc.soft_sync_response_received());
                     // Auto-detect requests ride the MCS message channel
                     // ([MS-RDPBCGR] 2.2.14.3). With none negotiated (the client
                     // did not request it), there is nowhere to send them, and
@@ -3825,10 +3846,23 @@ impl RdpServer {
                             .await
                             .map_err(|e| ServerError::io("write_all", e))?;
 
-                        // No Network Characteristics Result here: [MS-RDPBCGR]
-                        // 1.3.9 lists it among the main-connection messages of
+                        // No Network Characteristics Result on the main
+                        // connection: [MS-RDPBCGR] 1.3.9 lists it there for
                         // Connect-Time Auto-Detection only. During Continuous
-                        // Auto-Detection it travels over sideband channels.
+                        // Auto-Detection it travels over the sideband channels
+                        // in active use, as an RDP_TUNNEL_SUBHEADER: once the
+                        // dynamic channels are on the tunnel, the result goes
+                        // there. It is what the client shows as the connection's
+                        // bandwidth and round-trip time (3.2.5.14).
+                        if tunnel_in_use
+                            && let Some(tx) = self.udp_autodetect_tx.as_ref()
+                            && let Some(result) = ad.build_netchar_result(now_ms)
+                        {
+                            let bytes = encode_vec(&result).map_err(ServerError::encode)?;
+                            if tx.try_send(bytes).is_err() {
+                                debug!("tunnel auto-detect queue full or gone; Network Characteristics Result skipped");
+                            }
+                        }
 
                         // Periodically measure bandwidth: Start on one tick, Stop several
                         // ticks later, with ordinary traffic in between counted by the
@@ -4230,6 +4264,7 @@ impl RdpServer {
         // keeps them.
         if !result.reactivation {
             self.udp_tunnel_tx = None;
+            self.udp_autodetect_tx = None;
             self.tunnel_backlog.clear();
             self.multitransport_confirmed = false;
             self.pending_soft_sync = None;
@@ -6949,7 +6984,10 @@ mod soft_sync_tests {
             .expect("Soft-Sync Request");
 
         let (second, _second_end) = mpsc::channel(16);
-        let mut events = vec![ServerEvent::SoftSyncToUdp { to_tunnel: second }];
+        let mut events = vec![ServerEvent::SoftSyncToUdp {
+            to_tunnel: second,
+            autodetect_to_tunnel: None,
+        }];
         let outcome = server
             .dispatch_server_events(&mut events, &mut writer, 1003, 1007, Some(1008))
             .await;
