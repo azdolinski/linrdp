@@ -2,12 +2,10 @@
 //!
 //! Implements RFC 6298 ("Computing TCP's Retransmission Timer") adapted
 //! for RDPEUDP2. The key difference from standard TCP: the minimum RTO
-//! is 300ms, not TCP's 1 second. MS-RDPEUDP2 Section 3.1.1.2.3 itself only
+//! is 100ms, not TCP's 1 second. MS-RDPEUDP2 Section 3.1.1.2.3 itself only
 //! says the loss-detection timeout is "dynamically variable, depending on
-//! the current network conditions", with no fixed floor of its own; the
-//! 300ms figure is [MS-RDPEUDP] (the v1 document) Section 3.1.6.1's
-//! VERSION_2 minimum retransmit timeout, used here as the closest available
-//! spec anchor.
+//! the current network conditions", with no fixed floor of its own (see
+//! `MIN_RTO`).
 //!
 //! RTT samples are derived from the ACK payload's `receivedTS` and
 //! `sendAckTimeGap` fields. Samples from delayed ACKs (ACKDELAYED flag)
@@ -17,12 +15,16 @@ use core::time::Duration;
 
 /// Minimum RTO for RDPEUDP2 connections.
 ///
-/// [MS-RDPEUDP] Section 3.1.6.1's VERSION_2 minimum retransmit timeout
-/// (see the module doc comment for why that document rather than
-/// MS-RDPEUDP2 itself). This is lower than TCP's 1s minimum (RFC 6298
-/// Section 2.4) because the protocol operates over a typically low-latency
-/// network path (RDP sessions).
-const MIN_RTO: Duration = Duration::from_millis(300);
+/// It used to be [MS-RDPEUDP] (the v1 document) Section 3.1.6.1's VERSION_2
+/// minimum of 300 ms, which does not apply to version 3.
+///
+/// Lowered to 100 ms: [MS-RDPEUDP2] 3.1.1.2.3 makes the loss timeout
+/// "dynamically variable, depending on the current network conditions" and
+/// sets no floor for version 3, and a 300 ms floor held every tail loss on a
+/// LAN for at least 300 ms. It stays well above what a Windows receiver may
+/// delay an acknowledgment by: half the RTT by default (3.1.5.2), plus its
+/// timer granularity.
+const MIN_RTO: Duration = Duration::from_millis(100);
 
 /// Maximum RTO cap to prevent unbounded backoff.
 ///
@@ -46,7 +48,7 @@ const RTTVAR_BETA: u32 = 4;
 
 /// RTT estimator with smoothed RTT, RTT variance, and RTO calculation.
 ///
-/// Follows RFC 6298 Section 2 with the RDPEUDP2 minimum RTO of 300ms.
+/// Follows RFC 6298 Section 2 with a minimum RTO of 100ms.
 ///
 /// # Usage
 ///
@@ -59,7 +61,7 @@ const RTTVAR_BETA: u32 = 4;
 /// let mut rtt = RttEstimator::new();
 /// // First sample initializes SRTT and RTTVAR
 /// rtt.update(Duration::from_millis(50));
-/// assert!(rtt.rto() >= Duration::from_millis(300)); // min RTO enforced
+/// assert!(rtt.rto() >= Duration::from_millis(100)); // min RTO enforced
 ///
 /// // Subsequent samples refine the estimate
 /// rtt.update(Duration::from_millis(48));
@@ -131,7 +133,7 @@ impl RttEstimator {
 
     /// Current retransmission timeout.
     ///
-    /// Always in the range [300ms, 16s] for RDPEUDP2.
+    /// Always in the range [100ms, 16s] for RDPEUDP2.
     pub(crate) fn rto(&self) -> Duration {
         self.rto
     }
@@ -153,6 +155,11 @@ impl RttEstimator {
     /// for the same segment, capped at MAX_RTO.
     pub(crate) fn on_timeout(&mut self) {
         self.rto = (self.rto * 2).min(MAX_RTO);
+    }
+
+    /// Drop the timeout backoff once the peer acknowledges new data again.
+    pub(crate) fn reset_backoff(&mut self) {
+        self.recompute_rto();
     }
 
     /// Recompute RTO from SRTT and RTTVAR, applying floor and ceiling.
@@ -206,7 +213,7 @@ mod tests {
     #[test]
     fn first_sample_rto_floor() {
         let mut rtt = RttEstimator::new();
-        // Very small RTT → RTO should be clamped to 300ms minimum
+        // Very small RTT → RTO should be clamped to the minimum
         rtt.update(Duration::from_millis(10));
 
         assert_eq!(rtt.srtt(), Some(Duration::from_millis(10)));
@@ -236,9 +243,9 @@ mod tests {
 
         // RTTVAR = 3/4 * 50 + 1/4 * |100 - 100| = 37.5ms
         // SRTT = 7/8 * 100 + 1/8 * 100 = 100ms
-        // RTO = 100 + 4 * 37.5 = 250ms → clamped to 300ms
+        // RTO = 100 + 4 * 37.5 = 250ms, above the 100ms floor
         assert_eq!(rtt.srtt(), Some(Duration::from_millis(100)));
-        assert_eq!(rtt.rto(), MIN_RTO);
+        assert_eq!(rtt.rto(), Duration::from_millis(250));
     }
 
     #[test]
@@ -281,7 +288,7 @@ mod tests {
     #[test]
     fn rto_min_floor_enforced() {
         let mut est = RttEstimator::new();
-        // Extremely fast connection → RTO should still be >= 300ms
+        // Extremely fast connection → RTO should still be >= the minimum
         est.update(Duration::from_micros(500));
         assert!(
             est.rto() >= MIN_RTO,
