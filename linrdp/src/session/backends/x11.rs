@@ -153,7 +153,7 @@ fn serve(keeper: Keeper<'_>) -> anyhow::Result<()> {
 
     // Only now is the display real. Publishing the record earlier is what let
     // a failed start masquerade as a healthy session.
-    keeper::wait_for_display(args.display, core::time::Duration::from_secs(10)).inspect_err(|_| {
+    keeper::wait_for_display(args.display, x_pid, core::time::Duration::from_secs(10)).inspect_err(|_| {
         tracing::error!(
             display = args.display,
             log = %x_log.display(),

@@ -178,7 +178,7 @@ impl Greeter {
         let env = vec![("DISPLAY".to_owned(), format!(":{display_number}"))];
         keeper::clear_stale_display(display_number);
         let x_pid = keeper::spawn_child(&cmd, &env, &owner, &log).context("start the logon screen's X server")?;
-        keeper::wait_for_display(display_number, core::time::Duration::from_secs(10)).inspect_err(|_| {
+        keeper::wait_for_display(display_number, x_pid, core::time::Duration::from_secs(10)).inspect_err(|_| {
             // SAFETY: signalling a child we just forked.
             unsafe { libc::kill(x_pid, libc::SIGKILL) };
         })?;

@@ -179,16 +179,37 @@ pub(crate) fn clear_stale_display(display: u16) {
 /// The grandchild is detached, so its exec failure cannot be waited for; a
 /// socket that accepts is the only evidence available that the desktop is
 /// real.
-pub(crate) fn wait_for_display(display: u16, timeout: core::time::Duration) -> anyhow::Result<()> {
+pub(crate) fn wait_for_display(display: u16, x_pid: i32, timeout: core::time::Duration) -> anyhow::Result<()> {
     let socket = format!("/tmp/.X11-unix/X{display}");
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
+        // Our own server must still be running. A foreign server holding this
+        // number answers instantly, and a keeper that took that as success
+        // started a desktop on somebody else's display, published a record
+        // for it and reported the session ready — while its own X server had
+        // already exited with "server already running". Watching the pid
+        // turns that into the start-up failure it always was.
+        if let Some(status) = reaped(x_pid) {
+            anyhow::bail!("the X server for :{display} exited during start-up (status {status})");
+        }
         if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
             return Ok(());
         }
         std::thread::sleep(core::time::Duration::from_millis(50));
     }
     anyhow::bail!("X server for :{display} did not start within {timeout:?}")
+}
+
+/// The exit status of `pid`, if it is a child of ours that has already died.
+///
+/// `kill(pid, 0)` cannot answer this: a child that has exited but not been
+/// reaped is a zombie, and signalling a zombie succeeds. Only `waitpid`
+/// distinguishes "still running" from "already gone".
+fn reaped(pid: i32) -> Option<i32> {
+    let mut status = 0;
+    // SAFETY: waiting on our own child with WNOHANG; returns immediately.
+    let seen = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    (seen == pid).then_some(status)
 }
 
 /// Start `cmd` as a direct child, running as `user`, and return its pid.
