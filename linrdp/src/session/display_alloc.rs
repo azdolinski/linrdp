@@ -160,8 +160,58 @@ pub(crate) fn owner_of(base: &Path, number: u16) -> Option<String> {
     (!user.is_empty()).then_some(user)
 }
 
+/// Whether anything is already serving X on this display number.
+///
+/// Connecting, not just looking: an X server killed with SIGKILL leaves its
+/// socket file behind, and a stale entry would otherwise make every number
+/// look taken forever.
+fn is_served(number: u16) -> bool {
+    std::os::unix::net::UnixStream::connect(format!("/tmp/.X11-unix/X{number}")).is_ok()
+}
+
+/// Whether the lock for one number is free — that is, whether no keeper is
+/// holding it.
+///
+/// Deliberately separate from [`allocate`]: this answers a question about
+/// linrdp's own bookkeeping and must not consult the X socket, because a
+/// desktop that outlived its keeper has a free lock and a live server, and
+/// conflating the two is what made a restart delete a running session.
+pub(crate) fn lock_is_free(base: &Path, number: u16) -> bool {
+    let path = lock_path(base, number);
+    let Ok(file) = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+    else {
+        return false;
+    };
+    // Taking the lock is the probe: if it succeeds nobody was holding it, and
+    // `file` drops at the end of this function, releasing it again.
+    //
+    // SAFETY: a valid open fd; LOCK_NB returns rather than blocking.
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
 /// Claim the lowest free display number in `range`.
 pub(crate) fn allocate(base: &Path, range: RangeInclusive<u16>) -> anyhow::Result<DisplayLease> {
+    allocate_with(base, range, is_served)
+}
+
+/// [`allocate`], with the "is anything already serving this number" probe
+/// injected.
+///
+/// Production passes [`is_served`]. Tests pass their own, because display
+/// numbers are a machine-global resource: a unit test that allocated :10
+/// would otherwise pass or fail depending on whether this build machine
+/// happens to be running a desktop on it.
+pub(crate) fn allocate_with(
+    base: &Path,
+    range: RangeInclusive<u16>,
+    served: impl Fn(u16) -> bool,
+) -> anyhow::Result<DisplayLease> {
     for number in range.clone() {
         let path = lock_path(base, number);
         let file = OpenOptions::new()
@@ -177,6 +227,26 @@ pub(crate) fn allocate(base: &Path, range: RangeInclusive<u16>) -> anyhow::Resul
         // blocking when another holder has the lock.
         let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
         if locked {
+            // The lock says no linrdp session owns this number. An X server
+            // answering on it says otherwise — a desktop that outlived the
+            // keeper which held the lock, or somebody else's server on a
+            // number in our range. Either way the next thing we would do is
+            // start an X server that dies on "server already running", so
+            // skip the number instead.
+            //
+            // This is a veto and never a grant: the `flock` above remains the
+            // only thing that *awards* a number, so the world-writable socket
+            // path cannot be used to steer an allocation towards an attacker.
+            // The worst a squatter achieves is denying one number, which it
+            // could already do — the difference is that it now says so in the
+            // log instead of handing the user a black screen.
+            if served(number) {
+                tracing::warn!(
+                    display = number,
+                    "display is unlocked but an X server answers on it — skipping the number"
+                );
+                continue; // `file` drops here, releasing the lock
+            }
             return Ok(DisplayLease {
                 number,
                 base: base.to_path_buf(),
@@ -198,11 +268,32 @@ mod tests {
         base
     }
 
+    /// Regression: a number whose lock is free but whose X server is alive —
+    /// a desktop that outlived its keeper — must be skipped, not handed out.
+    /// Allocating it starts an X server that dies on "server already
+    /// running", and the client was then routed to the survivor anyway.
+    #[test]
+    fn a_number_already_being_served_is_skipped() {
+        let base = temp_base("served");
+        let lease = allocate_with(&base, 10..=11, |n| n == 10).expect("lease");
+        assert_eq!(lease.number, 11, ":10 answers, so the next free number is used");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The veto never awards a number, so a range where everything is served
+    /// is an error rather than a silently broken session.
+    #[test]
+    fn a_fully_served_range_is_an_error() {
+        let base = temp_base("allserved");
+        assert!(allocate_with(&base, 10..=11, |_| true).is_err(), "nothing is free");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn two_leases_never_share_a_number() {
         let base = temp_base("distinct");
-        let a = allocate(&base, 10..=12).expect("first lease");
-        let b = allocate(&base, 10..=12).expect("second lease");
+        let a = allocate_with(&base, 10..=12, |_| false).expect("first lease");
+        let b = allocate_with(&base, 10..=12, |_| false).expect("second lease");
         assert_ne!(a.number, b.number, "a held lock must be skipped");
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -210,10 +301,10 @@ mod tests {
     #[test]
     fn a_released_number_is_reused() {
         let base = temp_base("reuse");
-        let first = allocate(&base, 10..=10).expect("lease");
+        let first = allocate_with(&base, 10..=10, |_| false).expect("lease");
         let number = first.number;
         drop(first);
-        let again = allocate(&base, 10..=10).expect("the number is free again");
+        let again = allocate_with(&base, 10..=10, |_| false).expect("the number is free again");
         assert_eq!(again.number, number);
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -221,8 +312,8 @@ mod tests {
     #[test]
     fn an_exhausted_range_is_an_error_not_a_panic() {
         let base = temp_base("exhausted");
-        let _held = allocate(&base, 10..=10).expect("lease");
-        let err = allocate(&base, 10..=10).expect_err("range is full");
+        let _held = allocate_with(&base, 10..=10, |_| false).expect("lease");
+        let err = allocate_with(&base, 10..=10, |_| false).expect_err("range is full");
         assert!(err.to_string().contains("no free display"), "the error must say what ran out, got: {err}");
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -230,7 +321,7 @@ mod tests {
     #[test]
     fn the_owner_is_recorded_and_readable() {
         let base = temp_base("owner");
-        let lease = allocate(&base, 10..=12).expect("lease");
+        let lease = allocate_with(&base, 10..=12, |_| false).expect("lease");
         lease.record_owner("alice").expect("record");
         assert_eq!(owner_of(&base, lease.number).as_deref(), Some("alice"));
         assert_eq!(owner_of(&base, 99), None, "an unused display has no owner");
@@ -243,21 +334,21 @@ mod tests {
     #[test]
     fn a_handed_over_claim_is_still_held_by_the_new_owner() {
         let base = temp_base("handoff");
-        let lease = allocate(&base, 30..=30).expect("lease");
+        let lease = allocate_with(&base, 30..=30, |_| false).expect("lease");
         let number = lease.number;
         let fd = lease.into_handoff_fd();
 
         assert!(
-            allocate(&base, 30..=30).is_err(),
+            allocate_with(&base, 30..=30, |_| false).is_err(),
             "forgetting the lease must not release the lock the descriptor holds"
         );
 
         let adopted = DisplayLease::adopt(&base, number, fd).expect("the descriptor still holds the lock");
         assert_eq!(adopted.number, number);
-        assert!(allocate(&base, 30..=30).is_err(), "the adopted lease still holds it");
+        assert!(allocate_with(&base, 30..=30, |_| false).is_err(), "the adopted lease still holds it");
 
         drop(adopted);
-        allocate(&base, 30..=30).expect("closing the last copy frees the number");
+        allocate_with(&base, 30..=30, |_| false).expect("closing the last copy frees the number");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -324,7 +415,7 @@ mod tests {
     #[test]
     fn an_adopted_claim_does_not_survive_into_the_sessions_processes() {
         let base = temp_base("cloexec");
-        let lease = allocate(&base, 40..=40).expect("lease");
+        let lease = allocate_with(&base, 40..=40, |_| false).expect("lease");
         let fd = lease.into_handoff_fd();
         let adopted = DisplayLease::adopt(&base, 40, fd).expect("adopt");
 
@@ -354,7 +445,7 @@ mod tests {
     #[test]
     fn display_name_is_the_x_form() {
         let base = temp_base("name");
-        let lease = allocate(&base, 42..=42).expect("lease");
+        let lease = allocate_with(&base, 42..=42, |_| false).expect("lease");
         assert_eq!(lease.display_name(), ":42");
         let _ = std::fs::remove_dir_all(&base);
     }

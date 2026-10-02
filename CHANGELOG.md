@@ -15,6 +15,56 @@ Releasing is driven by this file: a push to `main` that adds a new
 
 ---
 
+## [0.1.2] - 2026-10-02
+
+Reconnecting after a restart or an upgrade could show a black screen with the
+desktop still running behind it. Sessions outlive the connection by design, and
+after this they outlive a restart of linrdp as well: the client reattaches to
+the desktop it left open, with its applications still running.
+
+### Fixed
+
+#### Reattaching after a restart or upgrade
+- **A desktop that outlived its keeper is adopted, not rebuilt.** Session
+  liveness was read off the display `flock`, which belongs to the keeper — and
+  the keeper and the desktop have separate lifetimes on purpose. The desktop
+  runs in its own logind scope and `KillMode=process` is in the unit precisely
+  so it survives a supervisor restart; the keeper lives in linrdp's own control
+  group and does not have to. A restart that outlived its keepers therefore
+  looked exactly like a dead session.
+
+  What followed was deterministic: the record of a *running* desktop was
+  deleted, a second session was built on the number that desktop still held,
+  the new X server died on "server already running" three milliseconds later,
+  the client was routed to the survivor anyway, and — because the new session
+  had already written a fresh cookie — every grab and every keystroke failed
+  with "Invalid MIT-MAGIC-COOKIE-1 key". Audio, clipboard and EGFX negotiated
+  normally, so the session looked connected and showed nothing.
+
+  Liveness is now a property of the desktop: the X11 setup the capture path is
+  about to perform anyway, connecting to the display and authenticating with
+  the cookie the session record names. That settles both halves at once —
+  something is listening, and it is this session's, because only this session's
+  server accepts this cookie. `/tmp/.X11-unix` is world-writable, so the second
+  half is what keeps a squatted socket from being adopted as another account's
+  desktop.
+- **A display number whose X server is still answering is no longer handed
+  out.** The allocator vetoes such a number rather than starting a server on it
+  that dies immediately. A veto only, never a grant: the `flock` remains the
+  sole thing that awards a number, so the world-writable socket path cannot be
+  used to steer an allocation.
+- **A keeper no longer adopts a foreign X server.** Waiting for the display
+  treated any socket that accepted as proof that the keeper's own server had
+  started, so a keeper could publish a record for somebody else's display and
+  report the session ready while its own X server was already gone. It now
+  watches its own process alongside the socket.
+- **A session that does not survive start-up is reported as an error** instead
+  of being served as an empty screen. A record published moments before its
+  keeper tore itself down was previously read by the waiting worker and routed
+  to.
+
+---
+
 ## [0.1.1] - 2026-09-30
 
 GNOME on Wayland, working UDP transport and a round of protocol compliance

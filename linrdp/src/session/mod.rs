@@ -47,13 +47,57 @@ pub(crate) fn attach_existing(
     registry::find(base, user, range)
 }
 
-/// Whether the record for `display` is backed by a live keeper.
+/// Whether the desktop a record describes is still running and still ours.
 ///
-/// A free `flock` is proof the keeper is gone: the kernel drops the lock when
-/// the holding process dies, so this survives crashes and a supervisor restart
-/// without any bookkeeping of our own.
-pub(crate) fn is_stale(base: &Path, display: u16) -> bool {
-    display_alloc::allocate(base, display..=display).is_ok()
+/// The probe is exactly the X11 setup the capture path is about to perform:
+/// connect to the display's socket and authenticate with the cookie the
+/// record names. Success proves both halves at once — a server is listening,
+/// and it is *this* session's, because only this session's server accepts
+/// this cookie.
+///
+/// Both halves are needed. `/tmp/.X11-unix` is world-writable, so any local
+/// user can leave a socket at `X<n>`; a squatter answers the connect and
+/// fails the handshake, and is reported dead rather than adopted.
+pub(crate) fn desktop_is_live(rec: &registry::SessionRecord) -> bool {
+    let socket = format!("/tmp/.X11-unix/X{}", rec.display);
+    let Ok(unix) = std::os::unix::net::UnixStream::connect(&socket) else {
+        return false;
+    };
+    let Ok((stream, _peer)) = x11rb::rust_connection::DefaultStream::from_unix_stream(unix) else {
+        return false;
+    };
+    let Ok((name, data)) = xauth::cookie_for(Path::new(&rec.xauthority), rec.display) else {
+        return false;
+    };
+    x11rb::rust_connection::RustConnection::connect_to_stream_with_auth_info(stream, 0, name, data).is_ok()
+}
+
+/// Whether the recorded session is gone and its number may be reused.
+///
+/// Liveness is a property of the **desktop**, not of the keeper. The two have
+/// separate lifetimes by design: the desktop runs in its own logind scope and
+/// `KillMode=process` is in the unit precisely so it survives a supervisor
+/// restart, while the keeper lives in linrdp's own control group and does not
+/// have to.
+///
+/// Reading a free `flock` as "the session is over" conflated them. Any
+/// restart that outlived its keepers then made linrdp delete the record of a
+/// *running* desktop and build a second session on the occupied number: the
+/// new X server died on "server already running", the client was routed to
+/// the survivor anyway, and — because the new session had already written a
+/// fresh cookie — every grab and every key failed with "Invalid
+/// MIT-MAGIC-COOKIE-1 key". That is the black screen this replaces.
+pub(crate) fn is_stale(rec: &registry::SessionRecord) -> bool {
+    !desktop_is_live(rec)
+}
+
+/// Whether a keeper is still holding `display`.
+///
+/// A free `flock` means no keeper — which says nothing about the desktop, and
+/// is why this is reported separately from [`is_stale`] rather than standing
+/// in for it.
+pub(crate) fn keeper_is_gone(base: &Path, display: u16) -> bool {
+    display_alloc::lock_is_free(base, display)
 }
 
 /// Drop the record for a dead session so the number can be reused.
@@ -72,11 +116,34 @@ pub(crate) fn attach_live(
     user: &str,
     range: RangeInclusive<u16>,
 ) -> Option<registry::SessionRecord> {
+    attach_live_with(base, user, range, desktop_is_live)
+}
+
+/// [`attach_live`], with the desktop-liveness probe injected.
+///
+/// Production passes [`desktop_is_live`], which performs the real X11
+/// handshake. Tests pass their own: standing up an X server that completes a
+/// cookie handshake is not something a unit test can do, and faking liveness
+/// by holding the display lock is exactly the conflation this change exists
+/// to remove.
+pub(crate) fn attach_live_with(
+    base: &Path,
+    user: &str,
+    range: RangeInclusive<u16>,
+    live: impl Fn(&registry::SessionRecord) -> bool,
+) -> Option<registry::SessionRecord> {
     let rec = attach_existing(base, user, range)?;
-    if is_stale(base, rec.display) {
-        // The desktop died; clear the record so the next create() starts clean.
+    if !live(&rec) {
+        // The desktop really is gone; clear the record so create() starts clean.
         let _ = forget(base, rec.display);
         return None;
+    }
+    if keeper_is_gone(base, rec.display) {
+        tracing::info!(
+            user,
+            display = rec.display,
+            "the desktop outlived its keeper — adopting it rather than starting a second one"
+        );
     }
     Some(rec)
 }
@@ -92,10 +159,23 @@ pub(crate) fn resolve_display(
     console: bool,
     ambient: &str,
 ) -> String {
+    resolve_display_with(base, user, range, console, ambient, desktop_is_live)
+}
+
+/// [`resolve_display`], with the desktop-liveness probe injected. See
+/// [`attach_live_with`] for why the seam is here.
+pub(crate) fn resolve_display_with(
+    base: &Path,
+    user: &str,
+    range: RangeInclusive<u16>,
+    console: bool,
+    ambient: &str,
+    live: impl Fn(&registry::SessionRecord) -> bool,
+) -> String {
     if console {
         return ambient.to_owned();
     }
-    match attach_live(base, user, range) {
+    match attach_live_with(base, user, range, live) {
         Some(rec) => format!(":{}", rec.display),
         // No ambient fallback: a user whose session is gone must be refused,
         // not quietly shown the shared desktop.
@@ -162,8 +242,21 @@ fn create(
         return Err(error);
     }
 
-    keeper_main::wait_for_record(base, display, user, spec.ready_within)
-        .with_context(|| format!("session for {user} on :{display}"))
+    let rec = keeper_main::wait_for_record(base, display, user, spec.ready_within)
+        .with_context(|| format!("session for {user} on :{display}"))?;
+
+    // The record proves the keeper published a session; it does not prove the
+    // session is still there to serve. A keeper whose X server exits moments
+    // after it publishes leaves a record behind for exactly as long as it
+    // takes to tear itself down, and a worker that read it in that window
+    // routed the client to a display with nothing on it. Refusing here costs
+    // one handshake and turns a black screen into an error the log explains.
+    anyhow::ensure!(
+        desktop_is_live(&rec),
+        "the session for {user} on :{display} did not survive start-up — see the X server log in {}",
+        base.join(format!("display-{display}.log")).display()
+    );
+    Ok(rec)
 }
 
 /// Fork a detached `linrdp --keeper` and feed it the password on stdin.
@@ -458,18 +551,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A record whose display lock is free belongs to a dead keeper.
-    #[test]
-    fn a_record_without_a_live_lock_is_stale() {
-        let base = temp_base("stale");
-        seed(&base, "alice", 11);
-        assert!(is_stale(&base, 11), "nobody holds the lock, so the keeper is gone");
-
-        let _held = display_alloc::allocate(&base, 11..=11).expect("hold the lock");
-        assert!(!is_stale(&base, 11), "a held lock means a live session");
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
     #[test]
     fn forgetting_a_session_frees_the_display() {
         let base = temp_base("forget");
@@ -480,13 +561,72 @@ mod tests {
     }
 
     /// A stale record must not send a reconnecting user to a dead desktop.
+    /// Regression: a desktop that outlived its keeper must be adopted, not
+    /// deleted and rebuilt on a number that is still in use.
+    ///
+    /// Reading a free `flock` as "the session is over" is what made a
+    /// supervisor restart hand the user a black screen: the record of a
+    /// running desktop was deleted, a second session was built on the
+    /// occupied number, and the client was routed to the survivor with the
+    /// wrong cookie.
+    #[test]
+    fn a_free_lock_means_no_keeper_not_a_dead_desktop() {
+        let base = temp_base("nokeeper");
+        seed(&base, "alice", 11);
+        assert!(keeper_is_gone(&base, 11), "nobody holds the lock, so the keeper is gone");
+
+        let _held = display_alloc::allocate_with(&base, 11..=11, |_| false).expect("hold the lock");
+        assert!(!keeper_is_gone(&base, 11), "a held lock means a live keeper");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Staleness is decided by the desktop, and a record pointing at a
+    /// display with no X server on it is the one case that really is stale.
+    #[test]
+    fn a_record_with_no_x_server_is_stale() {
+        let base = temp_base("nox");
+        seed(&base, "alice", 11);
+        let rec = attach_existing(&base, "alice", 10..=20).expect("seeded record");
+        assert!(
+            is_stale(&rec),
+            "nothing is serving :11, so the session behind the record is gone"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A socket that answers but fails the handshake is somebody else's
+    /// server, not this session's desktop. `/tmp/.X11-unix` is world-writable,
+    /// so adopting on "the socket answered" alone would let any local user
+    /// present a desktop as another account's.
+    #[test]
+    fn a_squatted_socket_is_not_adopted() {
+        let base = temp_base("squat");
+        seed(&base, "alice", 11);
+        let rec = attach_existing(&base, "alice", 10..=20).expect("seeded record");
+
+        let socket = std::path::Path::new("/tmp/.X11-unix/X11");
+        if socket.exists() {
+            return; // a real display :11 on this machine; nothing to prove safely
+        }
+        let Ok(listener) = std::os::unix::net::UnixListener::bind(socket) else {
+            return; // no permission to create one here
+        };
+        assert!(
+            is_stale(&rec),
+            "a listener that cannot answer the cookie handshake is not this session"
+        );
+        drop(listener);
+        let _ = std::fs::remove_file(socket);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn attach_live_skips_a_stale_record() {
         let base = temp_base("skipstale");
         seed(&base, "alice", 11);
         assert!(
-            attach_live(&base, "alice", 10..=20).is_none(),
-            "a record with no live keeper must not be attached to"
+            attach_live_with(&base, "alice", 10..=20, |_| false).is_none(),
+            "a record with no desktop behind it must not be attached to"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -547,7 +687,12 @@ mod tests {
             if publish {
                 drop(child.stdin.take());
                 assert!(child.wait().unwrap().success());
-                assert_eq!(attach_live(&base, &user, 51000..=51000).unwrap().display, 51000);
+                    // `attach_existing`, not `attach_live`: what this test is
+                // about is the account claim and the published record. The
+                // fixture deliberately has no X server, and `attach_live`
+                // asks the further question of whether the desktop is
+                // serving — which here it is not, by construction.
+                assert_eq!(attach_existing(&base, &user, 51000..=51000).unwrap().display, 51000);
             } else {
                 child.kill().unwrap(); child.wait().unwrap();
                 assert!(registry::read_one(&base, 51000).is_none());
@@ -620,15 +765,14 @@ mod tests {
     fn console_mode_uses_the_ambient_display() {
         let base = temp_base("console");
         seed(&base, "alice", 11);
-        let _held = display_alloc::allocate(&base, 11..=11).expect("keep the session live");
 
         assert_eq!(
-            resolve_display(&base, "alice", 10..=20, true, ":99"),
+            resolve_display_with(&base, "alice", 10..=20, true, ":99", |_| true),
             ":99",
             "console mode must not route to a per-user session"
         );
         assert_eq!(
-            resolve_display(&base, "alice", 10..=20, false, ":99"),
+            resolve_display_with(&base, "alice", 10..=20, false, ":99", |_| true),
             ":11",
             "without console mode the user's own session wins"
         );
