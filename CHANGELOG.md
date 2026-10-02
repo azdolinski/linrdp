@@ -15,7 +15,7 @@ Releasing is driven by this file: a push to `main` that adds a new
 
 ---
 
-## [0.1.2] - 2026-10-01
+## [0.1.2] - 2026-10-02
 
 Reconnecting after a restart or an upgrade could show a black screen with the
 desktop still running behind it. Sessions outlive the connection by design, and
